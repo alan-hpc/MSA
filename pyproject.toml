@@ -1,25 +1,31 @@
 [build-system]
-requires = ["setuptools>=64", "wheel"]
+requires = [
+  "setuptools>=64",
+  "wheel",
+  "torch>=2.9",
+  "nvidia-cutlass-dsl[cu13]>=4.5.1",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fmha_sm100"
 version = "0.1.1"
-description = "MSA — MiniMax Sparse Attention: dense FlashAttention + sparse top-k indexer (csrc JIT) and CuTe-DSL sparse attention for NVIDIA SM100"
+description = "MSA — MiniMax Sparse Attention: dense FlashAttention + sparse top-k indexer (csrc JIT) and CuTe-DSL sparse attention for NVIDIA SM100 (CUDA 13.x required)"
 readme = "README.md"
 requires-python = ">=3.10"
 # SPDX-License-Identifier: MIT
 license = { text = "MIT" }
 authors = [{ name = "MiniMax" }]
 dependencies = [
-    "torch",
+    "torch>=2.9",
     "apache-tvm-ffi",
     "jinja2",
     "ninja",
     "pybind11",
-    "cuda-python",
-    "nvidia-cutlass-dsl>=4.4.1",
-    "quack-kernels>=0.2.10",
+    "cuda-python>=13,<14",
+    "nvidia-cutlass-dsl[cu13]>=4.5.1",
+    "quack-kernels>=0.4,<0.5",
+    "flash-attn-4[cu13]==4.0.0b15",
 ]
 
 [project.urls]
@@ -37,7 +43,7 @@ package-dir = { "" = "python" }
 # The cute/ sparse sources are loaded via sys.path.insert at runtime by
 # fmha_sm100/sparse.py (not imported as a submodule), so they are shipped as
 # package data.
-packages = ["fmha_sm100"]
+packages = ["fmha_sm100", "fmha_sm100.kvouter"]
 
 [tool.setuptools.package-data]
 fmha_sm100 = [

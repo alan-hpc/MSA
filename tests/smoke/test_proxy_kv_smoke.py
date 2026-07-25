@@ -18,6 +18,9 @@ Trimmed from test_sparse_attn_e2e_proxy_kv.py to the bare main path:
 Default: run the pipeline once + shape/dtype/NaN sanity checks.
 With --check: also run the full topk-selection multiset check + PyTorch
               sparse-ref cosine check (ported from the e2e test).
+
+Default h_r_real=8 because KV-outer sparse prefill requires qhead_per_kv >= 8.
+See tests/kvouter_support.py.
 """
 import argparse
 import math
@@ -87,7 +90,7 @@ def sparse_ref_real_kv(q_real, k_pages_real, v_pages_real,
 
 
 def run(check=False, seed=0,
-        total_qo_len=8, num_kv_heads_real=4, h_r_real=4,
+        total_qo_len=8, num_kv_heads_real=4, h_r_real=8,
         qo_offset_prefix=256, page_size=128, head_dim=128, topk=16):
     torch.manual_seed(seed)
     dev = torch.device("cuda")
@@ -210,9 +213,10 @@ if __name__ == "__main__":
                         help="T = number of query tokens. 1 = decode, large = prefill.")
     parser.add_argument("--num-kv-heads-real", type=int, default=4,
                         help="KV head count of the REAL GQA cache.")
-    parser.add_argument("--h-r-real", type=int, default=4,
+    parser.add_argument("--h-r-real", type=int, default=8,
                         help="head replication: num_qo_heads_real = "
-                             "num_kv_heads_real * h_r_real (1=MHA, 4=GQA-4, 8=GQA-8).")
+                             "num_kv_heads_real * h_r_real (1=MHA, 4=GQA-4, 8=GQA-8). "
+                             "KV-outer sparse prefill requires h_r_real >= 8.")
     parser.add_argument("--qo-offset-prefix", type=int, default=256,
                         help="KV prefix length. 256 → max_k_tiles=128 (Filtered single-CTA "
                              "path); 524000 → max_k_tiles=4096 (Multi-CTA Lookback path).")

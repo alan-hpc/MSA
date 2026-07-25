@@ -43,8 +43,10 @@ The current public support contract is intentionally narrow:
 
 ## Installation
 
-Install a CUDA-enabled PyTorch build that matches your environment first. Then
-install the repo-side Python requirements:
+Install a CUDA-enabled PyTorch build that matches your environment first. This
+stack requires **CUDA Toolkit 13.x** (`nvcc`); see the
+[top-level README](../../../../README.md#requirements). Then install the
+repo-side Python requirements:
 
 ```bash
 make setup

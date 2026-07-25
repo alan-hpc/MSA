@@ -1,2 +1,5 @@
-nvidia-cutlass-dsl>=4.4.1
-quack-kernels>=0.2.10
+# CuTe-DSL sparse stack (see top-level pyproject.toml for the full package).
+# CUDA Toolkit 13.x (nvcc) required.
+nvidia-cutlass-dsl[cu13]>=4.5.1
+quack-kernels>=0.4,<0.5
+flash-attn-4[cu13]==4.0.0b15

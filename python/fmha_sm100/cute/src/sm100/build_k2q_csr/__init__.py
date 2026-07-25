@@ -3,13 +3,8 @@
 
 """JIT-loaded CUDA C++ extension for the q2k -> k2q CSR builder.
 
-This module compiles ``build_k2q_csr.cu`` on first import via
-``torch.utils.cpp_extension.load`` and exposes ``run_build_k2q_csr``.
-The extension is cached in ``~/.cache/torch_extensions/`` so subsequent
-imports are cheap.
-
-The kernel pipeline is tuned and verified for SM100; other
-architectures are not supported.
+Compiles device kernels with nvcc and host/pybind glue with g++ so nvcc never
+parses PyTorch headers. Cached under ``~/.cache/torch_extensions/``.
 """
 
 from __future__ import annotations
@@ -20,7 +15,8 @@ import torch
 from torch.utils.cpp_extension import load
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_SRC = os.path.join(_THIS_DIR, "build_k2q_csr.cu")
+_KERNELS = os.path.join(_THIS_DIR, "build_k2q_csr_kernels.cu")
+_HOST = os.path.join(_THIS_DIR, "build_k2q_csr_host.cpp")
 _BIND = os.path.join(_THIS_DIR, "build_k2q_csr_bind.cpp")
 
 _extra_cflags = ["-O3", "-std=c++17"]
@@ -31,12 +27,14 @@ _extra_cuda_cflags = [
     "-arch=sm_100",
     "--ptxas-options=-v",
     "--expt-relaxed-constexpr",
+    "-std=c++17",
     "-I/usr/local/cuda/include/cccl",
+    f"-I{_THIS_DIR}",
 ]
 
 _ext = load(
     name="sparse_build_k2q_csr_ext",
-    sources=[_SRC, _BIND],
+    sources=[_KERNELS, _HOST, _BIND],
     extra_cflags=_extra_cflags,
     extra_cuda_cflags=_extra_cuda_cflags,
     verbose=False,
