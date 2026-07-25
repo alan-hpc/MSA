@@ -21,8 +21,9 @@ from torch.utils.cpp_extension import load
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_THIS_DIR, "build_k2q_csr.cu")
+_BIND = os.path.join(_THIS_DIR, "build_k2q_csr_bind.cpp")
 
-_extra_cflags = ["-O3"]
+_extra_cflags = ["-O3", "-std=c++17"]
 _extra_cuda_cflags = [
     "-O3",
     "--use_fast_math",
@@ -35,7 +36,7 @@ _extra_cuda_cflags = [
 
 _ext = load(
     name="sparse_build_k2q_csr_ext",
-    sources=[_SRC],
+    sources=[_SRC, _BIND],
     extra_cflags=_extra_cflags,
     extra_cuda_cflags=_extra_cuda_cflags,
     verbose=False,

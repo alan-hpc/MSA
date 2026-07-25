@@ -21,7 +21,7 @@
 // lexicographic order so that warp-local slot ranges concatenate to the
 // global q-sorted output.
 
-#include <torch/extension.h>
+#include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -523,17 +523,17 @@ __global__ void k2q_scatter_kernel(
 
 template <int kTopK, int kBlockK>
 static void launch_pipeline(
-    torch::Tensor q2k,
-    torch::Tensor cu_q,
-    torch::Tensor cu_k,
-    torch::Tensor row_ptr,
-    torch::Tensor q_idx,
+    at::Tensor q2k,
+    at::Tensor cu_q,
+    at::Tensor cu_k,
+    at::Tensor row_ptr,
+    at::Tensor q_idx,
     int total_rows,
     int max_kv_blocks,
-    torch::Tensor scheduler_metadata = torch::Tensor(),
-    torch::Tensor work_count = torch::Tensor(),
-    torch::Tensor qsplit_idx = torch::Tensor(),
-    torch::Tensor split_counts = torch::Tensor(),
+    at::Tensor scheduler_metadata = at::Tensor(),
+    at::Tensor work_count = at::Tensor(),
+    at::Tensor qsplit_idx = at::Tensor(),
+    at::Tensor split_counts = at::Tensor(),
     int target_q_per_cta = 1,
     int work_capacity = 0,
     int max_seqlen_q = 0)
@@ -553,11 +553,11 @@ static void launch_pipeline(
         q_idx.data_ptr<int>(), 0xFF,
         (size_t)H * S_Q * kTopK * sizeof(int), stream));
 
-    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
-    auto row_counts = torch::zeros({H, total_rows}, opts);
-    auto row_map = torch::empty({B, max_kv_blocks}, opts);
+    auto opts = at::TensorOptions().dtype(at::kInt).device(device);
+    auto row_counts = at::zeros({H, total_rows}, opts);
+    auto row_map = at::empty({B, max_kv_blocks}, opts);
     bool emit_schedule = scheduler_metadata.defined();
-    auto row_coords = emit_schedule ? torch::empty({total_rows, 2}, opts) : torch::Tensor();
+    auto row_coords = emit_schedule ? at::empty({total_rows, 2}, opts) : at::Tensor();
     int* scheduler_metadata_ptr = emit_schedule ? scheduler_metadata.data_ptr<int>() : nullptr;
     int* work_count_ptr = emit_schedule ? work_count.data_ptr<int>() : nullptr;
     int* qsplit_idx_ptr = emit_schedule ? qsplit_idx.data_ptr<int>() : nullptr;
@@ -611,7 +611,7 @@ static void launch_pipeline(
     int q_per_warp = (q_per_cta + kWarps_pick - 1) / kWarps_pick;
     int G_total = G * kWarps_pick;
 
-    auto tile_counts = torch::empty({G_total, H, total_rows}, opts);
+    auto tile_counts = at::empty({G_total, H, total_rows}, opts);
 
     // -- Compile-time switch on kWarps for the templated kernels ---------
     auto rmap_fn = k2q_build_row_map_kernel<kBlockK>;
@@ -681,11 +681,11 @@ static void launch_pipeline(
 }
 
 void run_build_k2q_csr(
-    torch::Tensor q2k,
-    torch::Tensor cu_q,
-    torch::Tensor cu_k,
-    torch::Tensor row_ptr,
-    torch::Tensor q_idx,
+    at::Tensor q2k,
+    at::Tensor cu_q,
+    at::Tensor cu_k,
+    at::Tensor row_ptr,
+    at::Tensor q_idx,
     int64_t topk,
     int64_t blk_kv,
     int64_t total_rows,
@@ -732,15 +732,15 @@ void run_build_k2q_csr(
 }
 
 void run_build_k2q_csr_with_schedule(
-    torch::Tensor q2k,
-    torch::Tensor cu_q,
-    torch::Tensor cu_k,
-    torch::Tensor row_ptr,
-    torch::Tensor q_idx,
-    torch::Tensor scheduler_metadata,
-    torch::Tensor work_count,
-    torch::Tensor qsplit_idx,
-    torch::Tensor split_counts,
+    at::Tensor q2k,
+    at::Tensor cu_q,
+    at::Tensor cu_k,
+    at::Tensor row_ptr,
+    at::Tensor q_idx,
+    at::Tensor scheduler_metadata,
+    at::Tensor work_count,
+    at::Tensor qsplit_idx,
+    at::Tensor split_counts,
     int64_t topk,
     int64_t blk_kv,
     int64_t total_rows,
@@ -821,34 +821,3 @@ void run_build_k2q_csr_with_schedule(
     }
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run_build_k2q_csr", &run_build_k2q_csr,
-          "q2k -> k2q CSR build (sorted within row)",
-          pybind11::arg("q2k"),
-          pybind11::arg("cu_q"),
-          pybind11::arg("cu_k"),
-          pybind11::arg("row_ptr"),
-          pybind11::arg("q_idx"),
-          pybind11::arg("topk"),
-          pybind11::arg("blk_kv"),
-          pybind11::arg("total_rows"),
-          pybind11::arg("max_kv_blocks"));
-    m.def("run_build_k2q_csr_with_schedule", &run_build_k2q_csr_with_schedule,
-          "q2k -> k2q CSR build with fused attention schedule metadata",
-          pybind11::arg("q2k"),
-          pybind11::arg("cu_q"),
-          pybind11::arg("cu_k"),
-          pybind11::arg("row_ptr"),
-          pybind11::arg("q_idx"),
-          pybind11::arg("scheduler_metadata"),
-          pybind11::arg("work_count"),
-          pybind11::arg("qsplit_idx"),
-          pybind11::arg("split_counts"),
-          pybind11::arg("topk"),
-          pybind11::arg("blk_kv"),
-          pybind11::arg("total_rows"),
-          pybind11::arg("max_kv_blocks"),
-          pybind11::arg("target_q_per_cta"),
-          pybind11::arg("work_capacity"),
-          pybind11::arg("max_seqlen_q"));
-}
