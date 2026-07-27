@@ -19,6 +19,10 @@ Python package; the public `fmha_sm100` / `fmha_sm100_plan` API is unchanged.
 
 ![MSA architecture](docs/architecture.png)
 
+> **Note:** `docs/architecture.png` predates the KV-outer integration and shows the
+> original two-stack layout. On this branch, sparse prefill is routed through
+> KV-outer (GQA ≥ 8) or legacy CuTe (GQA &lt; 8) via `sparse_fmha_adapter.py`.
+
 > Algorithm reference: [MiniMax Sparse Attention paper](docs/MiniMaxSparseAttention.pdf).
 
 | Stack | Path | What it gives you |
@@ -51,7 +55,11 @@ python -c "import torch; print(torch.__version__)"                # ≥ 2.9
 
 ## Using with the `kernels` library
 
-To quickly get started using MSA kernels, you can use the [`kernels` library](https://github.com/huggingface/kernels):
+> **Note:** The Hugging Face Hub build tracks upstream `main` and does not include
+> the Fireworks KV-outer backend on this branch. For KV-outer sparse prefill,
+> install from the `fireworks-msa` branch (see [Install](#install)).
+
+To quickly get started using upstream MSA kernels, you can use the [`kernels` library](https://github.com/huggingface/kernels):
 
 ```py
 # make sure `kernels` is installed: `pip install -U kernels`
@@ -81,9 +89,12 @@ pip install . --no-build-isolation      # standard install
 ```
 
 This pulls in `nvidia-cutlass-dsl`, `quack-kernels`, and `flash-attn-4` (see
-`pyproject.toml`). Dense csrc kernels are JIT-compiled on first use; the KV-outer
-C++ extension is built at install time. On first KV-outer call per config, CuTe-DSL
-kernels are AOT-exported (cached under `~/.cache/minfer/`).
+`pyproject.toml`). Dense csrc kernels are JIT-compiled on first use and cached
+under `~/.cache/minfer/fmha_sm100/` (delete that directory to force recompile).
+The KV-outer C++ extension is built at install time. On the first KV-outer call
+per config, CuTe-DSL kernels are AOT-exported into a per-process temp directory;
+set `MINIMAX_KERNELS_CUTE_AOT_CACHE` to a fixed path to persist that cache across
+restarts.
 
 **KV-outer backend selection** (optional env vars):
 
@@ -93,21 +104,24 @@ kernels are AOT-exported (cached under `~/.cache/minfer/`).
 | `FMHA_SM100_KVOUTER_CPP=1` | Force C++ AOT |
 | `FMHA_SM100_KVOUTER_CPP=0` | Force Python CuTe-DSL |
 | `MINIMAX_KERNELS_KVOUTER_CPP` | Legacy alias for the same flags |
+| `MINIMAX_KERNELS_CUTE_AOT_CACHE` | Persistent directory for KV-outer CuTe-DSL AOT exports (default: per-process temp dir) |
 
 Sparse prefill uses KV-outer when `num_qo_heads // num_kv_heads ≥ 8` (e.g. TP1
 config 64/4); lower GQA ratios still use the legacy CuTe CSR path under `cute/`.
 
 ## Verify
 
-Run a small CUDA smoke test. **The first run JIT-compiles `sparse_topk_select`,
-which takes 30 s – a few minutes on a cold nvcc cache** — this is normal, not
-a hang. The KV-outer C++ extension (`fmha_sm100._C`) is built at `pip install`
-time; the first sparse prefill call may additionally AOT-export CuTe-DSL kernels
-(cached under `~/.cache/minfer/`). Subsequent runs hit the caches and finish
-in seconds.
+Run small CUDA smoke tests after install:
 
 ```bash
+# Dense indexer JIT (first run compiles sparse_topk_select; 30 s – a few minutes
+# on a cold nvcc cache is normal, not a hang). Cached under ~/.cache/minfer/fmha_sm100/.
 python tests/smoke/test_sparse_topk_forced.py
+
+# End-to-end sparse prefill via the fmha_sm100 API (exercises KV-outer when
+# qhead_per_kv >= 8; default h_r_real=8). First call may AOT-export CuTe-DSL
+# kernels into a per-process temp dir (or MINIMAX_KERNELS_CUTE_AOT_CACHE).
+python tests/smoke/test_proxy_kv_smoke.py
 ```
 
 ## Usage

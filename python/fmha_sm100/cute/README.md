@@ -1,12 +1,15 @@
-# MiniMax Sparse Attention (MSA) — CuTe-DSL kernel
+# MiniMax Sparse Attention (MSA) — legacy CuTe-DSL sparse stack
 
-This is the **CuTe-DSL** implementation of MSA, shipped inside the
-`fmha_sm100` Python package. For the package overview, install steps, and
-the dense csrc JIT path, see the
+This is the **legacy CuTe-DSL** sparse implementation, shipped inside the
+`fmha_sm100` Python package. On the `fireworks-msa` branch, sparse **prefill**
+with `qhead_per_kv >= 8` is routed to the Fireworks KV-outer backend instead;
+this stack remains the path for GQA &lt; 8 prefill, paged FP8 decode, NVFP4 /
+FP4 quantization, and the FP4 indexer. For the package overview, install
+steps, and the dense csrc JIT path, see the
 [top-level README](../../../../README.md).
 
-The rest of this file documents the **sparse (CuTe-DSL)** surface only: CSR
-metadata, schedules, sparse page attention, FP8 / NVFP4 / FP4 quantization,
+The rest of this file documents the **legacy CuTe-DSL sparse** surface only:
+CSR metadata, schedules, sparse page attention, FP8 / NVFP4 / FP4 quantization,
 the paged FP8 decode wrapper, and the FP4 indexer.
 
 ---
@@ -43,14 +46,21 @@ The current public support contract is intentionally narrow:
 
 ## Installation
 
-Install a CUDA-enabled PyTorch build that matches your environment first. This
-stack requires **CUDA Toolkit 13.x** (`nvcc`); see the
-[top-level README](../../../../README.md#requirements). Then install the
-repo-side Python requirements:
+Install the package from the repo root first (see
+[top-level README — Install](../../../../README.md#install)):
+
+```bash
+pip install -e . --no-build-isolation
+```
+
+For CuTe-DSL-only development inside this directory, you can additionally run:
 
 ```bash
 make setup
 ```
+
+This stack requires **CUDA Toolkit 13.x** (`nvcc`); see the
+[top-level README — Requirements](../../../../README.md#requirements).
 
 ## Quick Start
 
@@ -684,7 +694,8 @@ High-signal files:
 - `D=128` is the only documented and tested head dimension in the current contract.
 - The FP4 indexer currently returns block max scores only; topK selection and
   CSR construction remain caller-owned downstream steps.
-- This repo is not packaged as a pip module yet; it is used directly from the source tree.
+- Prefer `pip install -e . --no-build-isolation` from the repo root; `make setup`
+  in this directory is for CuTe-DSL-only development.
 - Paged FP8 decode currently requires `qhead_per_kv=16`, `page_size=128`, and SM100. Other configurations are not supported by the schedule kernel.
 - Paged FP8 decode `batch <= 1024`. The single-CTA schedule kernel stores per-batch state in shared memory; larger batches need a multi-CTA cooperative redesign (planned but not yet implemented).
 - Paged FP8 decode requires `seqused_k[b] >= seqlen_q` for every batch (i.e. context must include the q-tokens being emitted — a batched-decode invariant), AND `seqused_k[b] % page_size ∈ {0, seqlen_q, 2·seqlen_q, ..., page_size − seqlen_q}` (the last partial page must hold a whole packed-GQA q-group, which is `seqlen_q` columns). Violations are caught at `plan()` with a clear `ValueError`. The same constraint exists in FA-style packgqa kernels in principle but never fires there because FA's typical use satisfies `seqlen_k ≥ seqlen_q` (decode emits 1 token; prefill is self-attention). Tracked as a kernel-level TODO (saturate `causal_col_limit ≥ 1` in mask.py).
