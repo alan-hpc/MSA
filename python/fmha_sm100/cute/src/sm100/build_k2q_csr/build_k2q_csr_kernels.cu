@@ -1,37 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 MiniMax
 // SPDX-License-Identifier: MIT
 
-// CUDA C++ q2k -> k2q CSR builder.
-//
-// Five-stage pipeline. q-ascending order within each CSR row is preserved
-// by partitioning q across (CTA, warp_in_CTA) units; each unit owns a
-// contiguous q-sub-range and reserves a contiguous slot range per row via
-// a precomputed exclusive prefix scan.
-//
-//   M:  build_row_map      -- round-robin packing of rows across batches
-//   H:  histogram + tile_counts
-//   PR: row prefix         -- single block per head, row_counts -> row_ptr
-//   PT: tile prefix        -- multi-block, scan tile_counts along (c, w) axis
-//   S:  scatter (sorted)   -- per-warp slot range, q-sequential within warp
-//
-// Per-warp partitioning: each CTA has kWarps warps; warp w of CTA c owns
-// q-range [c*q_per_cta + w*q_per_warp, c*q_per_cta + (w+1)*q_per_warp).
-// tile_counts is shaped [G * kWarps, H, total_rows]; the "row" dimension
-// of the prefix scan is the flattened (c * kWarps + w) index, scanned in
-// lexicographic order so that warp-local slot ranges concatenate to the
-// global q-sorted output.
+// CUDA device kernels for the q2k -> k2q CSR builder (nvcc only; no ATen).
 
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cuda.h>
+#include "build_k2q_csr_launch.h"
 #include <cuda_runtime.h>
 
-#include <algorithm>
-
-#define CHECK_CUDA(x) TORCH_CHECK((x).is_cuda(), #x " must be CUDA")
-#define CHECK_CONTIGUOUS(x) TORCH_CHECK((x).is_contiguous(), #x " must be contiguous")
-#define CHECK_INT(x) TORCH_CHECK((x).scalar_type() == at::kInt, #x " must be int32")
-#define CHECK_INPUT(x) CHECK_CUDA(x); CHECK_CONTIGUOUS(x); CHECK_INT(x)
+#include <cstddef>
 
 namespace {
 
@@ -515,340 +490,197 @@ __global__ void k2q_scatter_kernel(
     }
 }
 
-}  // anonymous namespace
-
-// ===========================================================================
-// Host orchestration
-// ===========================================================================
-
-template <int kTopK, int kBlockK>
-static void launch_pipeline(
-    torch::Tensor q2k,
-    torch::Tensor cu_q,
-    torch::Tensor cu_k,
-    torch::Tensor row_ptr,
-    torch::Tensor q_idx,
+template <int kTopK, int kBlockK, int kWarps>
+void launch_hist_kernel(
+    int const* q2k,
+    int const* cu_q,
+    int const* row_map,
+    int* row_counts,
+    int* tile_counts,
+    int H,
+    int B,
+    int S_Q,
     int total_rows,
     int max_kv_blocks,
-    torch::Tensor scheduler_metadata = torch::Tensor(),
-    torch::Tensor work_count = torch::Tensor(),
-    torch::Tensor qsplit_idx = torch::Tensor(),
-    torch::Tensor split_counts = torch::Tensor(),
-    int target_q_per_cta = 1,
-    int work_capacity = 0,
-    int max_seqlen_q = 0)
+    int q_per_cta,
+    int q_per_warp,
+    size_t smem_bytes,
+    int G,
+    cudaStream_t stream)
 {
-    int H = (int)q2k.size(0);
-    int S_Q = (int)q2k.size(1);
-    int topK = (int)q2k.size(2);
-    TORCH_CHECK(topK == kTopK, "topK runtime != template kTopK");
-    int B = (int)cu_q.size(0) - 1;
-    auto device = q2k.device();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, kWarps>;
+    cudaFuncSetAttribute(
+        hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    hist_fn<<<G, kWarps * kWarpSize, smem_bytes, stream>>>(
+        q2k, cu_q, row_map, row_counts, tile_counts,
+        H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
+}
 
-    AT_CUDA_CHECK(cudaMemsetAsync(
-        row_ptr.data_ptr<int>(), 0,
-        (size_t)H * (total_rows + 1) * sizeof(int), stream));
-    AT_CUDA_CHECK(cudaMemsetAsync(
-        q_idx.data_ptr<int>(), 0xFF,
-        (size_t)H * S_Q * kTopK * sizeof(int), stream));
+template <int kTopK, int kBlockK, int kWarps>
+void launch_scatter_kernel(
+    int const* q2k,
+    int const* cu_q,
+    int const* row_map,
+    int const* abs_base,
+    int* q_idx,
+    int* qsplit_idx,
+    int* split_counts,
+    int H,
+    int B,
+    int S_Q,
+    int total_rows,
+    int max_kv_blocks,
+    int q_per_cta,
+    int q_per_warp,
+    int max_seqlen_q,
+    size_t smem_bytes,
+    int G,
+    cudaStream_t stream)
+{
+    auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, kWarps>;
+    cudaFuncSetAttribute(
+        scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    scat_fn<<<G, kWarps * kWarpSize, smem_bytes, stream>>>(
+        q2k, cu_q, row_map, abs_base, q_idx, qsplit_idx, split_counts,
+        H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp, max_seqlen_q);
+}
 
-    auto opts = torch::TensorOptions().dtype(torch::kInt32).device(device);
-    auto row_counts = torch::zeros({H, total_rows}, opts);
-    auto row_map = torch::empty({B, max_kv_blocks}, opts);
-    bool emit_schedule = scheduler_metadata.defined();
-    auto row_coords = emit_schedule ? torch::empty({total_rows, 2}, opts) : torch::Tensor();
-    int* scheduler_metadata_ptr = emit_schedule ? scheduler_metadata.data_ptr<int>() : nullptr;
-    int* work_count_ptr = emit_schedule ? work_count.data_ptr<int>() : nullptr;
-    int* qsplit_idx_ptr = emit_schedule ? qsplit_idx.data_ptr<int>() : nullptr;
-    int* split_counts_ptr = emit_schedule ? split_counts.data_ptr<int>() : nullptr;
-    int* row_coords_ptr = emit_schedule ? row_coords.data_ptr<int>() : nullptr;
-    if (emit_schedule) {
-        AT_CUDA_CHECK(cudaMemsetAsync(work_count_ptr, 0, sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(
-            scheduler_metadata_ptr, 0,
-            (size_t)work_capacity * 6 * sizeof(int), stream));
+#define K2Q_DISPATCH_WARPS(topk, kwarps, BODY)          \
+    do {                                                \
+        if ((kwarps) == 4) {                            \
+            BODY(topk, 4);                              \
+        } else if ((kwarps) == 2) {                     \
+            BODY(topk, 2);                              \
+        } else {                                        \
+            BODY(topk, 1);                              \
+        }                                               \
+    } while (0)
+
+#define K2Q_DISPATCH_TOPK_WARPS(topk, kwarps, BODY)    \
+    do {                                                \
+        if ((topk) == 16) {                             \
+            K2Q_DISPATCH_WARPS(16, kwarps, BODY);      \
+        } else if ((topk) == 8) {                       \
+            K2Q_DISPATCH_WARPS(8, kwarps, BODY);        \
+        } else if ((topk) == 32) {                      \
+            K2Q_DISPATCH_WARPS(32, kwarps, BODY);       \
+        } else if ((topk) == 4) {                       \
+            K2Q_DISPATCH_WARPS(4, kwarps, BODY);        \
+        }                                               \
+    } while (0)
+
+}  // namespace
+
+extern "C" void k2q_launch_row_map(
+    int const* cu_k,
+    int* row_map,
+    int* row_coords,
+    int B,
+    int max_kv_blocks,
+    cudaStream_t stream)
+{
+    if (max_kv_blocks <= 0) {
+        return;
     }
+    k2q_build_row_map_kernel<128><<<max_kv_blocks, 32, 0, stream>>>(
+        cu_k, row_map, row_coords, B, max_kv_blocks);
+}
 
-    int dev = q2k.get_device();
-    int num_sms = 0;
-    AT_CUDA_CHECK(cudaDeviceGetAttribute(
-        &num_sms, cudaDevAttrMultiProcessorCount, dev));
+extern "C" void k2q_launch_hist(
+    int topk,
+    int kwarps,
+    int const* q2k,
+    int const* cu_q,
+    int const* row_map,
+    int* row_counts,
+    int* tile_counts,
+    int H,
+    int B,
+    int S_Q,
+    int total_rows,
+    int max_kv_blocks,
+    int q_per_cta,
+    int q_per_warp,
+    size_t smem_bytes,
+    int G,
+    cudaStream_t stream)
+{
+#define LAUNCH_HIST(TOPK, WARPS) \
+    launch_hist_kernel<TOPK, 128, WARPS>( \
+        q2k, cu_q, row_map, row_counts, tile_counts, \
+        H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp, \
+        smem_bytes, G, stream)
+    K2Q_DISPATCH_TOPK_WARPS(topk, kwarps, LAUNCH_HIST);
+#undef LAUNCH_HIST
+}
 
-    // -- Pick kWarps per CTA based on SMEM budget for cursor/hist ---------
-    // SMEM per CTA = kWarps * total_rows * sizeof(int) (for both H and S).
-    // Want at least 2 CTAs/SM for memory parallelism. SM100 SMEM = 228KB.
-    // Pick the largest kWarps that fits two CTAs/SM, capped at 4.
-    // SMEM cursor packed as int16 (2 entries per int32 word):
-    int per_warp_smem = ((total_rows + 1) >> 1) * (int)sizeof(int);
-    int kWarps_pick = 4;
-    while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > 228 * 1024) {
-        kWarps_pick >>= 1;
-    }
-    if (kWarps_pick < 1) kWarps_pick = 1;
+extern "C" void k2q_launch_row_prefix(
+    int const* row_counts,
+    int* row_ptr,
+    int const* row_coords,
+    int* scheduler_metadata,
+    int* work_count,
+    int total_rows,
+    int target_q_per_cta,
+    int work_capacity,
+    int H,
+    cudaStream_t stream)
+{
+    k2q_row_prefix_kernel<1024><<<H, 1024, 0, stream>>>(
+        row_counts, row_ptr, row_coords, scheduler_metadata, work_count,
+        total_rows, target_q_per_cta, work_capacity);
+}
 
-    // -- Pick G (CTAs) ----------------------------------------------------
-    // For each (kWarps, per_warp_smem) pair, the SMEM-bound occupancy is
-    // 228KB / (kWarps*per_warp_smem) CTAs/SM. We size G as
-    // num_sms * occupancy so a single resident wave covers all CTAs and
-    // the memory pipeline runs at peak.
-    int per_cta_smem_bytes = kWarps_pick * per_warp_smem;
-    int max_ctas_per_sm = std::max(
-        1, (228 * 1024) / std::max(1, per_cta_smem_bytes));
-    if (max_ctas_per_sm > 8) max_ctas_per_sm = 8;
-    constexpr int kMinQPerCta = 256;
-    // Cap target_g at num_sms * 3 — empirically this balances
-    // per-CTA work-size against parallelism. Higher caps regress
-    // mid-size cases due to row_counts atomicAdd contention and
-    // smaller q_per_cta. SMEM-bound configurations naturally cap
-    // lower if max_ctas_per_sm < 3.
-    int target_g = num_sms * std::min(max_ctas_per_sm, 3);
-    int max_g_for_q = (S_Q + kMinQPerCta - 1) / kMinQPerCta;
-    int G = std::min({target_g, max_g_for_q, S_Q});
-    if (G < 1) G = 1;
-    int q_per_cta = (S_Q + G - 1) / G;
-    G = (S_Q + q_per_cta - 1) / q_per_cta;
-    int q_per_warp = (q_per_cta + kWarps_pick - 1) / kWarps_pick;
-    int G_total = G * kWarps_pick;
-
-    auto tile_counts = torch::empty({G_total, H, total_rows}, opts);
-
-    // -- Compile-time switch on kWarps for the templated kernels ---------
-    auto rmap_fn = k2q_build_row_map_kernel<kBlockK>;
-    auto rprefix_fn = k2q_row_prefix_kernel<1024>;
+extern "C" void k2q_launch_tile_prefix(
+    int* tile_counts,
+    int const* row_ptr,
+    int H,
+    int total_rows,
+    int G_total,
+    cudaStream_t stream)
+{
     constexpr int kPtRowsPerBlock = 8;
     constexpr int kPtThreads = 256;
+    int blocks_per_h = (total_rows + kPtRowsPerBlock - 1) / kPtRowsPerBlock;
+    int pt_grid = H * blocks_per_h;
+    if (pt_grid < 1) {
+        pt_grid = 1;
+    }
+    size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
     auto tprefix_smem_fn = k2q_tile_prefix_smem_kernel<kPtThreads, kPtRowsPerBlock>;
-
-    if (max_kv_blocks > 0) {
-        rmap_fn<<<max_kv_blocks, 32, 0, stream>>>(
-            cu_k.data_ptr<int>(), row_map.data_ptr<int>(), row_coords_ptr, B, max_kv_blocks);
-    }
-
-    auto launch_hist_scatter = [&](auto kWarps_const) {
-        constexpr int W = decltype(kWarps_const)::value;
-        size_t smem_bytes = (size_t)W * per_warp_smem;
-        auto hist_fn = k2q_hist_kernel<kTopK, kBlockK, W>;
-        auto scat_fn = k2q_scatter_kernel<kTopK, kBlockK, W>;
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
-            hist_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
-            scat_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes));
-
-        hist_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
-            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
-            row_counts.data_ptr<int>(), tile_counts.data_ptr<int>(),
-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp);
-
-        rprefix_fn<<<H, 1024, 0, stream>>>(
-            row_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
-            emit_schedule ? row_coords.data_ptr<int>() : nullptr,
-            scheduler_metadata_ptr,
-            work_count_ptr,
-            total_rows,
-            target_q_per_cta,
-            work_capacity);
-
-        // Grid is H * blocks_per_h so each block stays within a single
-        // head; flat (H*total_rows) grid would skip rows when total_rows
-        // is not a multiple of kPtRowsPerBlock.
-        int blocks_per_h = (total_rows + kPtRowsPerBlock - 1) / kPtRowsPerBlock;
-        int pt_grid = H * blocks_per_h;
-        if (pt_grid < 1) pt_grid = 1;
-        size_t pt_smem = (size_t)kPtRowsPerBlock * G_total * sizeof(int);
-        AT_CUDA_CHECK(cudaFuncSetAttribute(
-            tprefix_smem_fn, cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)pt_smem));
-        tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
-            tile_counts.data_ptr<int>(), row_ptr.data_ptr<int>(),
-            H, total_rows, G_total);
-
-        scat_fn<<<G, W * kWarpSize, smem_bytes, stream>>>(
-            q2k.data_ptr<int>(), cu_q.data_ptr<int>(), row_map.data_ptr<int>(),
-            tile_counts.data_ptr<int>(), q_idx.data_ptr<int>(),
-            qsplit_idx_ptr, split_counts_ptr,
-            H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp,
-            max_seqlen_q);
-    };
-
-    if (kWarps_pick == 4) {
-        launch_hist_scatter(std::integral_constant<int, 4>{});
-    } else if (kWarps_pick == 2) {
-        launch_hist_scatter(std::integral_constant<int, 2>{});
-    } else {
-        launch_hist_scatter(std::integral_constant<int, 1>{});
-    }
+    cudaFuncSetAttribute(
+        tprefix_smem_fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)pt_smem);
+    tprefix_smem_fn<<<pt_grid, kPtThreads, pt_smem, stream>>>(
+        tile_counts, row_ptr, H, total_rows, G_total);
 }
 
-void run_build_k2q_csr(
-    torch::Tensor q2k,
-    torch::Tensor cu_q,
-    torch::Tensor cu_k,
-    torch::Tensor row_ptr,
-    torch::Tensor q_idx,
-    int64_t topk,
-    int64_t blk_kv,
-    int64_t total_rows,
-    int64_t max_kv_blocks)
+extern "C" void k2q_launch_scatter(
+    int topk,
+    int kwarps,
+    int const* q2k,
+    int const* cu_q,
+    int const* row_map,
+    int const* abs_base,
+    int* q_idx,
+    int* qsplit_idx,
+    int* split_counts,
+    int H,
+    int B,
+    int S_Q,
+    int total_rows,
+    int max_kv_blocks,
+    int q_per_cta,
+    int q_per_warp,
+    int max_seqlen_q,
+    size_t smem_bytes,
+    int G,
+    cudaStream_t stream)
 {
-    CHECK_INPUT(q2k);
-    CHECK_INPUT(cu_q);
-    CHECK_INPUT(cu_k);
-    CHECK_INPUT(row_ptr);
-    CHECK_INPUT(q_idx);
-    TORCH_CHECK(blk_kv == 128, "build_k2q_csr only supports blk_kv == 128");
-    int H = (int)q2k.size(0);
-    int S_Q = (int)q2k.size(1);
-    int tr = (int)total_rows;
-    int mkv = (int)max_kv_blocks;
-    TORCH_CHECK(tr >= 0 && mkv >= 0,
-                "total_rows / max_kv_blocks must be non-negative");
-    TORCH_CHECK(row_ptr.size(0) == H && row_ptr.size(1) == tr + 1,
-                "row_ptr shape mismatch");
-    TORCH_CHECK(q_idx.size(0) == H && q_idx.size(1) == (int64_t)S_Q * (int)topk,
-                "q_idx shape mismatch");
-    if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        AT_CUDA_CHECK(cudaMemsetAsync(
-            row_ptr.data_ptr<int>(), 0,
-            (size_t)H * (tr + 1) * sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(
-            q_idx.data_ptr<int>(), 0xFF,
-            (size_t)H * S_Q * (int)topk * sizeof(int), stream));
-        return;
-    }
-
-    if (topk == 16) {
-        launch_pipeline<16, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else if (topk == 8) {
-        launch_pipeline<8, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else if (topk == 32) {
-        launch_pipeline<32, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else if (topk == 4) {
-        launch_pipeline<4, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else {
-        TORCH_CHECK(false, "unsupported topK ", topk, " (expected 4, 8, 16, or 32)");
-    }
-}
-
-void run_build_k2q_csr_with_schedule(
-    torch::Tensor q2k,
-    torch::Tensor cu_q,
-    torch::Tensor cu_k,
-    torch::Tensor row_ptr,
-    torch::Tensor q_idx,
-    torch::Tensor scheduler_metadata,
-    torch::Tensor work_count,
-    torch::Tensor qsplit_idx,
-    torch::Tensor split_counts,
-    int64_t topk,
-    int64_t blk_kv,
-    int64_t total_rows,
-    int64_t max_kv_blocks,
-    int64_t target_q_per_cta,
-    int64_t work_capacity,
-    int64_t max_seqlen_q)
-{
-    CHECK_INPUT(q2k);
-    CHECK_INPUT(cu_q);
-    CHECK_INPUT(cu_k);
-    CHECK_INPUT(row_ptr);
-    CHECK_INPUT(q_idx);
-    CHECK_INPUT(scheduler_metadata);
-    CHECK_INPUT(work_count);
-    CHECK_INPUT(qsplit_idx);
-    CHECK_INPUT(split_counts);
-    TORCH_CHECK(blk_kv == 128, "build_k2q_csr only supports blk_kv == 128");
-    int H = (int)q2k.size(0);
-    int S_Q = (int)q2k.size(1);
-    int tr = (int)total_rows;
-    int mkv = (int)max_kv_blocks;
-    int target = (int)target_q_per_cta;
-    int capacity = (int)work_capacity;
-    int max_sq = (int)max_seqlen_q;
-    TORCH_CHECK(tr >= 0 && mkv >= 0 && target > 0 && capacity > 0 && max_sq >= 0,
-                "invalid schedule sizing arguments");
-    TORCH_CHECK(row_ptr.size(0) == H && row_ptr.size(1) == tr + 1,
-                "row_ptr shape mismatch");
-    TORCH_CHECK(q_idx.size(0) == H && q_idx.size(1) == (int64_t)S_Q * (int)topk,
-                "q_idx shape mismatch");
-    TORCH_CHECK(qsplit_idx.sizes() == q_idx.sizes(), "qsplit_idx shape mismatch");
-    TORCH_CHECK(scheduler_metadata.size(0) == capacity && scheduler_metadata.size(1) == 6,
-                "scheduler_metadata shape mismatch");
-    TORCH_CHECK(work_count.numel() == 1, "work_count must have one int32 element");
-    TORCH_CHECK(split_counts.dim() == 2 && split_counts.size(0) == S_Q
-                && split_counts.size(1) == H,
-                "split_counts shape mismatch");
-    if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-        AT_CUDA_CHECK(cudaMemsetAsync(
-            row_ptr.data_ptr<int>(), 0,
-            (size_t)H * (tr + 1) * sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(
-            q_idx.data_ptr<int>(), 0xFF,
-            (size_t)H * S_Q * (int)topk * sizeof(int), stream));
-        AT_CUDA_CHECK(cudaMemsetAsync(work_count.data_ptr<int>(), 0, sizeof(int), stream));
-        if (split_counts.numel() > 0) {
-            AT_CUDA_CHECK(cudaMemsetAsync(
-                split_counts.data_ptr<int>(), 0,
-                (size_t)split_counts.numel() * sizeof(int), stream));
-        }
-        return;
-    }
-
-    if (topk == 16) {
-        launch_pipeline<16, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else if (topk == 8) {
-        launch_pipeline<8, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else if (topk == 32) {
-        launch_pipeline<32, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else if (topk == 4) {
-        launch_pipeline<4, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else {
-        TORCH_CHECK(false, "unsupported topK ", topk, " (expected 4, 8, 16, or 32)");
-    }
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("run_build_k2q_csr", &run_build_k2q_csr,
-          "q2k -> k2q CSR build (sorted within row)",
-          pybind11::arg("q2k"),
-          pybind11::arg("cu_q"),
-          pybind11::arg("cu_k"),
-          pybind11::arg("row_ptr"),
-          pybind11::arg("q_idx"),
-          pybind11::arg("topk"),
-          pybind11::arg("blk_kv"),
-          pybind11::arg("total_rows"),
-          pybind11::arg("max_kv_blocks"));
-    m.def("run_build_k2q_csr_with_schedule", &run_build_k2q_csr_with_schedule,
-          "q2k -> k2q CSR build with fused attention schedule metadata",
-          pybind11::arg("q2k"),
-          pybind11::arg("cu_q"),
-          pybind11::arg("cu_k"),
-          pybind11::arg("row_ptr"),
-          pybind11::arg("q_idx"),
-          pybind11::arg("scheduler_metadata"),
-          pybind11::arg("work_count"),
-          pybind11::arg("qsplit_idx"),
-          pybind11::arg("split_counts"),
-          pybind11::arg("topk"),
-          pybind11::arg("blk_kv"),
-          pybind11::arg("total_rows"),
-          pybind11::arg("max_kv_blocks"),
-          pybind11::arg("target_q_per_cta"),
-          pybind11::arg("work_capacity"),
-          pybind11::arg("max_seqlen_q"));
+#define LAUNCH_SCATTER(TOPK, WARPS) \
+    launch_scatter_kernel<TOPK, 128, WARPS>( \
+        q2k, cu_q, row_map, abs_base, q_idx, qsplit_idx, split_counts, \
+        H, B, S_Q, total_rows, max_kv_blocks, q_per_cta, q_per_warp, max_seqlen_q, \
+        smem_bytes, G, stream)
+    K2Q_DISPATCH_TOPK_WARPS(topk, kwarps, LAUNCH_SCATTER);
+#undef LAUNCH_SCATTER
 }

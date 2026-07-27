@@ -174,17 +174,50 @@ def _get_tvm_ffi_include():
     raise RuntimeError("Cannot find TVM-FFI include directory; install apache-tvm-ffi")
 
 
+def _parse_nvcc_major(nvcc_path: str) -> int:
+    """Return the major CUDA toolkit version from ``nvcc --version``."""
+    result = subprocess.run(
+        [nvcc_path, "--version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    for line in result.stdout.splitlines():
+        if "release" in line:
+            release = line.split("release", 1)[1].strip().split(",")[0].strip()
+            return int(release.split(".")[0])
+    raise RuntimeError(f"Could not parse nvcc version from:\n{result.stdout}")
+
+
+def _require_cuda13_toolkit(cuda_home: str) -> None:
+    """Require CUDA toolkit 13.x for csrc JIT compilation."""
+    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    if not os.path.isfile(nvcc):
+        raise RuntimeError(f"nvcc not found under {cuda_home}")
+    major = _parse_nvcc_major(nvcc)
+    if major < 13:
+        raise RuntimeError(
+            f"CUDA toolkit {major}.x found at {cuda_home}; "
+            "CUDA 13.x or newer is required"
+        )
+
+
 def _get_cuda_home():
     """Find CUDA toolkit root."""
     if "CUDA_HOME" in os.environ:
-        return os.environ["CUDA_HOME"]
-    nvcc = shutil.which("nvcc")
-    if nvcc:
-        return str(Path(nvcc).resolve().parent.parent)
-    for p in ["/usr/local/cuda", "/opt/cuda"]:
-        if os.path.isdir(p):
-            return p
-    raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
+        cuda_home = os.environ["CUDA_HOME"]
+    elif (nvcc := shutil.which("nvcc")):
+        cuda_home = str(Path(nvcc).resolve().parent.parent)
+    else:
+        cuda_home = None
+        for p in ["/usr/local/cuda", "/opt/cuda"]:
+            if os.path.isdir(p):
+                cuda_home = p
+                break
+        if cuda_home is None:
+            raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
+    _require_cuda13_toolkit(cuda_home)
+    return cuda_home
 
 
 _ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
