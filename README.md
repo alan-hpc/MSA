@@ -21,7 +21,7 @@ Python package; the public `fmha_sm100` / `fmha_sm100_plan` API is unchanged.
 
 > **Note:** `docs/architecture.png` predates the KV-outer integration and shows the
 > original two-stack layout. On this branch, sparse prefill is routed through
-> KV-outer (GQA ≥ 8) or legacy CuTe (GQA &lt; 8) via `sparse_fmha_adapter.py`.
+> KV-outer (GQA ≥ 8) or original MiniMax MSA CuTe (GQA &lt; 8) via `sparse_fmha_adapter.py`.
 
 > Algorithm reference: [MiniMax Sparse Attention paper](docs/MiniMaxSparseAttention.pdf).
 
@@ -29,8 +29,8 @@ Python package; the public `fmha_sm100` / `fmha_sm100_plan` API is unchanged.
 |---|---|---|
 | **csrc JIT** | `python/fmha_sm100/csrc/` | Dense FMHA (`fmha_sm100`, `fmha_sm100_plan`) + `sparse_topk_select` indexer, compiled from Jinja templates by `jit.py` at runtime. |
 | **KV-outer** | `python/fmha_sm100/kvouter/` + `csrc/kvouter/` | Fireworks KV-outer sparse **prefill** (GQA ≥ 8): Python CuTe-DSL + optional C++ AOT extension (`fmha_sm100._C`). Default path when `qhead_per_kv ≥ 8`. |
-| **CuTe-DSL (legacy sparse)** | `python/fmha_sm100/cute/` | CSR sparse prefill fallback (GQA &lt; 8), paged FP8 decode, BF16 / FP8 / NVFP4 / FP4 paths, compiled at runtime via `cute.compile`. |
-| **Bridge** | `python/fmha_sm100/sparse_fmha_adapter.py` | Routes sparse prefill through KV-outer or legacy CuTe based on GQA ratio; adapts the `fmha_sm100` API to both backends. |
+| **original MiniMax MSA CuTe-DSL** | `python/fmha_sm100/cute/` | CSR sparse prefill fallback (GQA &lt; 8), paged FP8 decode, BF16 / FP8 / NVFP4 / FP4 paths, compiled at runtime via `cute.compile`. |
+| **Bridge** | `python/fmha_sm100/sparse_fmha_adapter.py` | Routes sparse prefill through KV-outer or original MiniMax MSA CuTe based on GQA ratio; adapts the `fmha_sm100` API to both backends. |
 
 > **License: MIT.** Self-authored files carry `SPDX-License-Identifier: MIT`.
 > See [LICENSE](LICENSE) and [NOTICE](NOTICE). Bundled / derived third-party
@@ -39,7 +39,7 @@ Python package; the public `fmha_sm100` / `fmha_sm100_plan` API is unchanged.
 ## Requirements
 
 - **GPU**: NVIDIA SM100 (Blackwell).
-- **Toolchain**: CUDA Toolkit **13.x** with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set). Required for all stacks (csrc JIT, KV-outer, legacy CuTe).
+- **Toolchain**: CUDA Toolkit **13.x** with `nvcc` on `PATH` (or `CUDA_HOME` / `CUDA_PATH` set). Required for all stacks (csrc JIT, KV-outer, original MiniMax MSA CuTe).
 - **Python**: ≥ 3.10.
 - **PyTorch**: ≥ 2.9 (see `pyproject.toml`).
 - **OS**: Linux x86_64 (aarch64 untested; JIT builds may need small Makefile edits on WSL).
@@ -107,7 +107,7 @@ restarts.
 | `MINIMAX_KERNELS_CUTE_AOT_CACHE` | Persistent directory for KV-outer CuTe-DSL AOT exports (default: per-process temp dir) |
 
 Sparse prefill uses KV-outer when `num_qo_heads // num_kv_heads ≥ 8` (e.g. TP1
-config 64/4); lower GQA ratios still use the legacy CuTe CSR path under `cute/`.
+config 64/4); lower GQA ratios still use the original MiniMax MSA CuTe CSR path under `cute/`.
 
 ## Verify
 
@@ -167,7 +167,7 @@ out, _ = fmha_sm100(
 ```
 
 For block-sparse prefill with CSR metadata, NVFP4 K/V, and the paged FP8 decode
-wrapper, see the **legacy CuTe-DSL deep dive** (still used for decode, NVFP4, and
+wrapper, see the **original MiniMax MSA CuTe-DSL deep dive** (still used for decode, NVFP4, and
 GQA &lt; 8 prefill):
 
 - [`python/fmha_sm100/cute/README.md`](python/fmha_sm100/cute/README.md)
@@ -230,13 +230,13 @@ python/fmha_sm100/                  Python package
   api.py                            fmha_sm100 / fmha_sm100_plan / sparse_topk_select
   jit.py                            Runtime JIT (nvcc + ninja) for the csrc stack
   sparse.py                         Lazy shim that loads the cute/ stack
-  sparse_fmha_adapter.py            Bridge: fmha_sm100 API → KV-outer or legacy CuTe
+  sparse_fmha_adapter.py            Bridge: fmha_sm100 API → KV-outer or original MiniMax MSA CuTe
   kvouter/                          Vendored Fireworks KV-outer (Python + AOT export)
   csrc/kvouter/                     KV-outer C++ op (fmha_sm100._C)
   csrc/                             Dense CUDA kernels + Jinja templates (JIT-compiled)
     include/                        Vendored FlashInfer / CUTLASS-derived / TRT-LLM headers
   cutlass/                          NVIDIA CUTLASS git submodule (include/ + tools/util/include/)
-  cute/                             Legacy CuTe-DSL sparse attention (loaded via sys.path)
+  cute/                             Original MiniMax MSA CuTe-DSL sparse attention (loaded via sys.path)
 setup.py                            Builds fmha_sm100._C CUDA extension
 tests/                              Correctness tests
   smoke/  integration/  regression/
@@ -256,13 +256,13 @@ benchmarks/                         bench_sparse_attention_ops.py
   for background. Index build + forward + combine; C++ AOT path preferred
   (`fmha_sm100._C`). Public entry: `sparse_fmha` → `kvouter_attention`
   (via `sparse_fmha_adapter`).
-- **CuTe-DSL (legacy sparse)** — CSR sparse prefill fallback (GQA &lt; 8),
+- **original MiniMax MSA CuTe-DSL** — CSR sparse prefill fallback (GQA &lt; 8),
   FP8 / NVFP4 / FP4 quantization, paged FP8 decode
   (`SparseDecodePagedAttentionWrapper`), FP4 block-score indexer.
   Public entry: `fmha_sm100.sparse_atten_func`,
   `fmha_sm100.sparse_decode_atten_func`, `fmha_sm100.fp4_indexer_block_scores`.
 - **Bridge** — `sparse_fmha_plan` / `sparse_fmha` adapt the dense-API call
-  site to KV-outer or legacy CuTe for prefill; decode and indexer paths are
+  site to KV-outer or original MiniMax MSA CuTe for prefill; decode and indexer paths are
   unchanged.
 
 ## Third-party licenses

@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fmha_sm100"
 version = "0.1.1"
-description = "MSA — MiniMax Sparse Attention: dense FlashAttention + sparse top-k indexer (csrc JIT), Fireworks KV-outer sparse prefill, and legacy CuTe-DSL sparse attention for NVIDIA SM100 (CUDA 13.x required)"
+description = "MSA — MiniMax Sparse Attention: dense FlashAttention + sparse top-k indexer (csrc JIT), Fireworks KV-outer sparse prefill, and original MiniMax MSA CuTe-DSL sparse attention for NVIDIA SM100 (CUDA 13.x required)"
 readme = "README.md"
 requires-python = ">=3.10"
 # SPDX-License-Identifier: MIT
@@ -37,7 +37,7 @@ dependencies = [
 #     the package directory so that JIT can locate them via __file__.
 #   * KV-outer (python/fmha_sm100/kvouter/ + csrc/kvouter/) is built as
 #     fmha_sm100._C at install time and routes sparse prefill for GQA >= 8.
-#   * The legacy CuTe-DSL sparse stack (python/fmha_sm100/cute/) is exposed
+#   * The original MiniMax MSA CuTe-DSL sparse stack (python/fmha_sm100/cute/) is exposed
 #     through the importable `fmha_sm100.sparse` module (and lazily from the
 #     package root), which adds that directory to sys.path and re-exports the
 #     public sparse API.

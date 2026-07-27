@@ -1,6 +1,6 @@
-# MiniMax Sparse Attention (MSA) — legacy CuTe-DSL sparse stack
+# MiniMax Sparse Attention (MSA) — original MiniMax MSA CuTe-DSL sparse stack
 
-This is the **legacy CuTe-DSL** sparse implementation, shipped inside the
+This is the **original MiniMax MSA CuTe-DSL** sparse implementation, shipped inside the
 `fmha_sm100` Python package. On the `fireworks-msa` branch, sparse **prefill**
 with `qhead_per_kv >= 8` is routed to the Fireworks KV-outer backend instead;
 this stack remains the path for GQA &lt; 8 prefill, paged FP8 decode, NVFP4 /
@@ -8,7 +8,7 @@ FP4 quantization, and the FP4 indexer. For the package overview, install
 steps, and the dense csrc JIT path, see the
 [top-level README](../../../../README.md).
 
-The rest of this file documents the **legacy CuTe-DSL sparse** surface only:
+The rest of this file documents the **original MiniMax MSA CuTe-DSL sparse** surface only:
 CSR metadata, schedules, sparse page attention, FP8 / NVFP4 / FP4 quantization,
 the paged FP8 decode wrapper, and the FP4 indexer.
 
