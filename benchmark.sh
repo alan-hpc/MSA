@@ -261,6 +261,7 @@ echo
     --timing "$TIMING" \
     --qk-source "$QK_SOURCE" --qk-model "$QK_MODEL" --qk-layer "$QK_LAYER" \
     --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} \
+    --chunk-q "$PREFILL_CHUNK" \
     --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
     --gpu 0 \
     --csv "$OUT_DIR/baseline.csv" \
