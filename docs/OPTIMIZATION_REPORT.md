@@ -35,6 +35,8 @@
 | 14 | `block=128` + 小 topk 是被漏掉的最优区间 | cfg24（blk128/k8）128K 下 **18.26×** @ cos 0.9899，优于 cfg07 的 10.94× @ cos 0.9897 | 📋 **首选配置** |
 | 15 | `fireworks-msa` 的 KV-outer 后端在推荐工作点只有 1.03–1.12× | 优势随 topk 增长，恰与"往小 topk 走"的结论错位；数值等价（cos 0.99999） | 📋 值得合，非首要 |
 | 16 | decode 的 dense 已跑在 ~88% HBM 带宽上，稀疏路径距其带宽下界 **380×** | 说明 decode 的全部空间都被 §9(a) 的内核不匹配吃掉 | 🔴 印证 #12 |
+| 18 | **FP4 scale-reorder 内核在 2³⁰ 元素处非法访存** | 同类问题第三处；**说明是系统性 32 位寻址问题而非孤立 bug** | ✅ 已加守卫 |
+| 19 | `block=64 + topk=32` 在 512K prefill 内存放不下 | 确定性 OOM，同 topk 的 block=128 跑得通；从内存维度独立佐证 #14 | 📋 已记录 |
 | 17 | **dense FMHA 在 512K prefill 非法访存**（Q/O 元素数正好 2³¹），且不总是崩 | 污染 CUDA context 带走整场扫描；`dense (msa)` 的 512K 格作废。**FA4 在 1.5×2³¹ 处仍正确**，证明这是本仓库的 32 位寻址 bug 而非固有限制 | ✅ 已加守卫 |
 
 ### 关键实测（batch=1, causal, bf16, GPU-only 单层时间）
@@ -546,10 +548,52 @@ False），而分支把 AOT C++ 路径列为优先、Python 为 fallback。**下
 > 稀疏 forward（CuTe 的 `sparse_atten_func`）在同一 shape 下没有崩。它是另一条入口，
 > 不走这个守卫；但也不能据此断言它是 Int64 安全的，只能说这次没触发。
 
-**另外 3 个 OOM**：cfg04/08/12（blk=64, topk=32）在 512K 报
-`OutOfMemoryError: Tried to allocate 4.00 GiB`。同为 topk=32 的 cfg19/26/33（blk=128）
-却跑通了（attn 71.381 ms），说明这不是某个配置放不下，而是扫描过程中显存累积的结果。
-这本身也是 §4 的佐证：partial-O 是这条流水线上最大的单块分配。
+**另外 3 个 OOM**：cfg04/08/12（blk=64, topk=32）在 512K OOM，见 §20——
+后续验证表明它是确定性的固有限制，不是扫描过程中的显存累积。
+
+---
+---
+
+## 19. 🔴 FP4 scale-reorder 内核的 32 位寻址上限（已加守卫）
+
+跑完整 `benchmark.sh` 时抓到的第三处同类问题。1M decode 在 **`setup` 阶段**
+非法访存——早于所有已有守卫，且和预测中的 `csr` 失败无关。逐步同步二分后隔离到
+`fp4_indexer_reorder_scales_for_mma_cute` 自身。卡边：
+
+| K scale 张量 | 元素数 | 结果 |
+|---|---|---|
+| 262143 页 × 4 × 128 × 8 | 1,073,737,728 | 正常 |
+| **262144 页 × 4 × 128 × 8** | **1,073,741,824 = 2³⁰** | **每次都非法访存** |
+
+**上限是 2³⁰ 而不是 2³¹**，说明 kernel 内部某处按「输入 + 输出」两倍量形成偏移，
+恰好在 2 × 2³⁰ 处溢出 Int32。
+
+**这已经是同一类问题的第三处**（§2 indexer 分数张量 2³¹、§18 dense Q/O 2³¹、
+本节 scale reorder 2³⁰）。**这不是三个孤立 bug，是这套 CuTe 栈系统性的 32 位寻址问题。**
+三处的失败方式也一样：非法访存而非抛异常，污染 CUDA context，一个坏 shape 带走整场扫描。
+根治办法对三者相同——把 layout 的 extent 提升到 Int64，FA4 已经证明这条路可行（§18）。
+
+**已做**：在 `fp4_indexer_reorder_scales_for_mma_cute` 入口按 `k_scale.numel()` 加守卫。
+注意这条限制**按 selection head 数缩放**，所以 `sum`/`max`（共享 1 份 selection）比
+`keep`（Hkv 份）晚 4 倍才触发。
+
+---
+
+## 20. 📋 512K prefill 的内存墙：`block=64 + topk=32` 放不下
+
+`block=64, topk=32` 在 512K prefill 下 attention 级 OOM（`Tried to allocate 4.00 GiB`，
+268 GiB 卡上失败时只剩 1.98 GiB），而**同样 topk=32 的 `block=128` 跑得通**（attn 72.3 ms）。
+
+**确定性的，不是偶然**：两次完整 run 命中同样 3 个格子（cfg04/08/12），
+且单独在干净进程里跑同样 OOM。（先前一版报告把它归因为扫描过程中的显存累积，
+那个解释是错的，已更正。）
+
+selection→attention 路径上有某项随 **1/block** 增长，所以 block=64 需要 block=128 的两倍。
+确切是哪一块分配尚未定位——这里记录的是**实测边界而非公式**，`verify_expectations.py`
+里也照此标注。
+
+**意义**：这是从内存维度独立佐证了 §14 的结论。§14 从延迟出发说「往大 block、小 topk 走」；
+这里说的是**小 block + 大 topk 在长上下文下根本放不下**。两条独立理由指向同一个方向。
 
 ---
 ## 配置选择结论

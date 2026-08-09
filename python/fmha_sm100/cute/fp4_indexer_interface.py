@@ -348,6 +348,30 @@ def _compile_fp4_scale_reorder_kernel(
     return _FP4_COMPILE_CACHE[key]
 
 
+#: The scale-reorder kernel indexes with 32-bit arithmetic, and it faults once
+#: the K scale tensor reaches 2**30 elements -- half the Int32 range, which is
+#: what a kernel forming a combined input+output offset would give.  Measured on
+#: B300 at Hkv=4, page_size=128, G=8: 262143 pages runs, 262144 (exactly 2**30
+#: elements) illegal-accesses every time.  Like the other two 32-bit limits in
+#: this stack, the failure poisons the CUDA context rather than raising, so it
+#: takes down whatever runs next in the same process.
+_SCALE_REORDER_MAX_ELEMS = 2**30
+
+
+def _check_scale_reorder_int32(k_scale) -> None:
+    elems = int(k_scale.numel())
+    if elems < _SCALE_REORDER_MAX_ELEMS:
+        return
+    per_page = elems // max(1, int(k_scale.shape[0]))
+    raise ValueError(
+        f"K scale tensor has {elems} elements {tuple(k_scale.shape)}, at or above the "
+        f"{_SCALE_REORDER_MAX_ELEMS}-element limit of the scale-reorder kernel's 32-bit "
+        f"indexing. Past it the kernel illegal-accesses and poisons the CUDA context.\n"
+        f"At this geometry the ceiling is {(_SCALE_REORDER_MAX_ELEMS - 1) // max(1, per_page)} "
+        f"pages; reorder the K scales in chunks, or reduce batch x context."
+    )
+
+
 def fp4_indexer_reorder_scales_for_mma_cute(
     q_scale: torch.Tensor,
     k_scale: torch.Tensor,
@@ -372,6 +396,7 @@ def fp4_indexer_reorder_scales_for_mma_cute(
         ``validate_mma_scale_storage``.  These tensors can be passed to
         ``fp4_indexer_block_scores`` with ``scale_layout="preordered_mma"``.
     """
+    _check_scale_reorder_int32(k_scale)
 
     spec = normalize_fp4_format(fp4_format)
     if q_scale.device != k_scale.device:
