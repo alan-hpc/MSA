@@ -182,6 +182,23 @@ def _per_forward_table(by_len) -> str:
     return "\n".join(out)
 
 
+def _denominator(group):
+    """Reference latency for a ratio: the repo's dense kernel, else FA4.
+
+    Past its Int32 Q/O ceiling the repo's dense kernel is skipped, so no row for
+    it exists at the longest contexts -- exactly where the ratio matters most.
+    Falling back to FA4 keeps the column populated; both are dense references
+    and the sweep already reports the gap between them.  Returns None only when
+    neither ran, which is what an n/a cell should mean.
+    """
+    for want in ("dense", "dense-fa4"):
+        r = next((x for x in group if x["name"] == want), None)
+        v = num(r, "pipeline_gpu_ms") if r else None
+        if v:
+            return v
+    return None
+
+
 def render_matrix(by_len) -> str:
     """One config-by-context matrix — the view for comparing configurations."""
     seqlens = sorted(by_len)
@@ -199,8 +216,8 @@ def render_matrix(by_len) -> str:
         for s in seqlens:
             row = next((r for r in by_len[s] if r["name"] == name), None)
             gpu = num(row, "pipeline_gpu_ms") if row else None
-            dense = num(next(r for r in by_len[s] if r["name"] == "dense"), "pipeline_gpu_ms")
-            if row is None or gpu is None or not complete(row):
+            dense = _denominator(by_len[s])
+            if row is None or gpu is None or not complete(row) or dense is None:
                 out.append("<td class='num' style='color:var(--muted)'>n/a</td>")
             elif fmt == "ms":
                 out.append(f"<td class='num'>{gpu:.2f}</td>")
@@ -228,11 +245,18 @@ def render_matrix(by_len) -> str:
     for title, fmt in ((ms_title, "ms"),
                        ("相对 dense 的加速比（&gt;1 表示稀疏更快）", "ratio")):
         rows_html = []
-        dense_cells = "".join(
-            f"<td class='num'>{num(next(r for r in by_len[s] if r['name'] == 'dense'), 'pipeline_gpu_ms'):.2f}</td>"
-            if fmt == "ms" else "<td class='num'>1.00x</td>"
-            for s in seqlens
-        )
+        # The repo's dense kernel is skipped at lengths past its Int32 Q/O
+        # ceiling, so a row for it simply does not exist there.  next() without
+        # a default turned that into a StopIteration inside a generator, which
+        # Python re-raises as RuntimeError and which took the whole render down.
+        def _dense_cell(s):
+            v = _denominator(by_len[s])
+            if v is None:
+                return "<td class='num'>n/a</td>"
+            return (f"<td class='num'>{v:.2f}</td>" if fmt == "ms"
+                    else "<td class='num'>1.00x</td>")
+
+        dense_cells = "".join(_dense_cell(s) for s in seqlens)
         rows_html.append("<tr class='dense'><td>dense causal</td><td class='num'>—</td>"
                          "<td class='num'>—</td><td>—</td><td class='num'>—</td>"
                          + dense_cells + "</tr>")

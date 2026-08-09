@@ -71,6 +71,9 @@ from fmha_sm100.msa_pipeline import (  # noqa: E402
 #: built from Int32 extents, so it must stay within 2**31 elements.
 _SCORE_TENSOR_MAX_ELEMS = 2**31
 
+#: Mirrors the guard in api.py: the dense FMHA's Q/O tensors are Int32-indexed.
+_QO_INT32_LIMIT = 2**31
+
 #: B300 (SM103) dense peak, used only to contextualise the dense row.
 PEAK_TFLOPS_BF16 = 2250.0
 
@@ -240,12 +243,27 @@ _EXC_NOISE = (
 )
 
 
-def _fmt_exc(exc: BaseException, *, limit: int = 400) -> str:
-    """One-line, de-boilerplated rendering of an exception for a table cell."""
+def _fmt_exc(exc: BaseException, *, limit: int = 160) -> str:
+    """One-line, de-boilerplated rendering of an exception for a table cell.
+
+    The guards in this stack deliberately explain themselves at length -- the
+    numbers, the formula, the workarounds -- which is right when one shape
+    fails and wrong when thirty do: the table disappears under prose.  The
+    first sentence carries the fact; everything after it is remedy, and the
+    full text is still in the CSV and JSON.
+    """
     lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
     kept = [ln for ln in lines if not any(ln.startswith(n) for n in _EXC_NOISE)]
     msg = " ".join(kept) if kept else (lines[0] if lines else "")
-    if len(msg) > limit:
+    # A very short first sentence carries no numbers ("CUDA out of memory."),
+    # and the size is the whole point there -- take the next one too.
+    parts = msg.split(". ")
+    head = parts[0].rstrip(".")
+    if len(head) < 40 and len(parts) > 1:
+        head = f"{head}. {parts[1].rstrip('.')}"
+    if head and len(head) <= limit:
+        msg = head
+    elif len(msg) > limit:
         msg = msg[: limit - 1] + "\u2026"
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
@@ -1008,20 +1026,37 @@ def main(argv=None) -> int:
 
         dense_ms = None
         dense_out = None
+        # The repo's dense FMHA indexes Q/O with 32-bit arithmetic, so past
+        # 2**31 elements it cannot run at all -- that is a property of the
+        # shape, known before launching.  Skipping it there is not hiding a
+        # failure; it replaces a guaranteed multi-line guard message, repeated
+        # at every long context, with one line stating the ceiling.  FA4 has no
+        # such limit and still provides the reference.
+        dense_elems = args.batch * seqlen_q * model.num_qo_heads * model.bench_head_dim()
+        dense_reachable = dense_elems < _QO_INT32_LIMIT
+        if not args.no_dense and not dense_reachable:
+            ceiling = (_QO_INT32_LIMIT - 1) // (model.num_qo_heads * model.bench_head_dim())
+            print(f"      -- dense (msa) skipped: Q/O would need {dense_elems} elements, "
+                  f"past the {_QO_INT32_LIMIT} Int32 limit "
+                  f"(ceiling {ceiling} query tokens at this head geometry)")
         if not args.no_dense:
-            try:
-                dense, dense_out = bench_dense(
-                    model=model, batch=args.batch, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
-                    dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
-                    seed=args.seed, timing=args.timing,
-                    want_output=args.cos and seqlen_k <= args.cos_max_seqlen, qkv=qkv_here)
-                dense_ms = dense["pipeline_gpu_ms"]
-                rows.append(dense)
-                print_row(dense)
-            except Exception as exc:  # noqa: BLE001
-                dense_out = None
-                print(f"      !! dense reference failed: {type(exc).__name__}: {exc}")
+            if dense_reachable:
+                try:
+                    dense, dense_out = bench_dense(
+                        model=model, batch=args.batch, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
+                        dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
+                        seed=args.seed, timing=args.timing,
+                        want_output=args.cos and seqlen_k <= args.cos_max_seqlen, qkv=qkv_here)
+                    dense_ms = dense["pipeline_gpu_ms"]
+                    rows.append(dense)
+                    print_row(dense)
+                except Exception as exc:  # noqa: BLE001
+                    dense_out = None
+                    print(f"      !! dense reference failed: {_fmt_exc(exc)}")
 
+            # FA4 is a separate kernel with no such limit, so it must not be
+            # gated on the repo dense being reachable -- it is precisely at the
+            # lengths the repo kernel cannot reach that its reference matters.
             if fa4_fn is not None:
                 try:
                     fa4_row, _ = bench_fa4(
@@ -1031,6 +1066,13 @@ def main(argv=None) -> int:
                         timing=args.timing, qkv=qkv_here)
                     rows.append(fa4_row)
                     print_row(fa4_row, dense_ms)
+                    if dense_ms is None:
+                        # Without this the whole column reads N/A at exactly the
+                        # lengths the sweep exists to measure, even though a
+                        # perfectly good dense reference just ran.
+                        dense_ms = fa4_row["pipeline_gpu_ms"]
+                        print("      -- vs_dense below is against FA4 "
+                              "(the repo's dense kernel cannot run at this shape)")
                 except Exception as exc:  # noqa: BLE001
                     print(f"      !! FA4 reference failed: {type(exc).__name__}: {exc}")
 
