@@ -657,6 +657,13 @@ constexpr int kIndexerNumThreadsPerBlock = 512;
 constexpr int kIndexerNumBins = 1024;  // 10-bit hist (was 2048 / 11-bit)
 constexpr int kIndexerNumFinalItems = 2048;
 
+//: Upper bound on the selectable block count.  The kernel streams the row from
+//: global memory and its shared memory is a fixed union that does not scale
+//: with K, so this is a validation limit rather than a structural one; raising
+//: it is only safe with the correctness check in
+//: benchmarks/probe_topk_limit.py re-run at the new bound.
+constexpr uint32_t kSparseTopkMaxKTiles = 65536;
+
 template <uint32_t MAX_TOPK>
 __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSortKernel(
     const float* __restrict__ in,        // (num_qo_heads, qo, K) row-contig fp32 (transpose_buf)
@@ -1007,7 +1014,7 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   }
 
   // ---- IndexerTopK insertion-sort path ------------------------------------
-  if (max_k_tiles >= 12288) return cudaErrorNotSupported;
+  if (max_k_tiles >= kSparseTopkMaxKTiles) return cudaErrorNotSupported;
 
   float* transpose_buf = reinterpret_cast<float*>(workspace);
   return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, total_qo_len, num_qo_heads,

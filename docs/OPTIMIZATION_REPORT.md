@@ -301,7 +301,7 @@ B=28（114,688 行）跑通、B=32（131,072 行）失败。prefill 因 batch=1 
 
 | 项 | 说明 |
 |---|---|
-| `max_k_tiles < 12288` | top-k 内核只实现了插入排序路径，radix-sort 路径在 fork 时被删掉了。`max_k_tiles = ⌈kv_len / block⌉`，与 batch 无关，所以按 block 换算可达上下文为 **blk32/64/128 → 393K / 786K / 1.5M token**。原断言把上限写成固定的 `12288 × 128` token，只在 block=128 时正确，已改为按 block 表述。 |
+| ~~`max_k_tiles < 12288`~~（已解除，见 §22） | top-k 内核声称只实现插入排序路径。**实测该上限并非结构性的**：内核流式读行、SMEM 不随 K 变，抬到 65536 后选出的索引集合与 `torch.topk` 完全一致。可达上下文由 blk32/64/128 的 393K/786K/1.5M 提升到 **2M/4M/8M**。 |
 | 容器构建适配（已修） | `-arch` 按设备能力取（B300 是 sm_103，原本固定 sm_100 要走 PTX JIT）；CUDA 12.8 起 `-static-global-template-stub` 默认值变更导致匿名 namespace 模板 kernel 编译失败；pip CUDA stack 的 `cusparse.h` 只在 wheel 里，但整目录加 `-I` 会遮蔽 nvcc 自带的 `crt/host_runtime.h`，改为只软链缺失的头。 |
 | benchmark 韧性（已修） | 长扫描中途遇到不可恢复的 CUDA 故障会污染 context 导致后续全挂；现在每行落盘一次、context 不可用时干净退出并保留已测数据。 |
 
@@ -728,6 +728,51 @@ chunk 大小实测(causal,Hkv=4/D=128):
 2. **切块的适用范围有限**:当前只在 `causal 且 batch==1 且走 compact 调度` 时启用——
    chunk 的因果范围靠收缩 `cu_seqlens_k` 表达,这假设 KV 是单段连续的。
    varlen batch 需要逐请求切,尚未做。
+
+---
+---
+
+## 22. ✅ top-k 的 12288 块上限是继承来的，不是结构性的（已解除）
+
+`SparseTopKSelect` 用一句 `if (max_k_tiles >= 12288) return cudaErrorNotSupported;`
+拒绝大 K，注释说 radix-sort 路径未实现。这条限制卡住的是
+**blk=32 在 512K 以上、blk=64 在 1M**——本轮 `baseline,cfg10,cfg12` 扫描里那几个
+`n/a` 全部来自它。
+
+**读代码发现它不像是真的：**内核是流式的——行数据从 gmem 逐段读
+（`logits = in + bid * max_k_tiles`，`size_t` 基址），SMEM 是固定的 16 KB union
+（`FinalItems[2048]` 或 1024-bin 直方图），四级细化（10+11+11+10 = 42 bit）
+之后所有并列项共享同一个 32 位模式并直接填充。**没有任何结构随 K 增长。**
+
+**所以测它，不猜它**（`benchmarks/probe_topk_limit.py`）：抬高上限，越过它跑，
+把选出的索引与 `torch.topk` 在同一份分数上逐行比对。用集合比较，因为内核按
+索引升序输出而非按分数，并列项的取舍也可能不同。
+
+| max_k_tiles | 状态 | 索引集合 vs torch.topk | 耗时 |
+|---|---|---|---|
+| 8192（原上限内） | 跑通 | 一致 | 0.064 ms |
+| 12288 | 跑通 | 一致 | 0.086 ms |
+| 16384 | 跑通 | 一致 | 0.111 ms |
+| 32768 | 跑通 | 一致 | 0.205 ms |
+| 49152 | 跑通 | 一致 | 0.169 ms |
+| **65535** | **跑通** | **一致** | **0.239 ms** |
+
+耗时随 K 线性增长，没有任何拐点——这本身就说明没有触发某条降级路径。
+
+**已做**：上限提到 `kSparseTopkMaxKTiles = 65536`（.cuh 与 api.py 两处），
+并在 `tests/smoke/test_sparse_topk_forced.py` 加了一个 **K=16384** 的强制窗口用例
+（位于原上限之上），让这条边界以后被改回去时必须先面对它。全部用例 PASS。
+
+**效果**：可达上下文按 block 换算从 393K/786K/1.5M 提升到
+**2M / 4M / 8M**（blk 32/64/128）。实测 cfg10 在 512K 已经能跑完 top-k 与 CSR
+（原先是 `X:topk`）。
+
+> **注意 65536 也只是"验到这里"，不是新的结构上限。** 要再往上推，
+> 先把 `probe_topk_limit.py` 在目标 K 上重跑一遍。
+
+**剩余限制不受影响。**512K 上 cfg10/cfg12 仍会失败，但撞的是另外两条：
+indexer 的 Int32 分数张量（§2）与 blk=32/topk=32 的内存墙（§20）。
+这三条是独立的，解除一条不会连带解除另外两条。
 
 ---
 ## 配置选择结论

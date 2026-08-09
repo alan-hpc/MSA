@@ -150,7 +150,17 @@ def test_forced_large_k(
     topk=16, num_valid_pages=4000,
     force_begin=2, force_end=4, seed=99,
 ):
-    """Large K (> 4096 tiles) to stress histogram multi-pass path."""
+    """Large K to stress the histogram multi-pass path.
+
+    Also the regression guard for the selectable-block ceiling.  The dispatcher
+    used to refuse max_k_tiles >= 12288 citing an unimplemented radix-sort path,
+    which capped the reachable context at 12288 * block_size -- 393K tokens at
+    block 32, 786K at block 64.  The kernel streams the row and its shared
+    memory does not scale with K, so the bound was inherited rather than
+    structural; it was raised after checking selected index sets against
+    torch.topk up to K = 65535 (benchmarks/probe_topk_limit.py).  Keep a case
+    above the old bound here so a future change has to face it.
+    """
     torch.manual_seed(seed)
     dev = torch.device("cuda")
     max_score = torch.randn(num_qo_heads, max_k_tiles, total_qo_len,
@@ -191,4 +201,5 @@ if __name__ == "__main__":
     test_forced_ascending_order()
     test_forced_with_xor_fast_path()
     test_forced_large_k()
+    test_forced_large_k(max_k_tiles=16384, num_valid_pages=16000)
     print("\nAll forced-block tests PASSED!")

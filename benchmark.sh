@@ -36,7 +36,8 @@
 #   GPU         CUDA device index                       (default 0)
 #   SEQLENS     comma-separated KV lengths              (default 8192..1048576)
 #   BATCH       requests per measurement                (default 1)
-#   CONFIGS     'all' | 'matrix' | comma-separated list (default all)
+#   CONFIGS     'all' | 'matrix' | comma-separated list
+#               (default baseline,cfg10,cfg12 = baseline + b32/k32/max + b64/k32/max)
 #   OUT_DIR     results directory                       (default results/<UTC stamp>)
 #   DRY_MS      warmup ms per stage                     (default 50)
 #   REP_MS      measurement ms per stage                (default 200)
@@ -70,7 +71,10 @@ cd "$REPO_ROOT"
 PYTHON="${PYTHON:-python3}"
 GPU="${GPU:-0}"
 BATCH="${BATCH:-1}"
-CONFIGS="${CONFIGS:-all}"
+# baseline (block 128 / topk 16 / keep, no forced windows) plus the two the
+# sweep is currently focused on: block 32 and 64, both at topk 32, head=max.
+# CONFIGS=all restores the full 33-point grid.
+CONFIGS="${CONFIGS:-baseline,cfg10,cfg12}"
 INDEXER="${INDEXER:-measure}"
 MODEL="${MODEL:-model-n32}"
 TIMING="${TIMING:-simple}"

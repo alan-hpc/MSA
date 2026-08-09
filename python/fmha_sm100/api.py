@@ -1331,8 +1331,8 @@ def sparse_topk_select(
     # here is one selectable KV block, so the reachable context is
     # 12288 * block_size tokens — quoting a fixed token count would be wrong for
     # every block size but the 128 the indexer happens to page at.
-    assert max_k_tiles < 12288, (
-        f"max_k_tiles={max_k_tiles} >= 12288: v2.3 kernel only supports K < 12288 "
+    assert max_k_tiles < 65536, (
+        f"max_k_tiles={max_k_tiles} >= 65536: top-k select supports K < 65536 "
         f"(radix-sort path not yet implemented). max_k_tiles = ceil(kv_len / block_size), "
         f"so this shape needs a larger block_size (or a shorter context) — "
         f"block_size 32/64/128 reach 393216/786432/1572864 tokens respectively."
