@@ -19,7 +19,7 @@
 
 | # | 问题 | 量化影响 | 状态 |
 |---|---|---|---|
-| 1 | indexer GPU 时间超二次增长，长上下文下反客为主 | 128K 时占稀疏流水线 **72%**；S 每翻倍 ×6.1–6.9（dense 是 ×4.0） | 🔴 **最高优先级** |
+| 1 | indexer GPU 时间超二次增长，长上下文下反客为主 | 128K 时占稀疏流水线 **72%**；S 每翻倍 ×6.1–6.9（dense 是 ×4.0）。**根因已定位见 §21**：causal 调度的串行 task 解码，O(S³) | 🔴 **最高优先级** |
 | 2 | indexer 分数张量按 Int32 寻址，超 2³¹ 元素越界 | `head=sum/max` 在 **S > 92,672** 直接非法访存；原先是静默内存踩踏 | ✅ 已加守卫 |
 | 3 | indexer 每次调用跑 O(q_tiles²) 的 Python 循环 | 32K 下 **15.66 ms/次**纯 CPU × 46 层 = **720 ms/前向** | ✅ 已修复 61.6× |
 | 4 | 稀疏注意力的 partial-O 流量 ∝ topk，与实际访问 token 数无关 | 等预算下 topk=32 比 topk=16 慢 **1.86×** | 📋 建议（结构性） |
@@ -594,6 +594,96 @@ selection→attention 路径上有某项随 **1/block** 增长，所以 block=64
 
 **意义**：这是从内存维度独立佐证了 §14 的结论。§14 从延迟出发说「往大 block、小 topk 走」；
 这里说的是**小 block + 大 topk 在长上下文下根本放不下**。两条独立理由指向同一个方向。
+
+---
+---
+
+## 21. 🔴 §1 的根因找到了：causal 调度里的串行 task 解码，代价 O(S³)
+
+§1 只记录了「indexer 每翻倍 ×6.1–6.9,超二次」这个现象,没有定位原因,并列了两个猜测
+(负载不均 / DRAM page 冲突)。**两个都不对。** 与一个 DSA 形态的 FP8 indexer
+(`compass-sparse-gqa`,DeepGEMM `fp8_mqa_logits`)对照后,原因是确定的。
+
+### 现象:效率每翻倍掉一半
+
+| S | FP8 (SparseGQA) | FP4 (MSA) | FP8 TFLOPS | FP4 TFLOPS |
+|---|---|---|---|---|
+| 32K | 1.41 ms | 0.84 ms | 780 | 654 |
+| 64K | 4.91 ms | 5.08 ms | 896 | 433 |
+| 128K | 18.10 ms | 35.08 ms | 972 | 251 |
+| 256K | 69.50 ms | 257.69 ms | 1012 | **137** |
+
+FP8 那条**效率是平的甚至变好**(大 shape 摊薄开销,正常);FP4 **每翻倍掉一半**,
+耗时比趋近 8 = 2³,即 **time ∝ S³**,而工作量只有 S²。
+注意 FP4 在 32K 是**更快的**(0.84 vs 1.41 ms,而且只做一半 flops)——所以问题不在精度。
+
+### 定位:不是 q 维度,不是 k 维度,是三角形状
+
+固定一维、只增长另一维(`benchmarks/probe_indexer_scaling.py`):
+
+| 形状 | causal | 有效算力随 S |
+|---|---|---|
+| 非 causal | 否 | 1702 → 1815 TFLOPS,**平** |
+| causal 但 q≪k(板状) | 是 | 1173 → 915 TFLOPS,**基本平** |
+| causal 且 q→k(三角) | 是 | 827 → 512 → 251,**塌方** |
+
+同一形状对照最刺眼:128K 非 causal **9.66 ms @ 1822 TFLOPS**,causal **35.08 ms @ 251 TFLOPS**
+——**做一半的工作,慢 3.6 倍**。所以 causal *掩码* 的固定代价只有约 1.7–2×,
+真正致命的是**三角形工作分布**。
+
+### 根因:`fp4_indexer.py:539` 的串行扫描
+
+```python
+while q_scan < q_tile_count and not task_valid:
+    ...
+    visible_group_count = visible_limit // Int32(self.k_tiles_per_cta * _BLOCK_K) + 1
+    task_valid = remaining < visible_group_count
+    if not task_valid:
+        remaining -= visible_group_count      # 从 q_tile 0 开始逐个减
+        q_scan += Int32(1)
+```
+
+compact 模式下 grid 只有 `(k_group, kv_head)`,**q 维度不在 grid 里**。每个 CTA 必须把自己的
+扁平 `task_idx` 解码成 `(q_tile_idx, ktile_group)`,而解码方式是**从 q_tile 0 开始逐个累减**
+——一条长度正比于自身 q_tile 序号的串行依赖链,且内含整数除法。
+
+非 causal 路径没有这个问题,它是 `q_tile_idx = task_idx // k_group_count`,**O(1)**。
+
+总扫描量 = `tasks × q_tile_count` = `O(S²) × O(S)` = **O(S³)**,与实测的立方增长吻合。
+它也解释了上表全部三行:非 causal 不扫描;causal 板状时 `q_tile_count` 不随 k 变,
+所以是常数代价;causal 三角时 `q_tile_count = S/128`,于是立方。
+
+### 验证:MMA 工作量不变,只压 `q_tile_count`
+
+256K causal,把同一个三角形拆成多次调用(总 MMA 量完全相同):
+
+| 切法 | q_tile_count | 耗时 | 加速 |
+|---|---|---|---|
+| 不切 | 2048 | 257.68 ms | — |
+| 64K × 4 | 512 | 67.16 ms | 3.84× |
+| 32K × 8 | 256 | 41.77 ms | 6.17× |
+| **16K × 16** | **128** | **22.78 ms** | **11.31×** |
+
+耗时几乎正比于 `q_tile_count`,正是「代价 ∝ 扫描长度」的签名。
+
+### 结论与修法
+
+**FP4 不慢。** 16K 切块那档换算是 **1545 TFLOPS**,高于 FP8 路径的 1013 TFLOPS——
+扫描一旦消除,FP4 就兑现了它该有的精度优势。
+
+SparseGQA 没这个病,不是因为 FP8,而是它 prefill **固定按 `CHUNK=4096` 切块**,
+每次调用 q 维恒定,等价量被钉成常数,所以效率曲线是平的。
+
+修法按优先级:
+
+1. **闭式求逆(正解)**。`task_idx → q_tile` 的累积计数约为 `i²/32`,可用 `sqrt` 加一两步
+   牛顿迭代 O(1) 求出,彻底删掉 while 循环。预期把 256K 从 257.69 ms 压到约 23 ms。
+2. **预计算查找表**。用一个极小的 setup kernel 生成 `task_idx → (q_tile, group)`,
+   代价 O(tasks) 一次,mainloop 里变成一次访存。
+3. **切块(已实现,治标)**。§20 为显存加的 `PREFILL_CHUNK` 顺带压住了 `q_tile_count`
+   ——这解释了此前 8K–1M 全扫描里那个费解的现象:完整流水线加速比在 256K 跌到
+   1.4× 的谷底,512K/1M 切块后反而回升到 3.1×/10.1×。**256K 是最后一个不切块的长度,
+   所以它承受了最长的扫描链。**
 
 ---
 ## 配置选择结论
