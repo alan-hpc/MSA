@@ -67,6 +67,10 @@ from fmha_sm100.msa_pipeline import (  # noqa: E402
     causal_end_blocks,
 )
 
+#: Mirrors the guard in fp4_indexer_interface: the score tensor's CuTe layout is
+#: built from Int32 extents, so it must stay within 2**31 elements.
+_SCORE_TENSOR_MAX_ELEMS = 2**31
+
 #: B300 (SM103) dense peak, used only to contextualise the dense row.
 PEAK_TFLOPS_BF16 = 2250.0
 
@@ -323,6 +327,54 @@ class StageFailure(Exception):
 # ---------------------------------------------------------------------------
 # One (config, shape) measurement
 # ---------------------------------------------------------------------------
+
+
+def _auto_chunk_q(model, seqlen_k: int) -> int:
+    """Largest query chunk whose block-score tensor stays Int32-addressable.
+
+    Memory is not the binding constraint here and picking the chunk by memory
+    alone silently breaks the indexer: at 1M the card can hold a 512K chunk
+    (166 GiB) but the score tensor for one is 4 x 8192 x 524288 = 4x over the
+    Int32 limit, so top-k, CSR and attention all run and only the indexer fails.
+    Derive the chunk from the limit that actually binds.
+    """
+    k_tiles = (seqlen_k + 127) // 128
+    denom = model.num_kv_heads * k_tiles
+    if denom <= 0:
+        return 0
+    return max(1, _SCORE_TENSOR_MAX_ELEMS // denom)
+
+
+def _merge_chunked(rows, *, seqlen_q, seqlen_k, chunk_q):
+    """Fold per-chunk rows into the single row the tables expect.
+
+    Chunking splits the *queries*; every query still scores against every KV
+    block it would have seen unchunked, and top-k is per-query, so the selection
+    is identical and the stage costs simply add.  Peak memory is what changes,
+    which is the whole point — but latency must be reported as the sum, not the
+    per-chunk figure, or a chunked row would look artificially fast next to an
+    unchunked one.
+    """
+    base = dict(rows[0])
+    base.update({"seqlen_q": seqlen_q, "seqlen_k": seqlen_k,
+                 "chunk_q": chunk_q, "num_chunks": len(rows)})
+    stages, errors = {}, {}
+    for r in rows:
+        for name, st in r.get("stages", {}).items():
+            acc = stages.setdefault(name, {"ms": 0.0, "iters": 0})
+            acc["ms"] += st.get("ms", 0.0)
+            acc["iters"] = max(acc["iters"], st.get("iters", 0))
+        for k, v in r.get("errors", {}).items():
+            errors.setdefault(k, v)
+    base["stages"], base["errors"] = stages, errors
+    ok = not {k: v for k, v in errors.items() if k != "cos"}
+    base["supported"] = ok
+    total = sum(st["ms"] for st in stages.values()) if ok else None
+    base["pipeline_ms"] = base["pipeline_gpu_ms"] = total
+    base["attn_ms_only"] = stages.get("attn", {}).get("ms") if ok else None
+    for k in ("cos_mean", "cos_p1", "cos_min", "ms_host", "pipeline_host_ms"):
+        base.pop(k, None)
+    return base
 
 
 def bench_config(
@@ -763,7 +815,8 @@ def write_csv(rows, path, *, quiet=False):
         "indexer_gpu_ms", "topk_gpu_ms", "csr_gpu_ms", "attn_gpu_ms",
         "indexer_host_ms", "topk_host_ms", "csr_host_ms", "attn_host_ms",
         "selection_ms", "pipeline_ms", "pipeline_gpu_ms", "pipeline_host_ms", "attn_ms_only",
-        "attn_tflops", "cos_mean", "cos_p1", "cos_min", "supported", "errors",
+        "attn_tflops", "cos_mean", "cos_p1", "cos_min", "supported", "chunk_q",
+        "num_chunks", "errors",
     ]
     with open(path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
@@ -827,6 +880,11 @@ def parse_args(argv=None):
                    help="only compute the cosine column at or below this KV length; the exact "
                         "block scores it needs cost a dense attention's worth of FLOPs per "
                         "configuration (default 32768)")
+    p.add_argument("--chunk-q", type=int, default=0,
+                   help="split prefill queries into chunks of this many tokens. "
+                        "0 disables; -1 picks the largest chunk the indexer's Int32 "
+                        "score tensor allows. Chunking does not change the result -- "
+                        "top-k is per-query -- only the peak footprint.")
     p.add_argument("--cos", action="store_true",
                    help="also report cosine similarity of each configuration's attention "
                         "output against dense. Selections are then built from the real Q/K "
@@ -976,15 +1034,46 @@ def main(argv=None) -> int:
                 except Exception as exc:  # noqa: BLE001
                     print(f"      !! FA4 reference failed: {type(exc).__name__}: {exc}")
 
+        # Query chunking: the score tensor is [Hkv, blocks, total_q], so its
+        # footprint falls linearly with the chunk while the result is unchanged.
+        # Only prefill has queries to split.
+        chunk = args.chunk_q if (args.mode != "decode" and args.chunk_q) else 0
+        if chunk < 0:
+            chunk = _auto_chunk_q(model, seqlen_k)
+            if 0 < chunk < seqlen_q:
+                print(f"NOTE      : chunking prefill queries at {chunk} "
+                      f"({-(-seqlen_q // chunk)} chunks) -- the indexer's score tensor "
+                      f"is Int32-addressed, which caps the chunk below what memory allows.")
+        chunk_starts = (list(range(0, seqlen_q, chunk)) if 0 < chunk < seqlen_q else [])
+
         for cfg in configs:
             t0 = time.time()
             try:
-                row = bench_config(
-                    cfg, model=model, batch=args.batch, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
-                    dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
-                    indexer_mode=args.indexer_mode, seed=args.seed,
-                    timing=args.timing, dense_out=dense_out, qkv=qkv_here,
-                )
+                if chunk_starts:
+                    parts = []
+                    for lo in chunk_starts:
+                        clen = min(chunk, seqlen_q - lo)
+                        # Right-aligning clen queries against (lo + clen) keys puts
+                        # chunk query j at absolute position lo + j -- the same
+                        # causal extent it has unchunked.
+                        parts.append(bench_config(
+                            cfg, model=model, batch=args.batch, seqlen_q=clen,
+                            seqlen_k=lo + clen, dtype=dtype, device=device,
+                            dry_ms=args.dry_ms, rep_ms=args.rep_ms,
+                            indexer_mode=args.indexer_mode, seed=args.seed,
+                            timing=args.timing, dense_out=None, qkv=None,
+                        ))
+                        torch.cuda.empty_cache()
+                    row = _merge_chunked(parts, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
+                                         chunk_q=chunk)
+                else:
+                    row = bench_config(
+                        cfg, model=model, batch=args.batch, seqlen_q=seqlen_q,
+                        seqlen_k=seqlen_k,
+                        dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
+                        indexer_mode=args.indexer_mode, seed=args.seed,
+                        timing=args.timing, dense_out=dense_out, qkv=qkv_here,
+                    )
             except Exception as exc:  # noqa: BLE001 - never abort the sweep
                 row = {**cfg.to_dict(), "batch": args.batch, "seqlen_q": seqlen_q,
                        "seqlen_k": seqlen_k,

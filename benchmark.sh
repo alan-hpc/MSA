@@ -45,6 +45,10 @@
 #   COS         set empty to skip the cosine table      (default 1)
 #   FA4_PATH    flash-attention checkout (FA4 reference)  (default ../flash-attention)
 #   NO_FA4      set to 1 to skip the FA4 reference row
+#   PREFILL_CHUNK    prefill query chunk in tokens; -1 (default) picks the
+#                    largest the indexer's Int32 score tensor allows, 0 disables.
+#                    Needed above 256K, where one unchunked score tensor exceeds
+#                    both the Int32 limit and the card.
 #   KVOUTER_PATH     fireworks-msa checkout; empty skips the KV-outer A/B
 #   KVOUTER_PYTHON   interpreter with the branch's pinned deps (default PYTHON)
 #   KVOUTER_FA4_PATH FA4 checkout for the KV-outer role, if not already importable
@@ -79,6 +83,7 @@ DECODE="${DECODE-1}"    # likewise -- see COS above
 DECODE_SEQLENS="${DECODE_SEQLENS:-32768,131072,524288}"
 DECODE_BATCH="${DECODE_BATCH:-32}"
 FA4_PATH="${FA4_PATH:-../flash-attention}"
+PREFILL_CHUNK="${PREFILL_CHUNK:--1}"
 KVOUTER_PATH="${KVOUTER_PATH:-}"
 KVOUTER_PYTHON="${KVOUTER_PYTHON:-}"
 KVOUTER_FA4_PATH="${KVOUTER_FA4_PATH:-}"
@@ -269,6 +274,7 @@ section "3. Configuration sweep"
     --qk-source "$QK_SOURCE" --qk-model "$QK_MODEL" --qk-layer "$QK_LAYER" \
     --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} \
     ${COS:+--cos} --cos-max-seqlen "$COS_MAX_SEQLEN" \
+    --chunk-q "$PREFILL_CHUNK" \
     --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
     --gpu 0 \
     --csv "$OUT_DIR/sweep.csv" \
