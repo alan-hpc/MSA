@@ -51,7 +51,7 @@
 #   KVOUTER_SEQLENS / KVOUTER_TOPKS   A/B grid (block is fixed at 128 by the branch)
 #   COS_MAX_SEQLEN  cosine only at or below this kv_len  (default 32768)
 #   QK_SOURCE   'model' | 'random'                       (default model: real layer Q/K/V)
-#   QK_MODEL    checkpoint for QK_SOURCE=model           (default <checkpoint>)
+#   QK_MODEL    checkpoint for QK_SOURCE=model           (unset: falls back to random)
 #   QK_LAYER    which layer to read                      (default 0)
 #   DECODE      set empty to skip the decode sweep       (default 1)
 #   DECODE_SEQLENS / DECODE_BATCH                        (default 32768,131072,524288 / 32)
@@ -70,12 +70,12 @@ CONFIGS="${CONFIGS:-all}"
 INDEXER="${INDEXER:-measure}"
 MODEL="${MODEL:-model-n32}"
 TIMING="${TIMING:-simple}"
-COS="${COS:-1}"
+COS="${COS-1}"          # ${VAR-} not ${VAR:-}: empty must mean "off", not "default"
 COS_MAX_SEQLEN="${COS_MAX_SEQLEN:-32768}"
 QK_SOURCE="${QK_SOURCE:-model}"
-QK_MODEL="${QK_MODEL:-<checkpoint>}"
+QK_MODEL="${QK_MODEL:-}"
 QK_LAYER="${QK_LAYER:-0}"
-DECODE="${DECODE:-1}"
+DECODE="${DECODE-1}"    # likewise -- see COS above
 DECODE_SEQLENS="${DECODE_SEQLENS:-32768,131072,524288}"
 DECODE_BATCH="${DECODE_BATCH:-32}"
 FA4_PATH="${FA4_PATH:-../flash-attention}"
@@ -191,6 +191,30 @@ if [[ -z "$NO_FA4" ]]; then
     fi
 else
     echo "FA4 reference : disabled (NO_FA4=$NO_FA4)"
+fi
+
+# Real Q/K only changes one table (the cosine one), but the failure to find a
+# checkpoint used to surface as a FileNotFoundError three sections later, after
+# the correctness gate had already run.  Decide it here, before anything is
+# spent, and keep going on random rather than refusing to benchmark at all.
+if [[ "$QK_SOURCE" == "model" ]]; then
+    if [[ -z "$QK_MODEL" ]]; then
+        echo "Q/K source    : random (QK_MODEL not set)"
+        echo "                Set QK_MODEL=/path/to/checkpoint for real post-RoPE Q/K."
+        echo "                Only the cosine table is affected: on random Q/K the"
+        echo "                attention is near-uniform, so those numbers read as a"
+        echo "                pessimistic floor.  All latency tables are unaffected."
+        QK_SOURCE=random
+    elif [[ ! -f "$QK_MODEL/config.json" ]]; then
+        echo "Q/K source    : random ($QK_MODEL has no config.json)"
+        echo "                QK_MODEL must be a checkpoint directory containing"
+        echo "                config.json, the safetensors shards, and a tokenizer."
+        QK_SOURCE=random
+    else
+        echo "Q/K source    : layer $QK_LAYER of $QK_MODEL"
+    fi
+else
+    echo "Q/K source    : random (QK_SOURCE=$QK_SOURCE)"
 fi
 
 # -----------------------------------------------------------------------------
@@ -401,7 +425,10 @@ emit(f"Table 1b  single-operator speedup vs {REF_LABEL} (>1 = sparse faster)",
         "      kernel. Treat the ratios as an upper bound."),
      speed)
 
-if any(f(r, "cos_mean") is not None for r in rows):
+# The dense rows carry cos_mean = 1.0 by construction (they are the
+# reference), so asking whether *any* row has one is always true and the
+# table prints empty when cosine was not measured.  Ask the sparse rows.
+if any(f(r, "cos_mean") is not None for r in rows if not r["name"].startswith("dense")):
     emit("Table 2  output cosine similarity vs dense gqa (per (token, head) vector, averaged)",
          "note: selections come from exact block scores over these very Q/K; 1.0000 == identical to dense.\n"
          + ("      Q/K are a real layer's post-RoPE activations, so these are the cosines a\n"
