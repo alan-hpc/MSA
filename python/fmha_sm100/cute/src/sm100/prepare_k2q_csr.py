@@ -5,7 +5,7 @@
 
 Thin dispatcher that calls the CUDA C++ kernel pipeline in
 ``src.sm100.build_k2q_csr``. Supports ``topK in {4, 8, 16, 32}`` and
-``blk_kv == 128`` only — other shapes raise ``ValueError`` rather than
+``blk_kv in {32, 64, 128}`` — other shapes raise ``ValueError`` rather than
 silently falling back to a torch-reference path.
 """
 
@@ -19,7 +19,9 @@ from src.sm100.prepare_scheduler import SparseAttentionSchedule, SPARSE_SCHEDULE
 
 
 _SUPPORTED_TOPK = (4, 8, 16, 32)
-_SUPPORTED_BLK_KV = 128
+# v3.0_msa_config: the CUDA pipeline templates on blk_kv and only uses it for
+# per-batch row-count arithmetic, so 32/64 are exact — not an approximation.
+_SUPPORTED_BLK_KV = (32, 64, 128)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -66,9 +68,9 @@ class SparseK2qCsrBuilderSm100:
         return_schedule: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, SparseAttentionSchedule]:
         # ---- Validation ----------------------------------------------------
-        if blk_kv != _SUPPORTED_BLK_KV:
+        if blk_kv not in _SUPPORTED_BLK_KV:
             raise ValueError(
-                f"SparseK2qCsrBuilderSm100 only supports blk_kv == "
+                f"SparseK2qCsrBuilderSm100 supports blk_kv in "
                 f"{_SUPPORTED_BLK_KV}, got {blk_kv}"
             )
         if q2k_indices.dtype != torch.int32:

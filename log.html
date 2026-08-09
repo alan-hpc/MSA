@@ -1,0 +1,1504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MSA 可配置稀疏注意力改造 · 工作日志</title>
+<style>
+  :root {
+    --bg: #fbfaf8;
+    --surface: #ffffff;
+    --surface-2: #f4f2ee;
+    --border: #e2ded6;
+    --text: #22201d;
+    --muted: #6b665e;
+    --accent: #9a4b1f;
+    --accent-soft: #f6ece4;
+    --ok: #2f6a3f;
+    --warn: #8a6d1f;
+    --bad: #97321f;
+    --code-bg: #f2efe9;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #16151a;
+      --surface: #1d1c22;
+      --surface-2: #24232b;
+      --border: #34323d;
+      --text: #e8e5e0;
+      --muted: #a09a92;
+      --accent: #e08a52;
+      --accent-soft: #2a2119;
+      --ok: #74c68a;
+      --warn: #d9b95e;
+      --bad: #e07a63;
+      --code-bg: #24232b;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #16151a;
+    --surface: #1d1c22;
+    --surface-2: #24232b;
+    --border: #34323d;
+    --text: #e8e5e0;
+    --muted: #a09a92;
+    --accent: #e08a52;
+    --accent-soft: #2a2119;
+    --ok: #74c68a;
+    --warn: #d9b95e;
+    --bad: #e07a63;
+    --code-bg: #24232b;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 40px 24px 96px; }
+
+  header.masthead {
+    border-bottom: 2px solid var(--accent);
+    padding-bottom: 20px;
+    margin-bottom: 8px;
+  }
+  header.masthead h1 { font-size: 27px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  header.masthead .sub { color: var(--muted); font-size: 14px; }
+  .kv { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-top: 14px; font-size: 13px; }
+  .kv b { color: var(--muted); font-weight: 500; }
+  .kv span { font-family: var(--mono); }
+
+  h2 {
+    font-size: 20px;
+    margin: 46px 0 14px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+  }
+  h2 .num {
+    display: inline-block; min-width: 30px;
+    color: var(--accent); font-family: var(--mono); font-size: 16px;
+  }
+  h3 { font-size: 16px; margin: 28px 0 10px; }
+  h4 { font-size: 14px; margin: 20px 0 8px; color: var(--muted); text-transform: uppercase;
+       letter-spacing: 0.06em; }
+  p { margin: 10px 0; }
+  ul, ol { margin: 10px 0; padding-left: 22px; }
+  li { margin: 5px 0; }
+
+  code, .mono { font-family: var(--mono); font-size: 0.9em; }
+  :not(pre) > code {
+    background: var(--code-bg); padding: 1px 5px; border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 12.5px;
+    line-height: 1.55; margin: 12px 0;
+  }
+
+  .scroll { overflow-x: auto; margin: 14px 0; border: 1px solid var(--border);
+            border-radius: 8px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 7px 11px; text-align: left; border-bottom: 1px solid var(--border);
+           white-space: nowrap; }
+  th { background: var(--surface-2); font-weight: 600; font-size: 12px;
+       text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  tr.hl td { background: var(--accent-soft); }
+  tr.dense td { color: var(--muted); font-style: italic; }
+
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 14px 18px; margin: 16px 0;
+  }
+  .card.ok { border-left-color: var(--ok); }
+  .card.warn { border-left-color: var(--warn); }
+  .card.bad { border-left-color: var(--bad); }
+  .card > :first-child { margin-top: 0; }
+  .card > :last-child { margin-bottom: 0; }
+  .card .title { font-weight: 600; margin-bottom: 6px; }
+
+  .pill {
+    display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-family: var(--mono); border: 1px solid var(--border);
+    background: var(--surface-2); color: var(--muted);
+  }
+  .pill.ok { color: var(--ok); border-color: var(--ok); }
+  .pill.warn { color: var(--warn); border-color: var(--warn); }
+  .pill.bad { color: var(--bad); border-color: var(--bad); }
+
+  .timeline { border-left: 2px solid var(--border); margin-left: 8px; padding-left: 22px; }
+  .step { position: relative; margin: 0 0 26px; }
+  .step::before {
+    content: ""; position: absolute; left: -29px; top: 7px; width: 10px; height: 10px;
+    border-radius: 50%; background: var(--accent); border: 2px solid var(--bg);
+  }
+  .step h3 { margin-top: 0; }
+
+  .files { font-family: var(--mono); font-size: 12.5px; }
+  .files td:first-child { color: var(--accent); }
+
+  footer { margin-top: 60px; padding-top: 18px; border-top: 1px solid var(--border);
+           color: var(--muted); font-size: 12.5px; }
+  .toc { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+         padding: 14px 18px; margin: 22px 0 0; }
+  .toc ol { margin: 6px 0 0; columns: 2; column-gap: 32px; }
+  .toc a { color: var(--text); text-decoration: none; }
+  .toc a:hover { color: var(--accent); text-decoration: underline; }
+  @media (max-width: 720px) { .toc ol { columns: 1; } }
+
+  table.sortable th { cursor: pointer; user-select: none; }
+  table.sortable th:hover { color: var(--accent); }
+  table.sortable th::after { content: " ⇅"; opacity: .35; font-size: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="masthead">
+  <h1>MSA 可配置稀疏注意力改造 · 工作日志</h1>
+  <div class="sub">
+    在 MiniMax Sparse Attention (<code>fmha_sm100</code>) 上实现 force_init / force_end /
+    block / topk / head 五维可配置化，按 model-n32 的注意力结构
+    （Hq=32 / Hkv=4 / D=128）在 NVIDIA B300 上完成基线评估与 12 组配置 benchmark。
+  </div>
+  <div class="kv">
+    <div><b>日期</b> <span>2026-08-08</span></div>
+    <div><b>目标模型</b> <span>model-n32</span></div>
+    <div><b>硬件</b> <span>8 × NVIDIA B300 SXM6 (sm_103)</span></div>
+    <div><b>主机</b> <span>&lt;remote-host&gt;</span></div>
+    <div><b>容器</b> <span>&lt;container&gt;</span></div>
+    <div><b>基线</b> <span>MSA main @ 80434d7</span></div>
+  </div>
+  <div class="toc">
+    <b style="font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;">目录</b>
+    <ol>
+      <li><a href="#s1">任务与约束</a></li>
+      <li><a href="#s2">现状分析</a></li>
+      <li><a href="#s3">设计决策</a></li>
+      <li><a href="#s4">实现记录</a></li>
+      <li><a href="#s5">正确性验证</a></li>
+      <li><a href="#s6">基线性能评估</a></li>
+      <li><a href="#s7">12 组配置 benchmark</a></li>
+      <li><a href="#s7b">head 模式的成本来源</a></li>
+      <li><a href="#s7c">完整配置网格（33 组）</a></li>
+      <li><a href="#s7d">Decode</a></li>
+      <li><a href="#s8">可优化点报告</a></li>
+      <li><a href="#s9">交付物与复现</a></li>
+    </ol>
+  </div>
+</header>
+
+<!-- ===================================================================== -->
+<h2 id="s1"><span class="num">1</span>任务与约束</h2>
+
+<p>需求是在现有 MSA 之上支持下列 12 组配置并给出 benchmark，配置参数参照 model-n16：</p>
+
+<div class="scroll">
+<table>
+<thead><tr>
+  <th>#</th><th>配置</th><th class="num">block</th><th class="num">topk</th>
+  <th>head</th><th class="num">sink 块</th><th class="num">local 块</th>
+  <th class="num">自由块</th><th class="num">token 预算</th>
+</tr></thead>
+<tbody id="cfg-matrix">
+  <tr><td>baseline</td><td class="mono">force_init(0)-force_end(0)-block(128)-topk(16)-head(keep)</td>
+      <td class="num">128</td><td class="num">16</td><td>keep</td>
+      <td class="num">0</td><td class="num">0</td><td class="num">16</td><td class="num">2048</td></tr>
+  <tr><td>1</td><td class="mono">fi(128)-fe(128)-block(32)-topk(16)-head(keep)</td><td class="num">32</td><td class="num">16</td><td>keep</td><td class="num">4</td><td class="num">4</td><td class="num">8</td><td class="num">512</td></tr>
+  <tr><td>2</td><td class="mono">fi(128)-fe(128)-block(32)-topk(32)-head(keep)</td><td class="num">32</td><td class="num">32</td><td>keep</td><td class="num">4</td><td class="num">4</td><td class="num">24</td><td class="num">1024</td></tr>
+  <tr><td>3</td><td class="mono">fi(128)-fe(128)-block(64)-topk(16)-head(keep)</td><td class="num">64</td><td class="num">16</td><td>keep</td><td class="num">2</td><td class="num">2</td><td class="num">12</td><td class="num">1024</td></tr>
+  <tr><td>4</td><td class="mono">fi(128)-fe(128)-block(64)-topk(32)-head(keep)</td><td class="num">64</td><td class="num">32</td><td>keep</td><td class="num">2</td><td class="num">2</td><td class="num">28</td><td class="num">2048</td></tr>
+  <tr><td>5</td><td class="mono">fi(128)-fe(128)-block(32)-topk(16)-head(sum)</td><td class="num">32</td><td class="num">16</td><td>sum</td><td class="num">4</td><td class="num">4</td><td class="num">8</td><td class="num">512</td></tr>
+  <tr><td>6</td><td class="mono">fi(128)-fe(128)-block(32)-topk(32)-head(sum)</td><td class="num">32</td><td class="num">32</td><td>sum</td><td class="num">4</td><td class="num">4</td><td class="num">24</td><td class="num">1024</td></tr>
+  <tr><td>7</td><td class="mono">fi(128)-fe(128)-block(64)-topk(16)-head(sum)</td><td class="num">64</td><td class="num">16</td><td>sum</td><td class="num">2</td><td class="num">2</td><td class="num">12</td><td class="num">1024</td></tr>
+  <tr><td>8</td><td class="mono">fi(128)-fe(128)-block(64)-topk(32)-head(sum)</td><td class="num">64</td><td class="num">32</td><td>sum</td><td class="num">2</td><td class="num">2</td><td class="num">28</td><td class="num">2048</td></tr>
+  <tr><td>9</td><td class="mono">fi(128)-fe(128)-block(32)-topk(16)-head(max)</td><td class="num">32</td><td class="num">16</td><td>max</td><td class="num">4</td><td class="num">4</td><td class="num">8</td><td class="num">512</td></tr>
+  <tr><td>10</td><td class="mono">fi(128)-fe(128)-block(32)-topk(32)-head(max)</td><td class="num">32</td><td class="num">32</td><td>max</td><td class="num">4</td><td class="num">4</td><td class="num">24</td><td class="num">1024</td></tr>
+  <tr><td>11</td><td class="mono">fi(128)-fe(128)-block(64)-topk(16)-head(max)</td><td class="num">64</td><td class="num">16</td><td>max</td><td class="num">2</td><td class="num">2</td><td class="num">12</td><td class="num">1024</td></tr>
+  <tr><td>12</td><td class="mono">fi(128)-fe(128)-block(64)-topk(32)-head(max)</td><td class="num">64</td><td class="num">32</td><td>max</td><td class="num">2</td><td class="num">2</td><td class="num">28</td><td class="num">2048</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>目标模型参数（读自 Megatron 预训练启动脚本）</h3>
+<div class="scroll">
+<table>
+<thead><tr><th>启动参数</th><th>值</th><th>对 MSA 的影响</th></tr></thead>
+<tbody>
+<tr><td class="mono">--num-attention-heads</td><td class="mono">32</td><td>Hq = 32</td></tr>
+<tr><td class="mono">--num-query-groups</td><td class="mono">4</td><td>Hkv = 4，GQA 组大小 <b>8</b>（内核支持 {1,2,4,8,16}）✓</td></tr>
+<tr class="hl"><td class="mono">--kv-channels</td><td class="mono">128</td>
+    <td><b>head_dim = 128，MSA 原生支持</b> ✓。注意这是显式覆盖：默认会是
+        <code>hidden_size / num_attention_heads = 2048/32 = 64</code></td></tr>
+<tr><td class="mono">--hidden-size</td><td class="mono">2048</td>
+    <td>Q 投影 2048 → 32×128 = 4096（扩张），K/V 各 4×128 = 512，融合 QKV 出维 5120</td></tr>
+<tr><td class="mono">--num-layers</td><td class="mono">45</td><td>45 层<b>全部</b>是 softmax attention</td></tr>
+<tr><td class="mono">--moe-layer-freq</td><td class="mono">([0]*3+[1]*42)</td>
+    <td>控制的是 <b>MLP</b> 走 dense 还是 MoE，<b>不是</b> attention 类型——所以不减少 MSA 可替换的层数</td></tr>
+<tr><td class="mono">--mtp-num-layers</td><td class="mono">1</td><td>MTP 层也跑 attention → 每次前向 <b>46</b> 层</td></tr>
+<tr><td class="mono">--seq-length</td><td class="mono">4096</td><td>训练上下文；benchmark 把 4096 与更长的点一起扫</td></tr>
+<tr><td class="mono">--qk-layernorm / --rotary-base</td><td class="mono">on / 10000</td><td>与 MSA 无关（在 attention 之外）</td></tr>
+<tr><td class="mono">--num-experts / --moe-router-topk</td><td class="mono">256 / 12</td><td>与 MSA 无关</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="card ok">
+  <div class="title">这个模型不需要任何内核扩展就能跑 MSA</div>
+  <p><code>head_dim=128</code> 与 <code>qhead_per_kv=8</code> 都落在 MSA 现有支持范围内，
+  所以本轮 benchmark 用的是模型的<b>真实</b>注意力几何，没有任何近似。</p>
+  <p>唯一仍然存在的支持缺口是 <b>decode 路径</b>：
+  <code>sparse_decode_atten_func</code> / <code>SparseDecodePagedAttentionWrapper</code>
+  硬性要求 <code>qhead_per_kv=16</code> 且 <code>page_size=128</code>，本模型是 8，
+  因此本轮只覆盖 prefill。</p>
+</div>
+
+<div class="card warn">
+  <div class="title">对照：model-n16 为什么不能直接跑</div>
+  <p>先前一版按 model-n16 做过同样的扫描。那个模型的 full-attention 层是
+  <code>head_dim=256</code>，超出 MSA 全线断言的 D=128
+  （<code>cute/interface.py</code>、<code>atten_fwd.py</code>、FP4 indexer 的 <code>_HEAD_DIM</code>），
+  只能降到 D=128 测量。两者对照见下表；GQA 比同为 8，所以 <code>head_mode</code>
+  的语义与成本比例在两个模型上一致。</p>
+  <div class="scroll">
+  <table>
+  <thead><tr><th>模型</th><th class="num">Hq</th><th class="num">Hkv</th><th class="num">GQA</th>
+    <th class="num">head_dim</th><th>MSA 可直接运行</th><th class="num">attn 层/前向</th></tr></thead>
+  <tbody>
+  <tr class="hl"><td>model-n32（本轮目标）</td><td class="num">32</td><td class="num">4</td>
+      <td class="num">8</td><td class="num">128</td><td><span class="pill ok">是</span></td><td class="num">46</td></tr>
+  <tr><td>model-n16</td><td class="num">16</td><td class="num">2</td>
+      <td class="num">8</td><td class="num">256</td><td><span class="pill bad">否（D=256）</span></td><td class="num">11</td></tr>
+  </tbody>
+  </table>
+  </div>
+  <p>两套几何都保留在 <code>msa_config.py::MODEL_SHAPES</code> 里，
+  <code>MODEL=n16 ./benchmark.sh</code> 可随时切回。</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="s2"><span class="num">2</span>现状分析</h2>
+
+<p>改造前，MSA 稀疏前向的四级流水线及其硬编码约束：</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>阶段</th><th>实现</th><th>改造前约束</th></tr></thead>
+<tbody>
+<tr><td>① block 打分</td><td class="mono">cute/fp4_indexer_interface.py<br>src/sm100/fp4_indexer.py</td>
+    <td><code>_PAGE_SIZE = _BLOCK_K = 128</code>；输出 <code>[Hq, ceil(Sk/128), total_q]</code></td></tr>
+<tr><td>② top-k 选择</td><td class="mono">csrc/include/sparse_topk_select.cuh<br>api.py::sparse_topk_select</td>
+    <td><code>constexpr topk = 16</code>；无 head 聚合；force_end 锚定序列末尾（仅 decode 语义正确）；输出 qo-outermost</td></tr>
+<tr><td>③ CSR + 调度</td><td class="mono">src/sm100/build_k2q_csr/build_k2q_csr.cu<br>prepare_k2q_csr.py</td>
+    <td><code>TORCH_CHECK(blk_kv == 128)</code></td></tr>
+<tr><td>④ 稀疏注意力</td><td class="mono">src/sm100/fwd/atten_fwd.py<br>interface.py::sparse_atten_func</td>
+    <td><code>blk_kv</code> 已是参数；topK ∈ {4,8,16,32}；D=128；文档标注仅支持 blk_kv=128</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>也就是说：<b>topk=32 被 ② 卡住，block=32/64 被 ①③ 卡住</b>，而 ④ 其实已经把
+<code>n_block_size</code> 参数化了——<code>atten_fwd.py</code> 的 TMEM 分配注释里甚至已经
+写明 “64-wide KV blocks use 384 columns and must round the allocation up”，说明 64 宽度
+在设计时被考虑过，只是从未在上层打通、也没有测试覆盖。这决定了改造的切入顺序。</p>
+
+<!-- ===================================================================== -->
+<h2 id="s3"><span class="num">3</span>设计决策</h2>
+
+<h3>3.1 head 聚合语义</h3>
+<p>MSA 的打分器以 MQA proxy-Q 模式工作，<b>每个 KV head 一行分数</b>。三种 head 模式的输入
+因此完全相同，区别只在于对这 <code>Hkv</code> 行做什么：</p>
+<div class="scroll">
+<table>
+<thead><tr><th>head_mode</th><th class="num">打分器行数</th><th class="num">选择份数</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td class="mono">keep</td><td class="num">Hkv = 4</td><td class="num">4</td>
+    <td>分数原样使用，每个 KV head 一份自己的选择。<b>这是 MSA 的出厂行为。</b></td></tr>
+<tr><td class="mono">sum</td><td class="num">Hkv = 4</td><td class="num">1</td>
+    <td>把 4 行求和，整层<b>共享一份</b>选择：被各 KV head 普遍需要的块胜出。</td></tr>
+<tr><td class="mono">max</td><td class="num">Hkv = 4</td><td class="num">1</td>
+    <td>同上取 max：只要<b>任一</b> KV head 想要就保留，跨 head 尺度无关。</td></tr>
+</tbody>
+</table>
+</div>
+<p>所以 <code>sum</code>/<code>max</code> <b>比 <code>keep</code> 便宜</b>——打分器工作量完全相同，
+而 top-k 只需产出 1 行而不是 4 行。单份选择再广播回 <code>Hkv</code> 交给 CSR
+（其元数据以 KV head 为键，且要求连续张量，所以 <code>expand</code> 不够，需要一次
+<code>contiguous()</code>）。</p>
+
+<div class="card warn">
+  <div class="title">这里我走过一次弯路，值得记下来</div>
+  <p>第一版把 <code>sum</code>/<code>max</code> 实现成了「对 <b>32 个 query head</b> 的分数归约」
+  ——那需要打分器先算 32 行，归约发生在昂贵那级的下游，结果 sum/max 比 keep 慢 4×，
+  128K 时还会撞上 §8.2 的 Int32 上限跑不了。那个结论是实现假设的产物，不是这两个模式的性质。
+  按上表的正确语义重测后，sum/max 反而比 keep 快 1.08–1.27×。
+  §7b 给出修正后的对比；§7 的 12 组主矩阵已按正确语义重跑。</p>
+</div>
+
+<h3>3.2 force 窗口以 token 表达</h3>
+<p><code>force_init</code>/<code>force_end</code> 用 <b>token</b> 计（128），在配置层向上取整换算成块，
+使同一份配置在 block 变化时保持语义不变：block=32 → 4 块，block=64 → 2 块。两个窗口
+<b>占用</b> topk 预算而非叠加，因此 <code>force_init_blocks + force_end_blocks ≤ topk</code>
+是配置层的硬校验。</p>
+
+<h3>3.3 force_end 的因果锚点</h3>
+<p>原实现把 local 窗口锚在 <code>num_valid_pages</code>（序列末尾），这对 decode 正确
+（query 就在序列末尾），对 prefill 则不是滑动窗口。新增可选的
+<code>causal_end_block[total_q]</code>：逐 query 传入其因果块上界，local 窗口锚在
+<b>每个 query 自己的位置</b>。不传时退化为原行为，向后兼容。</p>
+
+<h3>3.4 融合而非新增 pass</h3>
+<p>head 聚合、force 窗口标记、输出布局三件事全部折进 top-k 的 <b>transpose 阶段</b>——
+那是唯一一个本来就要完整流过分数张量的 kernel。这样三个特性都不引入额外的全张量访存。</p>
+
+<!-- ===================================================================== -->
+<h2 id="s4"><span class="num">4</span>实现记录</h2>
+
+<div class="timeline">
+
+<div class="step">
+<h3>4.1 环境搭建</h3>
+<p>8×B300 SXM6 (sm_103, 275 GB) 的容器环境：Python 3.12.13 / torch 2.11.0+cu130 /
+CUDA 13.0.88。<code>pip install -e .</code> 后
+<code>tests/smoke/test_sparse_topk_forced.py</code> 全绿，基线环境确认可用。</p>
+<p>后续所有实测都在这套环境上进行；本文中的绝对时间只在同一台机器上可比。</p>
+</div>
+
+<div class="step">
+<h3>4.2 top-k 选择内核：可配置化</h3>
+<p>文件：<code>python/fmha_sm100/csrc/include/sparse_topk_select.cuh</code>、
+<code>csrc/sparse_topk_select.cu</code>、<code>api.py</code></p>
+<ul>
+  <li><b>运行时 topk</b>：<code>SparseTopKSelect</code> 的 <code>constexpr topk = 16</code> 改为参数，
+      按运行时值选择 <code>IndexerTopKWithSortKernel&lt;16|32|64&gt;</code> 模板桶。
+      模板与 <code>WarpBitonicSortAsc32/64</code> 原本就已备好，此前只是没有派发路径。</li>
+  <li><b>head 聚合</b>：transpose kernel 模板化为
+      <code>kHeadReduceNone/Sum/Max</code>，读入 <code>group_size</code> 个 head 行在寄存器里归约后
+      再写转置结果。float4 XOR-swizzle 快速路径同样支持，每个 group 成员一次 float4 读，
+      SMEM 流量不变。</li>
+  <li><b>逐 query 因果 force 窗口</b>：新增可选
+      <code>causal_end_block</code>，force 判定改为
+      <code>SparseTopKIsForced(k, q_end, force_begin, force_end_blocks)</code>；
+      用 <code>k + force_end &gt;= q_end</code> 写法避免无符号下溢。</li>
+  <li><b>head-outermost 输出</b>：新增 <code>head_outermost</code> 开关，直接写出
+      <code>[Hkv, total_q, topk]</code>——正是 <code>build_k2q_csr</code> 需要的布局，
+      省掉生产路径上一次全量 permute+copy。</li>
+</ul>
+</div>
+
+<div class="step">
+<h3>4.3 JIT 缓存按源码内容失效</h3>
+<p>文件：<code>python/fmha_sm100/jit.py</code></p>
+<p><code>_do_compile_sparse_topk()</code> 原本只要 <code>.so</code> 存在就直接返回，而
+<code>sparse_topk_select.cuh</code> 是通过 <code>-I</code> 从源码树读的、并不拷进缓存目录——
+<b>改内核不会触发重编译</b>，会静默用旧 kernel。改为对
+<code>.cu + .cuh + tvm_ffi_utils.h</code> 做 SHA-256 指纹并落 stamp 文件，指纹变化即重编；
+编译前先删 stamp，避免编译中断留下「新指纹 + 旧 .so」。用内容而非 mtime，因为
+editable 安装、<code>git checkout</code>、容器 bind-mount 都会无意义地改动 mtime。</p>
+</div>
+
+<div class="step">
+<h3>4.4 CSR builder 支持 blk_kv 32 / 64</h3>
+<p>文件：<code>cute/src/sm100/build_k2q_csr/build_k2q_csr.cu</code>、
+<code>cute/src/sm100/prepare_k2q_csr.py</code></p>
+<p>核查后确认 <code>kBlockK</code> 模板参数在整个 pipeline 中只用于
+<code>ceil(seqlen_k / kBlockK)</code> 的行数运算（<code>k2q_build_row_map_kernel</code>），
+其余 kernel 只是透传。因此 32/64 是<b>精确</b>而非近似支持。把
+<code>TORCH_CHECK(blk_kv == 128)</code> 换成 {32,64,128} 校验，并用宏把
+(topK × blk_kv) 的 12 个实例化展开，两个入口共用。</p>
+</div>
+
+<div class="step">
+<h3>4.5 容器内 CUDA 构建修复（两处）</h3>
+<p>文件：<code>cute/src/sm100/build_k2q_csr/__init__.py</code></p>
+<ul>
+  <li><b><code>cusparse.h: No such file</code></b>：容器用 pip CUDA stack，
+      <code>cusparse.h</code> 在 <code>site-packages/nvidia/cu13/include</code> 而不在
+      <code>/usr/local/cuda/include</code>，而 <code>ATen/cuda/CUDAContext.h</code> 需要它。
+      直接把 wheel 的 include 目录整个加进去会<b>反向踩雷</b>：
+      <code>extra_include_paths</code> 排在 <code>-isystem $CUDA_HOME/include</code> 之前，
+      wheel 里的 <code>crt/host_runtime.h</code> 会遮蔽 nvcc 自带版本，导致
+      <code>macro "__cudaLaunch" passed 2 arguments</code>。最终做法：建一个 shim 目录，
+      只软链 CUDA_HOME <b>缺失</b>的头文件，绝不遮蔽已有的。</li>
+  <li><b><code>__cudaLaunch was not declared</code></b>：CUDA 12.8 把
+      <code>-static-global-template-stub</code> 默认翻成 true，与匿名 namespace 里的
+      模板 <code>__global__</code> 冲突。仓库自己的 csrc JIT 早就固定了这个 flag，
+      这里按 <code>torch.version.cuda ≥ 12.8</code> 条件补上。同时把
+      <code>-arch=sm_100</code> 改为按实际设备能力取（B300 上是 <code>sm_103</code>），
+      省掉每次进程启动的 PTX JIT。</li>
+</ul>
+</div>
+
+<div class="step">
+<h3>4.6 配置层与流水线</h3>
+<p>新增 <code>python/fmha_sm100/msa_config.py</code>（无 CUDA 依赖，任意机器可导入）：
+<code>MsaSparseConfig</code> 数据类 + 校验 + 三种字符串格式互转
+（slug <code>fi128-fe128-b32-k16-hkeep</code> / label <code>force_init(128)-...</code> /
+<code>key=value</code> 列表）+ 环境变量读取 + 12 组矩阵 + <code>MODEL_N16</code> 模型形状。</p>
+<p>新增 <code>python/fmha_sm100/msa_pipeline.py</code>：<code>MsaSparseAttention</code>
+把「打分 → 选择 → CSR → 注意力」串起来，每一级都可单独调用（benchmark 用），
+<code>__call__</code> 跑完整链路。刻意<b>不</b>持有打分器，让未来支持 sub-128 粒度的
+打分器可以直接替换。</p>
+</div>
+
+<div class="step">
+<h3>4.7 benchmark 暴露的 indexer host 瓶颈（当场修复）</h3>
+<p>文件：<code>cute/fp4_indexer_interface.py</code></p>
+<p>第一版 benchmark 跑出来 indexer 的 eager 延迟是 8K 下 1.13 ms、32K 下 15.7 ms，
+<b>而且 2 head 和 16 head 完全一样</b>——GPU 计算量差 8× 时间却不变，说明瓶颈在 host 而非 kernel。
+定位到 <code>_causal_compact_task_bound</code> 是 O(q_tiles&sup2;) 的纯 Python 双重循环，
+且每次调用重算。加 <code>lru_cache</code> 后 32K 从 15.66 ms 降到 0.254 ms（<b>61.6&times;</b>）。
+细节与后续建议见 §8.1。</p>
+<p>本轮所有 benchmark 数据都是在修复<b>之后</b>采集的。</p>
+</div>
+
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="s5"><span class="num">5</span>正确性验证</h2>
+
+<p>两个新回归测试，全部在 B300 实机跑通。测试几何由
+<code>msa_config.DEFAULT_MODEL</code> 推导，因此换目标模型时测试自动跟随——
+本轮是 <b>Hq=32 / Hkv=4 / GQA 8× / D=128</b>。</p>
+
+<h3>5.1 <code>tests/regression/test_msa_topk_config.py</code> — 38 用例</h3>
+<p>与 PyTorch 参考实现<b>逐元素精确</b>比对（分数取随机排列保证两两不等，唯一的并列
+就是 <code>FLT_MAX</code> 强制块，而强制块必然全被选中、顺序无关，所以可以要求精确相等）。</p>
+<ul>
+  <li>旧契约 topk=16 / keep / 无 force —— 兼容性</li>
+  <li>topk ∈ {4, 8, 16, 32} —— 其中 32 是改造前不支持的</li>
+  <li>head_mode ∈ {keep, sum, max} × {float4 XOR 快速路径, 补齐 tile 回退路径}</li>
+  <li>force (begin, end) ∈ {(4,0), (0,4), (4,4), (8,8)} —— 序列末尾锚点</li>
+  <li>逐 query 因果锚点 × 三种 head_mode</li>
+  <li><b>12 组配置矩阵</b>在 8192 上下文（block=32 → 256 块 / block=64 → 128 块）下全跑</li>
+  <li>head-outermost 布局必须是旧布局的精确转置（含 identity-fill 平凡路径）</li>
+  <li>边界：max_k_tiles ≤ topk、nvp == max_k_tiles、单 query</li>
+  <li>配置层护栏：block=32 + topk=4 + 128/128 窗口必须被拒（需要 8 块 &gt; 预算 4）</li>
+</ul>
+<div class="card ok"><span class="pill ok">PASS</span> 38/38，且原
+<code>tests/smoke/test_sparse_topk_forced.py</code> 8/8 仍全绿（含 “force=0 与不 force 逐位相同”）。</div>
+
+<h3>5.2 <code>tests/regression/test_msa_block_size.py</code> — blk_kv 32/64/128</h3>
+<p>构造真实的因果 top-k 选择（与生产同样的「打分 → top-k → 升序、-1 补齐」契约），
+过 CSR + schedule，跑 <code>sparse_atten_func</code>，与 fp32 masked SDPA 参考比对。</p>
+<div class="scroll">
+<table>
+<thead><tr><th>blk_kv</th><th class="num">topk</th><th class="num">块数</th>
+  <th class="num">相对误差</th><th class="num">最大绝对误差</th><th>结论</th></tr></thead>
+<tbody>
+<tr><td class="mono">32</td><td class="num">16</td><td class="num">64</td><td class="num">3.014e-03</td><td class="num">9.702e-03</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">32</td><td class="num">32</td><td class="num">64</td><td class="num">2.447e-03</td><td class="num">7.901e-03</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">64</td><td class="num">16</td><td class="num">32</td><td class="num">2.527e-03</td><td class="num">8.252e-03</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">64</td><td class="num">32</td><td class="num">32</td><td class="num">2.028e-03</td><td class="num">7.667e-03</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">128</td><td class="num">16</td><td class="num">16</td><td class="num">2.664e-03</td><td class="num">7.701e-03</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">128</td><td class="num">32</td><td class="num">16</td><td class="num">3.282e-03</td><td class="num">1.446e-02</td><td><span class="pill ok">PASS</span></td></tr>
+</tbody>
+</table>
+</div>
+<p>误差量级 2–4e-3，正是 bf16 存储 + fp32 累加对 fp32 参考应有的水平；
+判定阈值 2e-2。<b>结论：blk_kv=32 与 64 在 SM100 稀疏前向上数值正确。</b></p>
+
+<h3>5.3 端到端流水线</h3>
+<p>选择内核本身由 §5.1 的 38 个用例穷举覆盖，这一组要钉住的是<b>串联</b>——
+配置的强制窗口、推导出的逐 query 因果上界、CSR 构建、注意力调用四者描述的是同一个稀疏模式。
+任何一级接错（<code>blk_kv</code> 传错、<code>total_rows</code> 过期、选择张量转置了）
+都会表现为数值大幅偏离，而不是崩溃。同时断言 sink 窗口确实出现在选择结果的前
+<code>force_init_blocks</code> 个位置。</p>
+<div class="scroll">
+<table>
+<thead><tr><th>配置</th><th class="num">相对误差</th><th>sink 窗口</th><th>结论</th></tr></thead>
+<tbody>
+<tr><td class="mono">fi128-fe128-b32-k16-hkeep</td><td class="num">2.760e-03</td><td>✓</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">fi128-fe128-b64-k16-hkeep</td><td class="num">2.767e-03</td><td>✓</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">fi128-fe128-b32-k16-hsum</td><td class="num">2.194e-03</td><td>✓</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">fi128-fe128-b64-k16-hsum</td><td class="num">2.397e-03</td><td>✓</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">fi128-fe128-b32-k16-hmax</td><td class="num">1.980e-03</td><td>✓</td><td><span class="pill ok">PASS</span></td></tr>
+<tr><td class="mono">fi128-fe128-b64-k16-hmax</td><td class="num">2.824e-03</td><td>✓</td><td><span class="pill ok">PASS</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>5.4 选择质量验证 —— head 模式的 keep / sum / max</h3>
+
+<p>§7 的 benchmark 只回答了「哪个配置快」。<code>head_mode</code> 本质是<b>质量/成本</b>的权衡，
+只按延迟排序不构成答案。这一组补上质量的一半，用的是<b>真实训练权重的 Q/K</b>而不是随机张量：
+从 model-n32 checkpoint <code>&lt;checkpoint&gt;</code>（Hq=32 / Hkv=4 / GQA 8 / D=128，与目标完全一致）
+直接读单层的 <code>q_proj / k_proj / q_layernorm / k_layernorm</code>，复现 qk-layernorm → RoPE，
+算出精确的 dense attention，再问每种选择保住了多少注意力概率质量。</p>
+
+<h4>指标</h4>
+<p>对 query <code>q</code>、query head <code>h</code>，dense 权重 <code>p(q,·)</code>、选中 token 集
+<code>S(q,h)</code>：<code>recall(q,h) = Σ_{j∈S} p(q,j)</code>。
+这是 NSA / MoBA / DSA 都在用的标准量，等于稀疏内核还能看到的 softmax 分子占比。
+除均值外两个统计量更关键：<b>p5</b>（5 分位，尾部有多差）与
+<b>min-in-group</b>（GQA 组内被服务得最差的那个 query head——共享选择的下限就在这里）。</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th>模式</th><th>含义</th></tr></thead>
+<tbody>
+<tr><td class="mono">oracle</td><td>每个 query head 各选各的 top-k。内核做不到（CSR 元数据以 KV head 为键），
+    但它是任何共享方案的上界，让「sum vs max」有了标尺</td></tr>
+<tr><td class="mono">sum / max</td><td>把 <code>keep</code> 的同一批 Hkv=4 行 proxy 分数归约成
+    <b>一份</b>整层共享的选择——打分器工作量与 keep 完全相同</td></tr>
+<tr><td class="mono">keep</td><td>每个 KV head 一行分数。MSA 期望它来自单独的 proxy-Q 投影，而 MSA 并不训练这个投影，
+    这里用<b>组内 Q 向量池化</b>顶替（池化必须发生在 QK <b>之前</b>——对分数池化只等价于 sum 乘一个正常数，
+    top-k 不变）。所以 keep 这一行是<b>下界</b>：真正训练过的 proxy 只会更好</td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>结果（相对 per-head oracle 的 recall 比值）</h4>
+<div class="scroll">
+<table>
+<thead><tr><th class="num">seqlen</th><th class="num">block/topk</th><th class="num">预算</th>
+  <th class="num">oracle 绝对值</th><th class="num">keep<br>4 行 → 4 份</th>
+  <th class="num">sum<br>4 行 → 1 份</th><th class="num">max<br>4 行 → 1 份</th></tr></thead>
+<tbody>
+<tr><td class="num">8K</td><td class="num">64/16</td><td class="num">1024</td><td class="num">0.633</td>
+    <td class="num"><b>0.924</b></td><td class="num">0.901</td><td class="num">0.869</td></tr>
+<tr><td class="num">8K</td><td class="num">64/32</td><td class="num">2048</td><td class="num">0.818</td>
+    <td class="num"><b>0.949</b></td><td class="num">0.935</td><td class="num">0.915</td></tr>
+<tr class="hl"><td class="num">16K</td><td class="num">64/16</td><td class="num">1024</td><td class="num">0.486</td>
+    <td class="num"><b>0.900</b></td><td class="num">0.871</td><td class="num">0.829</td></tr>
+<tr><td class="num">16K</td><td class="num">64/32</td><td class="num">2048</td><td class="num">0.661</td>
+    <td class="num"><b>0.917</b></td><td class="num">0.894</td><td class="num">0.862</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>组内被服务最差的那个 query head（绝对 recall，16K / block=64 / topk=16）：
+<code>oracle</code> 0.486、<code>keep</code> 0.286、<code>sum</code> 0.210、<code>max</code> 0.211。
+<code>keep</code> 的选择在 8 个 query head 之间共享，<code>sum</code>/<code>max</code> 在 32 个之间共享，
+所以最差 head 掉得更多。</p>
+
+<div class="card ok">
+  <div class="title">结论</div>
+  <ol>
+    <li><b>排序稳定：keep &gt; sum &gt; max</b>，4 个 (seqlen, 形状) 组合、三个统计量无一例外。
+        质量与共享程度直接挂钩：4 份选择 &gt; 1 份选择。</li>
+    <li><b><code>max</code> 应当排除。</b>它和 <code>sum</code> 成本一样（实测差 &lt;1%），
+        质量却始终差 3.2–4.2 个点——被严格支配。</li>
+    <li><b><code>keep</code> 与 <code>sum</code> 是一个真实的取舍</b>：
+        <code>sum</code> 快 1.08–1.27×（§7b），质量差 1.4–2.9 个点。
+        短上下文（≤32K）<code>sum</code> 的速度优势最大而质量差距也最大；
+        长上下文（≥64K）速度优势缩到 1.08–1.14×，此时 <code>keep</code> 的质量更划算。</li>
+    <li><b>预算压倒 head 模式。</b>16K 下把 topk 从 16 提到 32，
+        <code>sum</code> 的 recall 从 0.871 涨到 0.894，超过 <code>keep</code>@topk=16 的
+        0.900 附近——加预算比换模式更有效。</li>
+  </ol>
+</div>
+
+<h3>5.5 既有测试无回归</h3>
+<p>改动触及公共 API（<code>sparse_topk_select</code> 新增 4 个参数）与 CSR builder，
+因此复跑了仓库既有的相关测试：</p>
+<ul>
+  <li><code>tests/smoke/test_sparse_topk_forced.py</code> —— 8/8 PASS，含
+      「force=0 与不 force 逐位相同」</li>
+  <li><code>tests/smoke/test_proxy_kv_smoke.py</code> —— PASS，
+      <code>max_score(4,128,8) → kv_block_indexes(8,4,16) → o(8,16,128)</code>，
+      旧调用形态（位置参数、qo-outermost 输出）行为不变</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="s6"><span class="num">6</span>基线性能评估</h2>
+
+<p>基线 = MSA 出厂配置：<code>block=128, topk=16</code>，无强制窗口，<code>head=keep</code>
+（打分器以 MQA proxy-Q 模式跑 Hkv=2 行）。对照组是同形状的 dense causal
+<code>fmha_sm100</code>。三个计时视角：</p>
+<ul>
+  <li><b>eager</b> — 逐次 CUDA event 计时（每次冲 L2），朴素 per-layer Python 循环看到的延迟</li>
+  <li><b>gpu</b> — CUDA graph 回放，剔除 host 派发后的纯内核时间</li>
+  <li><b>host</b> — 不同步的入队 wall time，即 host 派发成本</li>
+</ul>
+
+<!-- BEGIN:baseline -->
+<div class="scroll"><table>
+<thead><tr><th class="num">kv_len</th><th>行</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">eager</th><th class="num">host</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="dense"><td class="num">4096</td><td>dense causal FMHA</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">0.112</td><td class="num">0.112</td><td class="num">—</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">4096</td><td>baseline block=128 topk=16 keep</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">0.570</td><td class="num">0.570</td><td class="num">0.000</td><td class="num">0.20x</td></tr>
+<tr class="dense"><td class="num">8192</td><td>dense causal FMHA</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">0.380</td><td class="num">0.380</td><td class="num">—</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">8192</td><td>baseline block=128 topk=16 keep</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">1.059</td><td class="num">1.059</td><td class="num">0.000</td><td class="num">0.36x</td></tr>
+<tr class="dense"><td class="num">16384</td><td>dense causal FMHA</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">1.583</td><td class="num">1.583</td><td class="num">—</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">16384</td><td>baseline block=128 topk=16 keep</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">2.042</td><td class="num">2.042</td><td class="num">0.000</td><td class="num">0.78x</td></tr>
+<tr class="dense"><td class="num">32768</td><td>dense causal FMHA</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">6.537</td><td class="num">6.537</td><td class="num">—</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">32768</td><td>baseline block=128 topk=16 keep</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">4.482</td><td class="num">4.482</td><td class="num">0.000</td><td class="num">1.46x</td></tr>
+<tr class="dense"><td class="num">65536</td><td>dense causal FMHA</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">26.958</td><td class="num">26.958</td><td class="num">—</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">65536</td><td>baseline block=128 topk=16 keep</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">11.455</td><td class="num">11.455</td><td class="num">0.000</td><td class="num">2.35x</td></tr>
+<tr class="dense"><td class="num">131072</td><td>dense causal FMHA</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">107.263</td><td class="num">107.263</td><td class="num">—</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">131072</td><td>baseline block=128 topk=16 keep</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">—</td><td class="num">48.435</td><td class="num">48.435</td><td class="num">0.000</td><td class="num">2.21x</td></tr>
+</tbody></table></div>
+<p>单位 ms，batch=1，causal，bf16，Hq=32 / Hkv=4 / D=128（model-n32 的真实注意力几何）。</p>
+<p>model-n32 每次前向有 <b>46</b> 层 softmax attention（45 层 + 1 层 MTP），把单层耗时乘上去：</p>
+<div class="scroll"><table><thead><tr><th class="num">kv_len</th><th class="num">dense × 46</th><th class="num">baseline × 46</th><th class="num">最佳配置</th><th class="num">最佳 × 46</th><th class="num">相对 dense 省下</th></tr></thead><tbody>
+<tr><td class='num'>4096</td><td class='num'>5.1</td><td class='num'>26.2</td><td class='num'>cfg28</td><td class='num'>11.2</td><td class='num'><span style='color:var(--bad)'>+6.0 ms</span></td></tr>
+<tr><td class='num'>8192</td><td class='num'>17.5</td><td class='num'>48.7</td><td class='num'>cfg28</td><td class='num'>17.9</td><td class='num'><span style='color:var(--bad)'>+0.4 ms</span></td></tr>
+<tr><td class='num'>16384</td><td class='num'>72.8</td><td class='num'>93.9</td><td class='num'>cfg28</td><td class='num'>34.0</td><td class='num'>38.8 ms</td></tr>
+<tr><td class='num'>32768</td><td class='num'>300.7</td><td class='num'>206.2</td><td class='num'>cfg28</td><td class='num'>88.1</td><td class='num'>212.6 ms</td></tr>
+<tr><td class='num'>65536</td><td class='num'>1240.1</td><td class='num'>526.9</td><td class='num'>cfg23</td><td class='num'>331.2</td><td class='num'>908.8 ms</td></tr>
+<tr><td class='num'>131072</td><td class='num'>4934.1</td><td class='num'>2228.0</td><td class='num'>cfg30</td><td class='num'>1814.1</td><td class='num'>3120.0 ms</td></tr>
+</tbody></table></div>
+<!-- END:baseline -->
+
+<!-- ===================================================================== -->
+<h2 id="s7"><span class="num">7</span>12 组配置 benchmark</h2>
+
+<!-- BEGIN:sweep -->
+<h3>流水线延迟（ms / 层，单算子逐级相加）</h3><div class='scroll'><table><thead><tr><th>配置</th><th class='num'>block</th><th class='num'>topk</th><th>head</th><th class='num'>预算</th><th class='num'>4K</th><th class='num'>8K</th><th class='num'>16K</th><th class='num'>32K</th><th class='num'>64K</th><th class='num'>128K</th></tr></thead><tbody><tr class='dense'><td>dense causal</td><td class='num'>—</td><td class='num'>—</td><td>—</td><td class='num'>—</td><td class='num'>0.11</td><td class='num'>0.38</td><td class='num'>1.58</td><td class='num'>6.54</td><td class='num'>26.96</td><td class='num'>107.26</td></tr><tr><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.57</td><td class='num'>1.06</td><td class='num'>2.04</td><td class='num'>4.48</td><td class='num'>11.45</td><td class='num'>48.43</td></tr><tr><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>0.51</td><td class='num'>0.91</td><td class='num'>1.91</td><td class='num'>4.57</td><td class='num'>12.23</td><td class='num'>52.57</td></tr><tr><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>0.80</td><td class='num'>1.43</td><td class='num'>2.98</td><td class='num'>6.94</td><td class='num'>15.95</td><td class='num'>60.15</td></tr><tr class='hl'><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>0.53</td><td class='num'>0.95</td><td class='num'>1.86</td><td class='num'>4.25</td><td class='num'>11.43</td><td class='num'>49.29</td></tr><tr><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>0.82</td><td class='num'>1.47</td><td class='num'>2.91</td><td class='num'>6.42</td><td class='num'>14.93</td><td class='num'>56.60</td></tr><tr><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>0.44</td><td class='num'>0.77</td><td class='num'>1.53</td><td class='num'>3.54</td><td class='num'>10.47</td><td class='num'>47.38</td></tr><tr><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>0.72</td><td class='num'>1.27</td><td class='num'>2.49</td><td class='num'>5.53</td><td class='num'>14.09</td><td class='num'>54.82</td></tr><tr><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>0.47</td><td class='num'>0.81</td><td class='num'>1.52</td><td class='num'>3.47</td><td class='num'>10.03</td><td class='num'>45.72</td></tr><tr><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>0.75</td><td class='num'>1.34</td><td class='num'>2.56</td><td class='num'>5.53</td><td class='num'>13.55</td><td class='num'>53.17</td></tr><tr><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>0.45</td><td class='num'>0.76</td><td class='num'>1.53</td><td class='num'>3.55</td><td class='num'>10.44</td><td class='num'>47.33</td></tr><tr><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>0.73</td><td class='num'>1.27</td><td class='num'>2.50</td><td class='num'>5.55</td><td class='num'>14.13</td><td class='num'>54.77</td></tr><tr><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>0.47</td><td class='num'>0.81</td><td class='num'>1.55</td><td class='num'>3.49</td><td class='num'>10.02</td><td class='num'>45.74</td></tr><tr><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>0.76</td><td class='num'>1.34</td><td class='num'>2.57</td><td class='num'>5.56</td><td class='num'>13.60</td><td class='num'>53.15</td></tr><tr><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>0.37</td><td class='num'>0.65</td><td class='num'>1.35</td><td class='num'>3.34</td><td class='num'>10.42</td><td class='num'>48.71</td></tr><tr><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>0.30</td><td class='num'>0.51</td><td class='num'>1.01</td><td class='num'>2.51</td><td class='num'>8.59</td><td class='num'>43.46</td></tr><tr><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>0.38</td><td class='num'>0.67</td><td class='num'>1.31</td><td class='num'>3.11</td><td class='num'>9.56</td><td class='num'>45.45</td></tr><tr><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>0.31</td><td class='num'>0.55</td><td class='num'>1.04</td><td class='num'>2.53</td><td class='num'>8.35</td><td class='num'>42.09</td></tr><tr><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>0.40</td><td class='num'>0.72</td><td class='num'>1.39</td><td class='num'>3.20</td><td class='num'>9.45</td><td class='num'>44.31</td></tr><tr><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.57</td><td class='num'>1.06</td><td class='num'>2.06</td><td class='num'>4.45</td><td class='num'>11.54</td><td class='num'>48.56</td></tr><tr><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>0.75</td><td class='num'>1.70</td><td class='num'>3.31</td><td class='num'>6.95</td><td class='num'>15.69</td><td class='num'>56.98</td></tr><tr><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>0.31</td><td class='num'>0.51</td><td class='num'>1.02</td><td class='num'>2.54</td><td class='num'>8.70</td><td class='num'>43.68</td></tr><tr><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>0.24</td><td class='num'>0.40</td><td class='num'>0.74</td><td class='num'>1.92</td><td class='num'>7.29</td><td class='num'>40.06</td></tr><tr><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>0.32</td><td class='num'>0.54</td><td class='num'>1.01</td><td class='num'>2.47</td><td class='num'>8.23</td><td class='num'>41.99</td></tr><tr><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>0.26</td><td class='num'>0.42</td><td class='num'>0.78</td><td class='num'>1.97</td><td class='num'>7.20</td><td class='num'>39.46</td></tr><tr><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>0.34</td><td class='num'>0.58</td><td class='num'>1.13</td><td class='num'>2.61</td><td class='num'>8.26</td><td class='num'>41.58</td></tr><tr><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>0.50</td><td class='num'>0.92</td><td class='num'>1.74</td><td class='num'>3.82</td><td class='num'>10.27</td><td class='num'>45.77</td></tr><tr><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>0.74</td><td class='num'>1.55</td><td class='num'>3.08</td><td class='num'>6.26</td><td class='num'>14.42</td><td class='num'>54.13</td></tr><tr><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>0.31</td><td class='num'>0.52</td><td class='num'>1.02</td><td class='num'>2.53</td><td class='num'>8.68</td><td class='num'>43.61</td></tr><tr><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>0.24</td><td class='num'>0.39</td><td class='num'>0.74</td><td class='num'>1.91</td><td class='num'>7.28</td><td class='num'>40.04</td></tr><tr><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>0.33</td><td class='num'>0.54</td><td class='num'>1.02</td><td class='num'>2.44</td><td class='num'>8.22</td><td class='num'>41.97</td></tr><tr><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>0.26</td><td class='num'>0.42</td><td class='num'>0.79</td><td class='num'>1.97</td><td class='num'>7.21</td><td class='num'>39.44</td></tr><tr><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>0.34</td><td class='num'>0.59</td><td class='num'>1.12</td><td class='num'>2.61</td><td class='num'>8.28</td><td class='num'>41.58</td></tr><tr><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>0.50</td><td class='num'>0.92</td><td class='num'>1.74</td><td class='num'>3.81</td><td class='num'>10.42</td><td class='num'>45.72</td></tr><tr><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>0.74</td><td class='num'>1.55</td><td class='num'>3.00</td><td class='num'>6.18</td><td class='num'>14.59</td><td class='num'>54.08</td></tr></tbody></table></div>
+<h3>相对 dense 的加速比（&gt;1 表示稀疏更快）</h3><div class='scroll'><table><thead><tr><th>配置</th><th class='num'>block</th><th class='num'>topk</th><th>head</th><th class='num'>预算</th><th class='num'>4K</th><th class='num'>8K</th><th class='num'>16K</th><th class='num'>32K</th><th class='num'>64K</th><th class='num'>128K</th></tr></thead><tbody><tr class='dense'><td>dense causal</td><td class='num'>—</td><td class='num'>—</td><td>—</td><td class='num'>—</td><td class='num'>1.00x</td><td class='num'>1.00x</td><td class='num'>1.00x</td><td class='num'>1.00x</td><td class='num'>1.00x</td><td class='num'>1.00x</td></tr><tr><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.20x</td><td class='num'>0.36x</td><td class='num'>0.78x</td><td class='num' style='color:var(--ok);font-weight:600'>1.46x</td><td class='num' style='color:var(--ok);font-weight:600'>2.35x</td><td class='num' style='color:var(--ok);font-weight:600'>2.21x</td></tr><tr><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>0.22x</td><td class='num'>0.42x</td><td class='num'>0.83x</td><td class='num' style='color:var(--ok);font-weight:600'>1.43x</td><td class='num' style='color:var(--ok);font-weight:600'>2.20x</td><td class='num' style='color:var(--ok);font-weight:600'>2.04x</td></tr><tr><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>0.14x</td><td class='num'>0.27x</td><td class='num'>0.53x</td><td class='num'>0.94x</td><td class='num' style='color:var(--ok);font-weight:600'>1.69x</td><td class='num' style='color:var(--ok);font-weight:600'>1.78x</td></tr><tr class='hl'><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>0.21x</td><td class='num'>0.40x</td><td class='num'>0.85x</td><td class='num' style='color:var(--ok);font-weight:600'>1.54x</td><td class='num' style='color:var(--ok);font-weight:600'>2.36x</td><td class='num' style='color:var(--ok);font-weight:600'>2.18x</td></tr><tr><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>0.14x</td><td class='num'>0.26x</td><td class='num'>0.54x</td><td class='num' style='color:var(--ok);font-weight:600'>1.02x</td><td class='num' style='color:var(--ok);font-weight:600'>1.81x</td><td class='num' style='color:var(--ok);font-weight:600'>1.90x</td></tr><tr><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>0.25x</td><td class='num'>0.49x</td><td class='num' style='color:var(--ok);font-weight:600'>1.04x</td><td class='num' style='color:var(--ok);font-weight:600'>1.85x</td><td class='num' style='color:var(--ok);font-weight:600'>2.58x</td><td class='num' style='color:var(--ok);font-weight:600'>2.26x</td></tr><tr><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>0.16x</td><td class='num'>0.30x</td><td class='num'>0.64x</td><td class='num' style='color:var(--ok);font-weight:600'>1.18x</td><td class='num' style='color:var(--ok);font-weight:600'>1.91x</td><td class='num' style='color:var(--ok);font-weight:600'>1.96x</td></tr><tr><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>0.24x</td><td class='num'>0.47x</td><td class='num' style='color:var(--ok);font-weight:600'>1.04x</td><td class='num' style='color:var(--ok);font-weight:600'>1.89x</td><td class='num' style='color:var(--ok);font-weight:600'>2.69x</td><td class='num' style='color:var(--ok);font-weight:600'>2.35x</td></tr><tr><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>0.15x</td><td class='num'>0.28x</td><td class='num'>0.62x</td><td class='num' style='color:var(--ok);font-weight:600'>1.18x</td><td class='num' style='color:var(--ok);font-weight:600'>1.99x</td><td class='num' style='color:var(--ok);font-weight:600'>2.02x</td></tr><tr><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>0.25x</td><td class='num'>0.50x</td><td class='num' style='color:var(--ok);font-weight:600'>1.04x</td><td class='num' style='color:var(--ok);font-weight:600'>1.84x</td><td class='num' style='color:var(--ok);font-weight:600'>2.58x</td><td class='num' style='color:var(--ok);font-weight:600'>2.27x</td></tr><tr><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>0.15x</td><td class='num'>0.30x</td><td class='num'>0.63x</td><td class='num' style='color:var(--ok);font-weight:600'>1.18x</td><td class='num' style='color:var(--ok);font-weight:600'>1.91x</td><td class='num' style='color:var(--ok);font-weight:600'>1.96x</td></tr><tr><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>0.24x</td><td class='num'>0.47x</td><td class='num' style='color:var(--ok);font-weight:600'>1.02x</td><td class='num' style='color:var(--ok);font-weight:600'>1.87x</td><td class='num' style='color:var(--ok);font-weight:600'>2.69x</td><td class='num' style='color:var(--ok);font-weight:600'>2.34x</td></tr><tr><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>0.15x</td><td class='num'>0.28x</td><td class='num'>0.62x</td><td class='num' style='color:var(--ok);font-weight:600'>1.18x</td><td class='num' style='color:var(--ok);font-weight:600'>1.98x</td><td class='num' style='color:var(--ok);font-weight:600'>2.02x</td></tr><tr><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>0.30x</td><td class='num'>0.58x</td><td class='num' style='color:var(--ok);font-weight:600'>1.17x</td><td class='num' style='color:var(--ok);font-weight:600'>1.96x</td><td class='num' style='color:var(--ok);font-weight:600'>2.59x</td><td class='num' style='color:var(--ok);font-weight:600'>2.20x</td></tr><tr><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>0.37x</td><td class='num'>0.74x</td><td class='num' style='color:var(--ok);font-weight:600'>1.56x</td><td class='num' style='color:var(--ok);font-weight:600'>2.61x</td><td class='num' style='color:var(--ok);font-weight:600'>3.14x</td><td class='num' style='color:var(--ok);font-weight:600'>2.47x</td></tr><tr><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>0.29x</td><td class='num'>0.57x</td><td class='num' style='color:var(--ok);font-weight:600'>1.21x</td><td class='num' style='color:var(--ok);font-weight:600'>2.10x</td><td class='num' style='color:var(--ok);font-weight:600'>2.82x</td><td class='num' style='color:var(--ok);font-weight:600'>2.36x</td></tr><tr><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>0.36x</td><td class='num'>0.70x</td><td class='num' style='color:var(--ok);font-weight:600'>1.52x</td><td class='num' style='color:var(--ok);font-weight:600'>2.58x</td><td class='num' style='color:var(--ok);font-weight:600'>3.23x</td><td class='num' style='color:var(--ok);font-weight:600'>2.55x</td></tr><tr><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>0.28x</td><td class='num'>0.53x</td><td class='num' style='color:var(--ok);font-weight:600'>1.14x</td><td class='num' style='color:var(--ok);font-weight:600'>2.04x</td><td class='num' style='color:var(--ok);font-weight:600'>2.85x</td><td class='num' style='color:var(--ok);font-weight:600'>2.42x</td></tr><tr><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.20x</td><td class='num'>0.36x</td><td class='num'>0.77x</td><td class='num' style='color:var(--ok);font-weight:600'>1.47x</td><td class='num' style='color:var(--ok);font-weight:600'>2.34x</td><td class='num' style='color:var(--ok);font-weight:600'>2.21x</td></tr><tr><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>0.15x</td><td class='num'>0.22x</td><td class='num'>0.48x</td><td class='num'>0.94x</td><td class='num' style='color:var(--ok);font-weight:600'>1.72x</td><td class='num' style='color:var(--ok);font-weight:600'>1.88x</td></tr><tr><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>0.36x</td><td class='num'>0.74x</td><td class='num' style='color:var(--ok);font-weight:600'>1.55x</td><td class='num' style='color:var(--ok);font-weight:600'>2.58x</td><td class='num' style='color:var(--ok);font-weight:600'>3.10x</td><td class='num' style='color:var(--ok);font-weight:600'>2.46x</td></tr><tr><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>0.46x</td><td class='num'>0.96x</td><td class='num' style='color:var(--ok);font-weight:600'>2.13x</td><td class='num' style='color:var(--ok);font-weight:600'>3.41x</td><td class='num' style='color:var(--ok);font-weight:600'>3.70x</td><td class='num' style='color:var(--ok);font-weight:600'>2.68x</td></tr><tr><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>0.35x</td><td class='num'>0.70x</td><td class='num' style='color:var(--ok);font-weight:600'>1.56x</td><td class='num' style='color:var(--ok);font-weight:600'>2.65x</td><td class='num' style='color:var(--ok);font-weight:600'>3.28x</td><td class='num' style='color:var(--ok);font-weight:600'>2.55x</td></tr><tr><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>0.43x</td><td class='num'>0.91x</td><td class='num' style='color:var(--ok);font-weight:600'>2.02x</td><td class='num' style='color:var(--ok);font-weight:600'>3.32x</td><td class='num' style='color:var(--ok);font-weight:600'>3.74x</td><td class='num' style='color:var(--ok);font-weight:600'>2.72x</td></tr><tr><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>0.32x</td><td class='num'>0.65x</td><td class='num' style='color:var(--ok);font-weight:600'>1.40x</td><td class='num' style='color:var(--ok);font-weight:600'>2.50x</td><td class='num' style='color:var(--ok);font-weight:600'>3.26x</td><td class='num' style='color:var(--ok);font-weight:600'>2.58x</td></tr><tr><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>0.22x</td><td class='num'>0.42x</td><td class='num'>0.91x</td><td class='num' style='color:var(--ok);font-weight:600'>1.71x</td><td class='num' style='color:var(--ok);font-weight:600'>2.62x</td><td class='num' style='color:var(--ok);font-weight:600'>2.34x</td></tr><tr><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>0.15x</td><td class='num'>0.25x</td><td class='num'>0.51x</td><td class='num' style='color:var(--ok);font-weight:600'>1.05x</td><td class='num' style='color:var(--ok);font-weight:600'>1.87x</td><td class='num' style='color:var(--ok);font-weight:600'>1.98x</td></tr><tr><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>0.36x</td><td class='num'>0.73x</td><td class='num' style='color:var(--ok);font-weight:600'>1.55x</td><td class='num' style='color:var(--ok);font-weight:600'>2.59x</td><td class='num' style='color:var(--ok);font-weight:600'>3.10x</td><td class='num' style='color:var(--ok);font-weight:600'>2.46x</td></tr><tr><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>0.46x</td><td class='num'>0.98x</td><td class='num' style='color:var(--ok);font-weight:600'>2.14x</td><td class='num' style='color:var(--ok);font-weight:600'>3.41x</td><td class='num' style='color:var(--ok);font-weight:600'>3.70x</td><td class='num' style='color:var(--ok);font-weight:600'>2.68x</td></tr><tr><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>0.34x</td><td class='num'>0.71x</td><td class='num' style='color:var(--ok);font-weight:600'>1.56x</td><td class='num' style='color:var(--ok);font-weight:600'>2.67x</td><td class='num' style='color:var(--ok);font-weight:600'>3.28x</td><td class='num' style='color:var(--ok);font-weight:600'>2.56x</td></tr><tr><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>0.44x</td><td class='num'>0.90x</td><td class='num' style='color:var(--ok);font-weight:600'>1.99x</td><td class='num' style='color:var(--ok);font-weight:600'>3.32x</td><td class='num' style='color:var(--ok);font-weight:600'>3.74x</td><td class='num' style='color:var(--ok);font-weight:600'>2.72x</td></tr><tr><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>0.32x</td><td class='num'>0.65x</td><td class='num' style='color:var(--ok);font-weight:600'>1.42x</td><td class='num' style='color:var(--ok);font-weight:600'>2.50x</td><td class='num' style='color:var(--ok);font-weight:600'>3.26x</td><td class='num' style='color:var(--ok);font-weight:600'>2.58x</td></tr><tr><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>0.22x</td><td class='num'>0.41x</td><td class='num'>0.91x</td><td class='num' style='color:var(--ok);font-weight:600'>1.72x</td><td class='num' style='color:var(--ok);font-weight:600'>2.59x</td><td class='num' style='color:var(--ok);font-weight:600'>2.35x</td></tr><tr><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>0.15x</td><td class='num'>0.24x</td><td class='num'>0.53x</td><td class='num' style='color:var(--ok);font-weight:600'>1.06x</td><td class='num' style='color:var(--ok);font-weight:600'>1.85x</td><td class='num' style='color:var(--ok);font-weight:600'>1.98x</td></tr></tbody></table></div>
+<p><code>n/a</code> = 该形状下打分级无法运行（128K 的 sum/max 触发 §8.2 的 Int32 上限），这些格子<b>没有</b>参与任何排名。加粗绿色为稀疏胜过 dense 的格子。cfg03 高亮为综合推荐配置。</p>
+<h3>逐上下文明细</h3>
+<h3>kv_len = 4096　<span class='pill'>dense causal GPU 0.112 ms</span></h3>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">块数</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="hl"><td class='num'>1</td><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.243</td><td class='num'>0.46x</td></tr>
+<tr><td class='num'>2</td><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.244</td><td class='num'>0.46x</td></tr>
+<tr><td class='num'>3</td><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.256</td><td class='num'>0.44x</td></tr>
+<tr><td class='num'>4</td><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.258</td><td class='num'>0.43x</td></tr>
+<tr><td class='num'>5</td><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.300</td><td class='num'>0.37x</td></tr>
+<tr><td class='num'>6</td><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.312</td><td class='num'>0.36x</td></tr>
+<tr><td class='num'>7</td><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.312</td><td class='num'>0.36x</td></tr>
+<tr><td class='num'>8</td><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.312</td><td class='num'>0.36x</td></tr>
+<tr><td class='num'>9</td><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.324</td><td class='num'>0.35x</td></tr>
+<tr><td class='num'>10</td><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.326</td><td class='num'>0.34x</td></tr>
+<tr><td class='num'>11</td><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.344</td><td class='num'>0.32x</td></tr>
+<tr><td class='num'>12</td><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.344</td><td class='num'>0.32x</td></tr>
+<tr><td class='num'>13</td><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.373</td><td class='num'>0.30x</td></tr>
+<tr><td class='num'>14</td><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.381</td><td class='num'>0.29x</td></tr>
+<tr><td class='num'>15</td><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.404</td><td class='num'>0.28x</td></tr>
+<tr><td class='num'>16</td><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.444</td><td class='num'>0.25x</td></tr>
+<tr><td class='num'>17</td><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.453</td><td class='num'>0.25x</td></tr>
+<tr><td class='num'>18</td><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.466</td><td class='num'>0.24x</td></tr>
+<tr><td class='num'>19</td><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.470</td><td class='num'>0.24x</td></tr>
+<tr><td class='num'>20</td><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.504</td><td class='num'>0.22x</td></tr>
+<tr><td class='num'>21</td><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.504</td><td class='num'>0.22x</td></tr>
+<tr><td class='num'>22</td><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.510</td><td class='num'>0.22x</td></tr>
+<tr><td class='num'>23</td><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.533</td><td class='num'>0.21x</td></tr>
+<tr><td class='num'>24</td><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.569</td><td class='num'>0.20x</td></tr>
+<tr><td class='num'>25</td><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.570</td><td class='num'>0.20x</td></tr>
+<tr><td class='num'>26</td><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.717</td><td class='num'>0.16x</td></tr>
+<tr><td class='num'>27</td><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.727</td><td class='num'>0.15x</td></tr>
+<tr><td class='num'>28</td><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.744</td><td class='num'>0.15x</td></tr>
+<tr><td class='num'>29</td><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.744</td><td class='num'>0.15x</td></tr>
+<tr><td class='num'>30</td><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>32</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.748</td><td class='num'>0.15x</td></tr>
+<tr><td class='num'>31</td><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.754</td><td class='num'>0.15x</td></tr>
+<tr><td class='num'>32</td><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.756</td><td class='num'>0.15x</td></tr>
+<tr><td class='num'>33</td><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.795</td><td class='num'>0.14x</td></tr>
+<tr><td class='num'>34</td><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.819</td><td class='num'>0.14x</td></tr>
+</tbody></table></div>
+<h3>kv_len = 8192　<span class='pill'>dense causal GPU 0.380 ms</span></h3>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">块数</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="hl"><td class='num'>1</td><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.389</td><td class='num'>0.98x</td></tr>
+<tr><td class='num'>2</td><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.397</td><td class='num'>0.96x</td></tr>
+<tr><td class='num'>3</td><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.416</td><td class='num'>0.91x</td></tr>
+<tr><td class='num'>4</td><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.421</td><td class='num'>0.90x</td></tr>
+<tr><td class='num'>5</td><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.512</td><td class='num'>0.74x</td></tr>
+<tr><td class='num'>6</td><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.515</td><td class='num'>0.74x</td></tr>
+<tr><td class='num'>7</td><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.519</td><td class='num'>0.73x</td></tr>
+<tr><td class='num'>8</td><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.539</td><td class='num'>0.71x</td></tr>
+<tr><td class='num'>9</td><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.543</td><td class='num'>0.70x</td></tr>
+<tr><td class='num'>10</td><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.546</td><td class='num'>0.70x</td></tr>
+<tr><td class='num'>11</td><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.584</td><td class='num'>0.65x</td></tr>
+<tr><td class='num'>12</td><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.588</td><td class='num'>0.65x</td></tr>
+<tr><td class='num'>13</td><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.652</td><td class='num'>0.58x</td></tr>
+<tr><td class='num'>14</td><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.672</td><td class='num'>0.57x</td></tr>
+<tr><td class='num'>15</td><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.716</td><td class='num'>0.53x</td></tr>
+<tr><td class='num'>16</td><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.765</td><td class='num'>0.50x</td></tr>
+<tr><td class='num'>17</td><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.770</td><td class='num'>0.49x</td></tr>
+<tr><td class='num'>18</td><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.809</td><td class='num'>0.47x</td></tr>
+<tr><td class='num'>19</td><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.813</td><td class='num'>0.47x</td></tr>
+<tr><td class='num'>20</td><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.911</td><td class='num'>0.42x</td></tr>
+<tr><td class='num'>21</td><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.916</td><td class='num'>0.42x</td></tr>
+<tr><td class='num'>22</td><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.922</td><td class='num'>0.41x</td></tr>
+<tr><td class='num'>23</td><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.949</td><td class='num'>0.40x</td></tr>
+<tr><td class='num'>24</td><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.056</td><td class='num'>0.36x</td></tr>
+<tr><td class='num'>25</td><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.059</td><td class='num'>0.36x</td></tr>
+<tr><td class='num'>26</td><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.266</td><td class='num'>0.30x</td></tr>
+<tr><td class='num'>27</td><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.268</td><td class='num'>0.30x</td></tr>
+<tr><td class='num'>28</td><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.339</td><td class='num'>0.28x</td></tr>
+<tr><td class='num'>29</td><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.342</td><td class='num'>0.28x</td></tr>
+<tr><td class='num'>30</td><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.432</td><td class='num'>0.27x</td></tr>
+<tr><td class='num'>31</td><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.470</td><td class='num'>0.26x</td></tr>
+<tr><td class='num'>32</td><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.548</td><td class='num'>0.25x</td></tr>
+<tr><td class='num'>33</td><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.555</td><td class='num'>0.24x</td></tr>
+<tr><td class='num'>34</td><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>64</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.702</td><td class='num'>0.22x</td></tr>
+</tbody></table></div>
+<h3>kv_len = 16384　<span class='pill'>dense causal GPU 1.583 ms</span></h3>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">块数</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="hl"><td class='num'>1</td><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.740</td><td class='num'>2.14x</td></tr>
+<tr><td class='num'>2</td><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.744</td><td class='num'>2.13x</td></tr>
+<tr><td class='num'>3</td><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.782</td><td class='num'>2.02x</td></tr>
+<tr><td class='num'>4</td><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>0.795</td><td class='num'>1.99x</td></tr>
+<tr><td class='num'>5</td><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.012</td><td class='num'>1.56x</td></tr>
+<tr><td class='num'>6</td><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.014</td><td class='num'>1.56x</td></tr>
+<tr><td class='num'>7</td><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.016</td><td class='num'>1.56x</td></tr>
+<tr><td class='num'>8</td><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.020</td><td class='num'>1.55x</td></tr>
+<tr><td class='num'>9</td><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.024</td><td class='num'>1.55x</td></tr>
+<tr><td class='num'>10</td><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.045</td><td class='num'>1.52x</td></tr>
+<tr><td class='num'>11</td><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.116</td><td class='num'>1.42x</td></tr>
+<tr><td class='num'>12</td><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.130</td><td class='num'>1.40x</td></tr>
+<tr><td class='num'>13</td><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.312</td><td class='num'>1.21x</td></tr>
+<tr><td class='num'>14</td><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.349</td><td class='num'>1.17x</td></tr>
+<tr><td class='num'>15</td><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.389</td><td class='num'>1.14x</td></tr>
+<tr><td class='num'>16</td><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.524</td><td class='num'>1.04x</td></tr>
+<tr><td class='num'>17</td><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.526</td><td class='num'>1.04x</td></tr>
+<tr><td class='num'>18</td><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.527</td><td class='num'>1.04x</td></tr>
+<tr><td class='num'>19</td><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.547</td><td class='num'>1.02x</td></tr>
+<tr><td class='num'>20</td><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.744</td><td class='num'>0.91x</td></tr>
+<tr><td class='num'>21</td><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.745</td><td class='num'>0.91x</td></tr>
+<tr><td class='num'>22</td><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.859</td><td class='num'>0.85x</td></tr>
+<tr><td class='num'>23</td><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.913</td><td class='num'>0.83x</td></tr>
+<tr><td class='num'>24</td><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.042</td><td class='num'>0.78x</td></tr>
+<tr><td class='num'>25</td><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.059</td><td class='num'>0.77x</td></tr>
+<tr><td class='num'>26</td><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.491</td><td class='num'>0.64x</td></tr>
+<tr><td class='num'>27</td><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.500</td><td class='num'>0.63x</td></tr>
+<tr><td class='num'>28</td><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.562</td><td class='num'>0.62x</td></tr>
+<tr><td class='num'>29</td><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.568</td><td class='num'>0.62x</td></tr>
+<tr><td class='num'>30</td><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.905</td><td class='num'>0.54x</td></tr>
+<tr><td class='num'>31</td><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.977</td><td class='num'>0.53x</td></tr>
+<tr><td class='num'>32</td><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.004</td><td class='num'>0.53x</td></tr>
+<tr><td class='num'>33</td><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.085</td><td class='num'>0.51x</td></tr>
+<tr><td class='num'>34</td><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>128</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.311</td><td class='num'>0.48x</td></tr>
+</tbody></table></div>
+<h3>kv_len = 32768　<span class='pill'>dense causal GPU 6.537 ms</span></h3>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">块数</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="hl"><td class='num'>1</td><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.915</td><td class='num'>3.41x</td></tr>
+<tr><td class='num'>2</td><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.915</td><td class='num'>3.41x</td></tr>
+<tr><td class='num'>3</td><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.966</td><td class='num'>3.32x</td></tr>
+<tr><td class='num'>4</td><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>1.967</td><td class='num'>3.32x</td></tr>
+<tr><td class='num'>5</td><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.445</td><td class='num'>2.67x</td></tr>
+<tr><td class='num'>6</td><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.465</td><td class='num'>2.65x</td></tr>
+<tr><td class='num'>7</td><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.507</td><td class='num'>2.61x</td></tr>
+<tr><td class='num'>8</td><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.525</td><td class='num'>2.59x</td></tr>
+<tr><td class='num'>9</td><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.534</td><td class='num'>2.58x</td></tr>
+<tr><td class='num'>10</td><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.535</td><td class='num'>2.58x</td></tr>
+<tr><td class='num'>11</td><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.610</td><td class='num'>2.50x</td></tr>
+<tr><td class='num'>12</td><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>2.611</td><td class='num'>2.50x</td></tr>
+<tr><td class='num'>13</td><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.110</td><td class='num'>2.10x</td></tr>
+<tr><td class='num'>14</td><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.200</td><td class='num'>2.04x</td></tr>
+<tr><td class='num'>15</td><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.341</td><td class='num'>1.96x</td></tr>
+<tr><td class='num'>16</td><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.465</td><td class='num'>1.89x</td></tr>
+<tr><td class='num'>17</td><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.487</td><td class='num'>1.87x</td></tr>
+<tr><td class='num'>18</td><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.541</td><td class='num'>1.85x</td></tr>
+<tr><td class='num'>19</td><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.547</td><td class='num'>1.84x</td></tr>
+<tr><td class='num'>20</td><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.811</td><td class='num'>1.72x</td></tr>
+<tr><td class='num'>21</td><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>3.816</td><td class='num'>1.71x</td></tr>
+<tr><td class='num'>22</td><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>4.251</td><td class='num'>1.54x</td></tr>
+<tr><td class='num'>23</td><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>4.452</td><td class='num'>1.47x</td></tr>
+<tr><td class='num'>24</td><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>4.482</td><td class='num'>1.46x</td></tr>
+<tr><td class='num'>25</td><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>4.571</td><td class='num'>1.43x</td></tr>
+<tr><td class='num'>26</td><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>5.531</td><td class='num'>1.18x</td></tr>
+<tr><td class='num'>27</td><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>5.535</td><td class='num'>1.18x</td></tr>
+<tr><td class='num'>28</td><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>5.552</td><td class='num'>1.18x</td></tr>
+<tr><td class='num'>29</td><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>5.559</td><td class='num'>1.18x</td></tr>
+<tr><td class='num'>30</td><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>6.183</td><td class='num'>1.06x</td></tr>
+<tr><td class='num'>31</td><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>6.255</td><td class='num'>1.05x</td></tr>
+<tr><td class='num'>32</td><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>6.422</td><td class='num'>1.02x</td></tr>
+<tr><td class='num'>33</td><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>6.935</td><td class='num'>0.94x</td></tr>
+<tr><td class='num'>34</td><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>256</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>6.947</td><td class='num'>0.94x</td></tr>
+</tbody></table></div>
+<h3>kv_len = 65536　<span class='pill'>dense causal GPU 26.958 ms</span></h3>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">块数</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="hl"><td class='num'>1</td><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>7.200</td><td class='num'>3.74x</td></tr>
+<tr><td class='num'>2</td><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>7.210</td><td class='num'>3.74x</td></tr>
+<tr><td class='num'>3</td><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>7.279</td><td class='num'>3.70x</td></tr>
+<tr><td class='num'>4</td><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>7.290</td><td class='num'>3.70x</td></tr>
+<tr><td class='num'>5</td><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.224</td><td class='num'>3.28x</td></tr>
+<tr><td class='num'>6</td><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.227</td><td class='num'>3.28x</td></tr>
+<tr><td class='num'>7</td><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.259</td><td class='num'>3.26x</td></tr>
+<tr><td class='num'>8</td><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.279</td><td class='num'>3.26x</td></tr>
+<tr><td class='num'>9</td><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.348</td><td class='num'>3.23x</td></tr>
+<tr><td class='num'>10</td><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.586</td><td class='num'>3.14x</td></tr>
+<tr><td class='num'>11</td><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.683</td><td class='num'>3.10x</td></tr>
+<tr><td class='num'>12</td><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>8.701</td><td class='num'>3.10x</td></tr>
+<tr><td class='num'>13</td><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>9.452</td><td class='num'>2.85x</td></tr>
+<tr><td class='num'>14</td><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>9.559</td><td class='num'>2.82x</td></tr>
+<tr><td class='num'>15</td><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.021</td><td class='num'>2.69x</td></tr>
+<tr><td class='num'>16</td><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.030</td><td class='num'>2.69x</td></tr>
+<tr><td class='num'>17</td><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.270</td><td class='num'>2.62x</td></tr>
+<tr><td class='num'>18</td><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.420</td><td class='num'>2.59x</td></tr>
+<tr><td class='num'>19</td><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.423</td><td class='num'>2.59x</td></tr>
+<tr><td class='num'>20</td><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.441</td><td class='num'>2.58x</td></tr>
+<tr><td class='num'>21</td><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>10.468</td><td class='num'>2.58x</td></tr>
+<tr><td class='num'>22</td><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>11.430</td><td class='num'>2.36x</td></tr>
+<tr><td class='num'>23</td><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>11.455</td><td class='num'>2.35x</td></tr>
+<tr><td class='num'>24</td><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>11.543</td><td class='num'>2.34x</td></tr>
+<tr><td class='num'>25</td><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>12.234</td><td class='num'>2.20x</td></tr>
+<tr><td class='num'>26</td><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>13.547</td><td class='num'>1.99x</td></tr>
+<tr><td class='num'>27</td><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>13.601</td><td class='num'>1.98x</td></tr>
+<tr><td class='num'>28</td><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>14.093</td><td class='num'>1.91x</td></tr>
+<tr><td class='num'>29</td><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>14.133</td><td class='num'>1.91x</td></tr>
+<tr><td class='num'>30</td><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>14.420</td><td class='num'>1.87x</td></tr>
+<tr><td class='num'>31</td><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>14.586</td><td class='num'>1.85x</td></tr>
+<tr><td class='num'>32</td><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>14.929</td><td class='num'>1.81x</td></tr>
+<tr><td class='num'>33</td><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>512</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>15.688</td><td class='num'>1.72x</td></tr>
+<tr><td class='num'>34</td><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>15.946</td><td class='num'>1.69x</td></tr>
+</tbody></table></div>
+<h3>kv_len = 131072　<span class='pill'>dense causal GPU 107.263 ms</span></h3>
+<div class="scroll"><table><thead><tr><th class="num">#</th><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">块数</th><th class="num">indexer</th><th class="num">top-k</th><th class="num">CSR</th><th class="num">attn</th><th class="num">GPU 合计</th><th class="num">vs dense</th></tr></thead><tbody>
+<tr class="hl"><td class='num'>1</td><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>39.438</td><td class='num'>2.72x</td></tr>
+<tr><td class='num'>2</td><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>39.460</td><td class='num'>2.72x</td></tr>
+<tr><td class='num'>3</td><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>40.040</td><td class='num'>2.68x</td></tr>
+<tr><td class='num'>4</td><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>40.060</td><td class='num'>2.68x</td></tr>
+<tr><td class='num'>5</td><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>41.575</td><td class='num'>2.58x</td></tr>
+<tr><td class='num'>6</td><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>41.585</td><td class='num'>2.58x</td></tr>
+<tr><td class='num'>7</td><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>41.975</td><td class='num'>2.56x</td></tr>
+<tr><td class='num'>8</td><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>41.994</td><td class='num'>2.55x</td></tr>
+<tr><td class='num'>9</td><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>42.089</td><td class='num'>2.55x</td></tr>
+<tr><td class='num'>10</td><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>43.457</td><td class='num'>2.47x</td></tr>
+<tr><td class='num'>11</td><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>43.613</td><td class='num'>2.46x</td></tr>
+<tr><td class='num'>12</td><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>43.677</td><td class='num'>2.46x</td></tr>
+<tr><td class='num'>13</td><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>44.311</td><td class='num'>2.42x</td></tr>
+<tr><td class='num'>14</td><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>45.450</td><td class='num'>2.36x</td></tr>
+<tr><td class='num'>15</td><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>45.722</td><td class='num'>2.35x</td></tr>
+<tr><td class='num'>16</td><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>45.723</td><td class='num'>2.35x</td></tr>
+<tr><td class='num'>17</td><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>45.742</td><td class='num'>2.34x</td></tr>
+<tr><td class='num'>18</td><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>45.770</td><td class='num'>2.34x</td></tr>
+<tr><td class='num'>19</td><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>47.327</td><td class='num'>2.27x</td></tr>
+<tr><td class='num'>20</td><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>47.377</td><td class='num'>2.26x</td></tr>
+<tr><td class='num'>21</td><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>48.435</td><td class='num'>2.21x</td></tr>
+<tr><td class='num'>22</td><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>48.559</td><td class='num'>2.21x</td></tr>
+<tr><td class='num'>23</td><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>48.711</td><td class='num'>2.20x</td></tr>
+<tr><td class='num'>24</td><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>49.293</td><td class='num'>2.18x</td></tr>
+<tr><td class='num'>25</td><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>52.570</td><td class='num'>2.04x</td></tr>
+<tr><td class='num'>26</td><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>53.151</td><td class='num'>2.02x</td></tr>
+<tr><td class='num'>27</td><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>53.168</td><td class='num'>2.02x</td></tr>
+<tr><td class='num'>28</td><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>54.078</td><td class='num'>1.98x</td></tr>
+<tr><td class='num'>29</td><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>54.130</td><td class='num'>1.98x</td></tr>
+<tr><td class='num'>30</td><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>54.770</td><td class='num'>1.96x</td></tr>
+<tr><td class='num'>31</td><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>54.816</td><td class='num'>1.96x</td></tr>
+<tr><td class='num'>32</td><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>2048</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>56.600</td><td class='num'>1.90x</td></tr>
+<tr><td class='num'>33</td><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>1024</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>56.984</td><td class='num'>1.88x</td></tr>
+<tr><td class='num'>34</td><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>4096</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>—</td><td class='num'>60.153</td><td class='num'>1.78x</td></tr>
+</tbody></table></div>
+<h3>等 token 预算对照</h3>
+<p>把 token 预算固定住，只改 block/topk 的分配方式：</p>
+<div class="scroll"><table><thead><tr><th class="num">kv_len</th><th class="num">cfg03 attn<br>b64/k16, 1024 tok</th><th class="num">cfg02 attn<br>b32/k32, 1024 tok</th><th class="num">比值</th><th class="num">cfg01 attn<br>b32/k16, 512 tok</th><th class="num">cfg03 attn<br>b64/k16, 1024 tok</th><th class="num">比值</th></tr></thead><tbody>
+</tbody></table></div>
+<!-- END:sweep -->
+
+<!-- ===================================================================== -->
+<h2 id="s7b"><span class="num">7b</span>head 模式的成本来源</h2>
+
+<p>三种模式的<b>打分器工作量完全相同</b>（都是 Hkv=4 行），差别只在 top-k 产出几行选择。
+逐级拆开看得很清楚：</p>
+
+<div class="scroll">
+<table>
+<thead><tr><th class="num">kv_len</th><th>模式</th><th class="num">indexer</th><th class="num">top-k</th>
+  <th class="num">CSR</th><th class="num">attn</th><th class="num">合计</th>
+  <th class="num">vs dense</th><th class="num">vs keep</th></tr></thead>
+<tbody>
+<tr class="dense"><td class="num">8K</td><td>dense causal</td><td class="num">—</td><td class="num">—</td>
+    <td class="num">—</td><td class="num">0.365</td><td class="num">0.365</td><td class="num">1.00x</td><td class="num">—</td></tr>
+<tr><td class="num">8K</td><td>keep（4 行 → 4 份）</td><td class="num">0.049</td><td class="num">0.178</td>
+    <td class="num">0.070</td><td class="num">0.541</td><td class="num">0.838</td><td class="num">0.44x</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">8K</td><td>sum（4 行 → 1 份）</td><td class="num">0.050</td><td class="num">0.054</td>
+    <td class="num">0.069</td><td class="num">0.485</td><td class="num">0.658</td><td class="num">0.56x</td><td class="num"><b>1.27x</b></td></tr>
+<tr><td class="num">8K</td><td>max（4 行 → 1 份）</td><td class="num">0.049</td><td class="num">0.054</td>
+    <td class="num">0.070</td><td class="num">0.485</td><td class="num">0.658</td><td class="num">0.56x</td><td class="num">1.27x</td></tr>
+
+<tr class="dense"><td class="num">16K</td><td>dense causal</td><td class="num">—</td><td class="num">—</td>
+    <td class="num">—</td><td class="num">1.477</td><td class="num">1.477</td><td class="num">1.00x</td><td class="num">—</td></tr>
+<tr><td class="num">16K</td><td>keep</td><td class="num">0.166</td><td class="num">0.383</td>
+    <td class="num">0.074</td><td class="num">1.008</td><td class="num">1.632</td><td class="num">0.91x</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">16K</td><td>sum</td><td class="num">0.168</td><td class="num">0.105</td>
+    <td class="num">0.072</td><td class="num">1.000</td><td class="num">1.344</td><td class="num"><b>1.10x</b></td><td class="num"><b>1.21x</b></td></tr>
+<tr><td class="num">16K</td><td>max</td><td class="num">0.167</td><td class="num">0.105</td>
+    <td class="num">0.072</td><td class="num">1.050</td><td class="num">1.394</td><td class="num">1.06x</td><td class="num">1.17x</td></tr>
+
+<tr class="dense"><td class="num">32K</td><td>dense causal</td><td class="num">—</td><td class="num">—</td>
+    <td class="num">—</td><td class="num">6.481</td><td class="num">6.481</td><td class="num">1.00x</td><td class="num">—</td></tr>
+<tr><td class="num">32K</td><td>keep</td><td class="num">0.829</td><td class="num">0.838</td>
+    <td class="num">0.082</td><td class="num">2.083</td><td class="num">3.832</td><td class="num">1.69x</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">32K</td><td>sum</td><td class="num">0.827</td><td class="num">0.250</td>
+    <td class="num">0.080</td><td class="num">2.035</td><td class="num">3.192</td><td class="num"><b>2.03x</b></td><td class="num"><b>1.20x</b></td></tr>
+<tr><td class="num">32K</td><td>max</td><td class="num">0.827</td><td class="num">0.250</td>
+    <td class="num">0.081</td><td class="num">2.044</td><td class="num">3.202</td><td class="num">2.02x</td><td class="num">1.20x</td></tr>
+
+<tr class="dense"><td class="num">64K</td><td>dense causal</td><td class="num">—</td><td class="num">—</td>
+    <td class="num">—</td><td class="num">27.226</td><td class="num">27.226</td><td class="num">1.00x</td><td class="num">—</td></tr>
+<tr><td class="num">64K</td><td>keep</td><td class="num">5.074</td><td class="num">1.948</td>
+    <td class="num">0.125</td><td class="num">4.245</td><td class="num">11.393</td><td class="num">2.39x</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">64K</td><td>sum</td><td class="num">5.071</td><td class="num">0.624</td>
+    <td class="num">0.127</td><td class="num">4.187</td><td class="num">10.008</td><td class="num"><b>2.72x</b></td><td class="num">1.14x</td></tr>
+<tr><td class="num">64K</td><td>max</td><td class="num">5.072</td><td class="num">0.598</td>
+    <td class="num">0.125</td><td class="num">4.181</td><td class="num">9.977</td><td class="num">2.73x</td><td class="num">1.14x</td></tr>
+
+<tr class="dense"><td class="num">128K</td><td>dense causal</td><td class="num">—</td><td class="num">—</td>
+    <td class="num">—</td><td class="num">108.858</td><td class="num">108.858</td><td class="num">1.00x</td><td class="num">—</td></tr>
+<tr><td class="num">128K</td><td>keep</td><td class="num">35.072</td><td class="num">5.185</td>
+    <td class="num">0.301</td><td class="num">8.683</td><td class="num">49.241</td><td class="num">2.21x</td><td class="num">1.00x</td></tr>
+<tr class="hl"><td class="num">128K</td><td>sum</td><td class="num">35.066</td><td class="num">1.738</td>
+    <td class="num">0.299</td><td class="num">8.585</td><td class="num">45.687</td><td class="num"><b>2.38x</b></td><td class="num">1.08x</td></tr>
+<tr><td class="num">128K</td><td>max</td><td class="num">35.065</td><td class="num">1.709</td>
+    <td class="num">0.299</td><td class="num">8.569</td><td class="num">45.642</td><td class="num">2.39x</td><td class="num">1.08x</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>全部形状为 <code>block=64, topk=16</code>。<b>indexer 与 keep 逐位持平</b>（0.829 vs 0.827 @32K），
+<b>top-k 降 3.3–3.4×</b>（0.838 → 0.250 @32K，因为只产出 1 行而不是 4 行），CSR 与 attn 不变。
+收益随上下文变小（1.27× @8K → 1.08× @128K），因为 indexer 的占比在涨——它已经吃掉了
+128K 下 71% 的时间（§8.1）。</p>
+
+<p><b>16K 是关键点</b>：<code>keep</code> 还是 0.91×（亏），<code>sum</code> 已经 1.10×（赢）。
+把交叉点从 ~18.3K 前推到了 16K 以内。</p>
+
+<!-- ===================================================================== -->
+<h2 id="s7c"><span class="num">7c</span>完整配置网格（33 组，真实 Q/K）</h2>
+
+<p>配置矩阵已从最初的 12 组扩到 <b>33 组</b>，覆盖完整的
+<code>block ∈ {32,64,128}</code> × <code>topk ∈ {4,8,16,32}</code> × <code>head ∈ {keep,sum,max}</code> 网格。
+36 个组合中有 3 个非法：<code>block=32, topk=4</code> 装不下 128/128 的强制窗口
+（需要 4+4=8 块 &gt; 4），直接跳过而非静默裁剪。</p>
+
+<div class="card">
+  <div class="title">cfg01–cfg12 的编号与含义保持不变</div>
+  <p>新增的一律追加为 cfg13–cfg33，之前采集的数据仍然可比。
+  <code>msa_config._build_matrix()</code> 里用断言把这条钉死。</p>
+  <p>注意 <b>cfg18 与 baseline 不是一回事</b>：两者都是 <code>block=128, topk=16, keep</code>，
+  但 baseline <b>无强制窗口</b>，cfg18 带 128/128 的 sink+local——这一对正好隔离出强制窗口的净影响。</p>
+  <p><code>free_blocks = 0</code> 的六组（cfg13/14/20/21/27/28）是<b>纯 sink+滑窗对照组</b>：
+  强制窗口吃满整个预算，top-k 没有任何自由选择空间。它们的 cos 就是「打分器完全不起作用」的下限。</p>
+</div>
+
+<!-- BEGIN:grid -->
+<p>行按 <b>token 预算</b>排序（预算相同的配置相邻），方便看「同预算下不同 block/topk 拆分」的差异。点表头可按列排序。每列最优值以绿色加粗标出。</p>
+<h4>单算子相对 dense gqa 加速比</h4>
+<p>只计 attention 算子本身，不含 indexer / top-k / CSR。&gt;1 表示稀疏更快。</p>
+<div class="scroll"><table class="sortable"><thead><tr><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">4K</th><th class="num">8K</th><th class="num">16K</th><th class="num">32K</th><th class="num">64K</th><th class="num">128K</th></tr></thead><tbody>
+<tr class='dense'><td>dense gqa</td><td class='num'>—</td><td class='num'>—</td><td>—</td><td class='num'>—</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td></tr>
+<tr><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.3182</td><td class='num'>0.5327</td><td class='num'>1.15x</td><td class='num'>2.49x</td><td class='num'>5.91x</td><td class='num'>11.67x</td></tr>
+<tr><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>0.6162</td><td class='num'>1.17x</td><td class='num'>2.54x</td><td class='num'>5.24x</td><td class='num'>10.28x</td><td class='num'>19.83x</td></tr>
+<tr><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>0.6188</td><td class='num'>1.16x</td><td class='num'>2.53x</td><td class='num'>5.23x</td><td class='num'>10.28x</td><td class='num'>19.79x</td></tr>
+<tr><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>0.6168</td><td class='num'>1.18x</td><td class='num'>2.53x</td><td class='num'>5.22x</td><td class='num'>10.28x</td><td class='num'>19.79x</td></tr>
+<tr><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>0.9502</td><td class='num'>1.79x</td><td class='num'>4.07x</td><td class='num' style='color:var(--ok);font-weight:600'>8.73x</td><td class='num'>17.80x</td><td class='num'>34.60x</td></tr>
+<tr><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num' style='color:var(--ok);font-weight:600'>0.9518</td><td class='num' style='color:var(--ok);font-weight:600'>1.82x</td><td class='num' style='color:var(--ok);font-weight:600'>4.08x</td><td class='num'>8.66x</td><td class='num' style='color:var(--ok);font-weight:600'>17.80x</td><td class='num'>34.60x</td></tr>
+<tr><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>0.9505</td><td class='num'>1.75x</td><td class='num'>4.06x</td><td class='num'>8.68x</td><td class='num'>17.80x</td><td class='num'>34.57x</td></tr>
+<tr><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>0.3831</td><td class='num'>0.7015</td><td class='num'>1.45x</td><td class='num'>3.01x</td><td class='num'>6.17x</td><td class='num'>11.81x</td></tr>
+<tr><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>0.3751</td><td class='num'>0.6963</td><td class='num'>1.45x</td><td class='num'>3.00x</td><td class='num'>6.23x</td><td class='num'>11.92x</td></tr>
+<tr><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>0.3857</td><td class='num'>0.6889</td><td class='num'>1.46x</td><td class='num'>3.02x</td><td class='num'>6.22x</td><td class='num'>11.91x</td></tr>
+<tr><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>0.5962</td><td class='num'>1.07x</td><td class='num'>2.44x</td><td class='num'>5.26x</td><td class='num'>10.95x</td><td class='num'>21.18x</td></tr>
+<tr><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>0.5776</td><td class='num'>1.08x</td><td class='num'>2.44x</td><td class='num'>5.21x</td><td class='num'>11.00x</td><td class='num'>21.45x</td></tr>
+<tr><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>0.5841</td><td class='num'>1.06x</td><td class='num'>2.46x</td><td class='num'>5.14x</td><td class='num'>11.05x</td><td class='num'>21.43x</td></tr>
+<tr><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>0.8466</td><td class='num'>1.56x</td><td class='num'>3.52x</td><td class='num'>7.75x</td><td class='num'>17.15x</td><td class='num'>34.36x</td></tr>
+<tr><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>0.8468</td><td class='num'>1.55x</td><td class='num'>3.54x</td><td class='num'>7.75x</td><td class='num'>17.10x</td><td class='num'>34.72x</td></tr>
+<tr><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>0.8460</td><td class='num'>1.59x</td><td class='num'>3.65x</td><td class='num'>7.83x</td><td class='num'>17.31x</td><td class='num' style='color:var(--ok);font-weight:600'>34.75x</td></tr>
+<tr><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>0.2161</td><td class='num'>0.3874</td><td class='num'>0.8024</td><td class='num'>1.64x</td><td class='num'>3.40x</td><td class='num'>6.60x</td></tr>
+<tr><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>0.2149</td><td class='num'>0.3849</td><td class='num'>0.8009</td><td class='num'>1.64x</td><td class='num'>3.42x</td><td class='num'>6.66x</td></tr>
+<tr><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>0.2187</td><td class='num'>0.3854</td><td class='num'>0.8057</td><td class='num'>1.65x</td><td class='num'>3.44x</td><td class='num'>6.66x</td></tr>
+<tr><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>0.3555</td><td class='num'>0.6313</td><td class='num'>1.39x</td><td class='num'>2.95x</td><td class='num'>6.34x</td><td class='num'>12.29x</td></tr>
+<tr><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>0.3509</td><td class='num'>0.6278</td><td class='num'>1.38x</td><td class='num'>2.92x</td><td class='num'>6.43x</td><td class='num'>12.43x</td></tr>
+<tr><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>0.3557</td><td class='num'>0.6321</td><td class='num'>1.41x</td><td class='num'>2.95x</td><td class='num'>6.45x</td><td class='num'>12.46x</td></tr>
+<tr><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>0.5271</td><td class='num'>0.9447</td><td class='num'>2.06x</td><td class='num'>4.51x</td><td class='num'>10.24x</td><td class='num'>20.45x</td></tr>
+<tr><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>0.5224</td><td class='num'>0.9403</td><td class='num'>2.08x</td><td class='num'>4.45x</td><td class='num'>10.26x</td><td class='num'>20.73x</td></tr>
+<tr><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>0.5276</td><td class='num'>0.9496</td><td class='num'>2.04x</td><td class='num'>4.47x</td><td class='num'>10.38x</td><td class='num'>20.74x</td></tr>
+<tr><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>0.2056</td><td class='num'>0.3605</td><td class='num'>0.7644</td><td class='num'>1.60x</td><td class='num'>3.54x</td><td class='num'>6.84x</td></tr>
+<tr><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>0.2032</td><td class='num'>0.3532</td><td class='num'>0.7539</td><td class='num'>1.56x</td><td class='num'>3.52x</td><td class='num'>6.80x</td></tr>
+<tr><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>0.2032</td><td class='num'>0.3542</td><td class='num'>0.7561</td><td class='num'>1.57x</td><td class='num'>3.55x</td><td class='num'>6.80x</td></tr>
+<tr><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.3184</td><td class='num'>0.5356</td><td class='num'>1.14x</td><td class='num'>2.51x</td><td class='num'>5.79x</td><td class='num'>11.50x</td></tr>
+<tr><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>0.3166</td><td class='num'>0.5297</td><td class='num'>1.17x</td><td class='num'>2.49x</td><td class='num'>5.71x</td><td class='num'>11.64x</td></tr>
+<tr><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>0.3181</td><td class='num'>0.5342</td><td class='num'>1.16x</td><td class='num'>2.49x</td><td class='num'>5.91x</td><td class='num'>11.63x</td></tr>
+<tr><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>0.1965</td><td class='num'>0.2948</td><td class='num'>0.6180</td><td class='num'>1.33x</td><td class='num'>3.10x</td><td class='num'>6.14x</td></tr>
+<tr><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>0.1966</td><td class='num'>0.2940</td><td class='num'>0.6190</td><td class='num'>1.33x</td><td class='num'>3.07x</td><td class='num'>6.21x</td></tr>
+<tr><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>0.1967</td><td class='num'>0.2954</td><td class='num'>0.6000</td><td class='num'>1.31x</td><td class='num'>3.13x</td><td class='num'>6.19x</td></tr>
+</tbody></table></div>
+<h4>输出余弦相似度 vs dense gqa</h4>
+<p>Q/K/V 取自 model-n32 checkpoint <code>&lt;checkpoint&gt;</code> 的真实一层，每 (token, head) 向量取 cos 后平均。</p>
+<div class="scroll"><table class="sortable"><thead><tr><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">4K</th><th class="num">8K</th><th class="num">16K</th><th class="num">32K</th><th class="num">64K</th><th class="num">128K</th></tr></thead><tbody>
+<tr class='dense'><td>dense gqa</td><td class='num'>—</td><td class='num'>—</td><td>—</td><td class='num'>—</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td><td class='num'>1.0000</td></tr>
+<tr><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.9985</td><td class='num'>0.9974</td><td class='num'>0.9953</td><td class='num'>0.9945</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>0.9606</td><td class='num'>0.9521</td><td class='num'>0.9242</td><td class='num'>0.9208</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>0.9606</td><td class='num'>0.9521</td><td class='num'>0.9242</td><td class='num'>0.9208</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>0.9606</td><td class='num'>0.9521</td><td class='num'>0.9242</td><td class='num'>0.9208</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>0.9561</td><td class='num'>0.9454</td><td class='num'>0.9188</td><td class='num'>0.9149</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>0.9561</td><td class='num'>0.9454</td><td class='num'>0.9188</td><td class='num'>0.9149</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>0.9561</td><td class='num'>0.9454</td><td class='num'>0.9188</td><td class='num'>0.9149</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>0.9883</td><td class='num'>0.9870</td><td class='num'>0.9814</td><td class='num'>0.9808</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>0.9880</td><td class='num'>0.9838</td><td class='num'>0.9756</td><td class='num'>0.9750</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>0.9894</td><td class='num'>0.9872</td><td class='num'>0.9819</td><td class='num'>0.9814</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>0.9880</td><td class='num'>0.9869</td><td class='num'>0.9814</td><td class='num'>0.9814</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>0.9864</td><td class='num'>0.9828</td><td class='num'>0.9763</td><td class='num'>0.9768</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>0.9884</td><td class='num'>0.9873</td><td class='num'>0.9818</td><td class='num'>0.9819</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>0.9845</td><td class='num'>0.9840</td><td class='num'>0.9775</td><td class='num'>0.9792</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>0.9814</td><td class='num'>0.9761</td><td class='num'>0.9711</td><td class='num'>0.9742</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>0.9848</td><td class='num'>0.9853</td><td class='num'>0.9781</td><td class='num'>0.9797</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>0.9948</td><td class='num'>0.9939</td><td class='num'>0.9901</td><td class='num'>0.9882</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>0.9949</td><td class='num'>0.9930</td><td class='num'>0.9879</td><td class='num'>0.9845</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>0.9950</td><td class='num'>0.9939</td><td class='num'>0.9903</td><td class='num'>0.9887</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>0.9953</td><td class='num'>0.9945</td><td class='num'>0.9911</td><td class='num'>0.9897</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>0.9957</td><td class='num'>0.9937</td><td class='num'>0.9891</td><td class='num'>0.9868</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>0.9959</td><td class='num'>0.9943</td><td class='num'>0.9915</td><td class='num'>0.9903</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>0.9944</td><td class='num'>0.9940</td><td class='num'>0.9903</td><td class='num'>0.9899</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>0.9943</td><td class='num'>0.9928</td><td class='num'>0.9884</td><td class='num'>0.9875</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>0.9954</td><td class='num'>0.9940</td><td class='num'>0.9911</td><td class='num'>0.9903</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>0.9988</td><td class='num'>0.9978</td><td class='num'>0.9955</td><td class='num'>0.9939</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>0.9987</td><td class='num'>0.9975</td><td class='num'>0.9948</td><td class='num'>0.9921</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>0.9989</td><td class='num'>0.9977</td><td class='num'>0.9957</td><td class='num'>0.9941</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.9988</td><td class='num'>0.9978</td><td class='num'>0.9958</td><td class='num'>0.9946</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>0.9989</td><td class='num'>0.9975</td><td class='num'>0.9948</td><td class='num'>0.9930</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>0.9992</td><td class='num'>0.9977</td><td class='num'>0.9960</td><td class='num'>0.9948</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num' style='color:var(--ok);font-weight:600'>1.0000</td><td class='num'>0.9995</td><td class='num'>0.9984</td><td class='num'>0.9972</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num' style='color:var(--ok);font-weight:600'>1.0000</td><td class='num'>0.9995</td><td class='num'>0.9982</td><td class='num'>0.9964</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+<tr><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num' style='color:var(--ok);font-weight:600'>1.0000</td><td class='num' style='color:var(--ok);font-weight:600'>0.9995</td><td class='num' style='color:var(--ok);font-weight:600'>0.9985</td><td class='num' style='color:var(--ok);font-weight:600'>0.9972</td><td class='num' style='color:var(--muted)'>n/a</td><td class='num' style='color:var(--muted)'>n/a</td></tr>
+</tbody></table></div>
+<!-- END:grid -->
+
+<!-- ===================================================================== -->
+<h2 id="s7d"><span class="num">7d</span>Decode（q_len=1）</h2>
+
+<p>前面所有数据都是 prefill。长上下文服务的成本大头在 decode，而 decode 的约束完全不同：
+<code>total_q</code> 从上下文长度塌缩成 batch，§8.2 的 Int32 上限随之失效，但另外两道墙浮现出来。</p>
+
+<!-- BEGIN:decode -->
+<div class="scroll"><table><thead><tr><th>配置</th><th class="num">block</th><th class="num">topk</th><th>head</th><th class="num">预算</th><th class="num">32K</th><th class="num">128K</th><th class="num">512K</th></tr></thead><tbody>
+<tr class='dense'><td>dense gqa</td><td class='num'>—</td><td class='num'>—</td><td>—</td><td class='num'>—</td><td class='num'>0.330</td><td class='num'>1.210</td><td class='num'>4.719</td></tr>
+<tr><td>baseline</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.915<br><span style='color:var(--muted);font-size:11px'>0.36x</span></td><td class='num'>3.142<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg13</td><td class='num'>32</td><td class='num'>8</td><td>keep</td><td class='num'>256</td><td class='num'>1.929<br><span style='color:var(--muted);font-size:11px'>0.17x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg27</td><td class='num'>32</td><td class='num'>8</td><td>max</td><td class='num'>256</td><td class='num'>1.907<br><span style='color:var(--muted);font-size:11px'>0.17x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg20</td><td class='num'>32</td><td class='num'>8</td><td>sum</td><td class='num'>256</td><td class='num'>1.907<br><span style='color:var(--muted);font-size:11px'>0.17x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg14</td><td class='num'>64</td><td class='num'>4</td><td>keep</td><td class='num'>256</td><td class='num'>1.155<br><span style='color:var(--muted);font-size:11px'>0.29x</span></td><td class='num'>4.408<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg28</td><td class='num'>64</td><td class='num'>4</td><td>max</td><td class='num'>256</td><td class='num'>1.134<br><span style='color:var(--muted);font-size:11px'>0.29x</span></td><td class='num'>4.297<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg21</td><td class='num'>64</td><td class='num'>4</td><td>sum</td><td class='num'>256</td><td class='num'>1.134<br><span style='color:var(--muted);font-size:11px'>0.29x</span></td><td class='num'>4.297<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg01</td><td class='num'>32</td><td class='num'>16</td><td>keep</td><td class='num'>512</td><td class='num'>1.966<br><span style='color:var(--muted);font-size:11px'>0.17x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg09</td><td class='num'>32</td><td class='num'>16</td><td>max</td><td class='num'>512</td><td class='num'>1.943<br><span style='color:var(--muted);font-size:11px'>0.17x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg05</td><td class='num'>32</td><td class='num'>16</td><td>sum</td><td class='num'>512</td><td class='num'>1.942<br><span style='color:var(--muted);font-size:11px'>0.17x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg15</td><td class='num'>64</td><td class='num'>8</td><td>keep</td><td class='num'>512</td><td class='num'>1.213<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num'>4.466<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg29</td><td class='num'>64</td><td class='num'>8</td><td>max</td><td class='num'>512</td><td class='num'>1.189<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num'>4.348<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg22</td><td class='num'>64</td><td class='num'>8</td><td>sum</td><td class='num'>512</td><td class='num'>1.190<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num'>4.348<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg16</td><td class='num'>128</td><td class='num'>4</td><td>keep</td><td class='num'>512</td><td class='num'>0.844<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num'>3.054<br><span style='color:var(--muted);font-size:11px'>0.40x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg30</td><td class='num'>128</td><td class='num'>4</td><td>max</td><td class='num'>512</td><td class='num'>0.821<br><span style='color:var(--muted);font-size:11px'>0.40x</span></td><td class='num'>2.940<br><span style='color:var(--muted);font-size:11px'>0.41x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg23</td><td class='num'>128</td><td class='num'>4</td><td>sum</td><td class='num'>512</td><td class='num'>0.822<br><span style='color:var(--muted);font-size:11px'>0.40x</span></td><td class='num'>2.940<br><span style='color:var(--muted);font-size:11px'>0.41x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg02</td><td class='num'>32</td><td class='num'>32</td><td>keep</td><td class='num'>1024</td><td class='num'>2.032<br><span style='color:var(--muted);font-size:11px'>0.16x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg10</td><td class='num'>32</td><td class='num'>32</td><td>max</td><td class='num'>1024</td><td class='num'>2.000<br><span style='color:var(--muted);font-size:11px'>0.16x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg06</td><td class='num'>32</td><td class='num'>32</td><td>sum</td><td class='num'>1024</td><td class='num'>2.001<br><span style='color:var(--muted);font-size:11px'>0.16x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td><td class='num' style='color:var(--bad)'>✗ topk</td></tr>
+<tr><td>cfg03</td><td class='num'>64</td><td class='num'>16</td><td>keep</td><td class='num'>1024</td><td class='num'>1.252<br><span style='color:var(--muted);font-size:11px'>0.26x</span></td><td class='num'>4.485<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg11</td><td class='num'>64</td><td class='num'>16</td><td>max</td><td class='num'>1024</td><td class='num'>1.225<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num'>4.366<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg07</td><td class='num'>64</td><td class='num'>16</td><td>sum</td><td class='num'>1024</td><td class='num'>1.226<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num'>4.365<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg17</td><td class='num'>128</td><td class='num'>8</td><td>keep</td><td class='num'>1024</td><td class='num'>0.860<br><span style='color:var(--muted);font-size:11px'>0.38x</span></td><td class='num'>3.103<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg31</td><td class='num'>128</td><td class='num'>8</td><td>max</td><td class='num'>1024</td><td class='num'>0.838<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num'>2.988<br><span style='color:var(--muted);font-size:11px'>0.40x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg24</td><td class='num'>128</td><td class='num'>8</td><td>sum</td><td class='num'>1024</td><td class='num'>0.837<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num'>2.986<br><span style='color:var(--muted);font-size:11px'>0.41x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg04</td><td class='num'>64</td><td class='num'>32</td><td>keep</td><td class='num'>2048</td><td class='num'>1.314<br><span style='color:var(--muted);font-size:11px'>0.25x</span></td><td class='num'>4.517<br><span style='color:var(--muted);font-size:11px'>0.27x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg12</td><td class='num'>64</td><td class='num'>32</td><td>max</td><td class='num'>2048</td><td class='num'>1.290<br><span style='color:var(--muted);font-size:11px'>0.26x</span></td><td class='num'>4.387<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg08</td><td class='num'>64</td><td class='num'>32</td><td>sum</td><td class='num'>2048</td><td class='num'>1.290<br><span style='color:var(--muted);font-size:11px'>0.26x</span></td><td class='num'>4.388<br><span style='color:var(--muted);font-size:11px'>0.28x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg18</td><td class='num'>128</td><td class='num'>16</td><td>keep</td><td class='num'>2048</td><td class='num'>0.916<br><span style='color:var(--muted);font-size:11px'>0.36x</span></td><td class='num'>3.139<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg32</td><td class='num'>128</td><td class='num'>16</td><td>max</td><td class='num'>2048</td><td class='num'>0.892<br><span style='color:var(--muted);font-size:11px'>0.37x</span></td><td class='num'>3.019<br><span style='color:var(--muted);font-size:11px'>0.40x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg25</td><td class='num'>128</td><td class='num'>16</td><td>sum</td><td class='num'>2048</td><td class='num'>0.893<br><span style='color:var(--muted);font-size:11px'>0.37x</span></td><td class='num'>3.021<br><span style='color:var(--muted);font-size:11px'>0.40x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg19</td><td class='num'>128</td><td class='num'>32</td><td>keep</td><td class='num'>4096</td><td class='num'>1.017<br><span style='color:var(--muted);font-size:11px'>0.32x</span></td><td class='num'>3.215<br><span style='color:var(--muted);font-size:11px'>0.38x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg33</td><td class='num'>128</td><td class='num'>32</td><td>max</td><td class='num'>4096</td><td class='num'>0.993<br><span style='color:var(--muted);font-size:11px'>0.33x</span></td><td class='num'>3.091<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+<tr><td>cfg26</td><td class='num'>128</td><td class='num'>32</td><td>sum</td><td class='num'>4096</td><td class='num'>0.994<br><span style='color:var(--muted);font-size:11px'>0.33x</span></td><td class='num'>3.093<br><span style='color:var(--muted);font-size:11px'>0.39x</span></td><td class='num' style='color:var(--bad)'>✗ csr</td></tr>
+</tbody></table></div>
+<!-- END:decode -->
+
+<div class="card bad">
+  <div class="title">decode 走不通，而且是两个独立原因</div>
+  <ol>
+    <li><b>CSR builder 的 SMEM 直方图随 <code>total_rows = batch × ⌈S/block⌉</code> 爆掉。</b>
+      <code>k2q_hist_kernel</code> 在 shared memory 里开 <code>kWarps × total_rows</code> 的直方图，
+      B=32 时这个量是 prefill 的 32 倍。实测失败边界落在 6.5 万–13 万行之间，与 B300 每 CTA
+      227 KB 的 SMEM 上限（int16 打包约 11 万条目）吻合。这是 prefill 从未暴露过的限制。</li>
+    <li><b>稀疏注意力在 decode 下拿不到收益。</b>128K/baseline 只选 2048/131072 ≈ 1.6% 的 token，
+      理论该快 60 倍，实测 attention 阶段 1.17 ms vs dense 1.21 ms——几乎没省。
+      原因是 prefill 内核 <code>m_block_size=128</code> 打包 Q-head，<code>qhead_per_kv=8</code> 时
+      一个 tile 只有 16 个 query token；B=32 总共 2 个 tile，SM 大量闲置。</li>
+  </ol>
+  <p>MSA 为此备了专用的 <code>sparse_decode_atten_func</code>，但它硬性要求
+  <code>qhead_per_kv=16</code> 且 <code>page_size=128</code>——<b>model-n32 是 8，用不了</b>。
+  所以结论不是「decode 收益小」，而是<b>这个模型走不到那条 decode 内核上</b>。
+  要落地长上下文 decode，两件事都得做：放开 decode 内核的 <code>qhead_per_kv</code>，
+  以及把 CSR 直方图从 SMEM 挪到 global 或分块处理。</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="s8"><span class="num">8</span>可优化点报告</h2>
+
+<!-- BEGIN:opt -->
+
+<p>下面每一条都由 §6/§7 的实测数据支撑。已落地的四项标 <span class="pill ok">已修复</span>，
+其余为建议。完整版另见 <code>docs/OPTIMIZATION_REPORT.md</code>。</p>
+
+<div class="scroll"><table>
+<thead><tr><th class="num">#</th><th>问题</th><th>量化影响（model-n32 几何）</th><th>状态</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td>indexer GPU 时间超二次增长，长上下文下反客为主</td>
+    <td>128K 时占稀疏流水线 <b>72%</b>；S 每翻倍 &times;6.1–6.9（dense 是 &times;4.0）</td>
+    <td><span class="pill bad">最高优先级</span></td></tr>
+<tr><td class="num">2</td><td>indexer 分数张量按 Int32 寻址，超 2<sup>31</sup> 元素越界</td>
+    <td><code>head=sum/max</code> 在 <b>S &gt; 92,672</b> 直接非法访存；原先是静默内存踩踏</td>
+    <td><span class="pill ok">已加守卫</span></td></tr>
+<tr><td class="num">3</td><td>indexer 每次调用跑 O(q_tiles&sup2;) 的 Python 循环</td>
+    <td>32K 下 <b>15.66 ms/次</b>纯 CPU &times; 46 层 = 720 ms/前向</td>
+    <td><span class="pill ok">已修复 61.6&times;</span></td></tr>
+<tr><td class="num">4</td><td>稀疏注意力的 partial-O 流量 &prop; topk，与实际访问 token 数无关</td>
+    <td>等预算下 topk=32 比 topk=16 慢 <b>1.86&times;</b></td>
+    <td><span class="pill warn">建议（结构性）</span></td></tr>
+<tr><td class="num">5</td><td>JIT 缓存不随源码失效，改内核静默用旧 kernel</td>
+    <td>正确性风险</td><td><span class="pill ok">已修复</span></td></tr>
+<tr><td class="num">6</td><td>top-k 输出布局与 CSR builder 不匹配，需全量 permute</td>
+    <td>128K/topk32 下 67 MB 额外读写 + 一次 kernel 启动</td><td><span class="pill ok">已修复</span></td></tr>
+<tr><td class="num">7</td><td>head=sum/max 需 8&times; 的 indexer 计算与写出</td>
+    <td>64K 下选择级 40.4 ms vs keep 的 5.1 ms；128K 直接跑不了（见 #2）</td>
+    <td><span class="pill warn">建议</span></td></tr>
+<tr><td class="num">8</td><td>indexer 只能产出 128 token 粒度的块分数</td>
+    <td>block=32/64 的打分级无法原生支持</td><td><span class="pill warn">建议</span></td></tr>
+<tr><td class="num">9</td><td>top-k 的 transpose workspace 是分数张量的额外一读一写</td>
+    <td>128K/block32/keep 下 8.6 GB 中转</td><td><span class="pill warn">建议</span></td></tr>
+<tr><td class="num">10</td><td>wrapper 常量 host 开销约 0.21 ms/次（四级合计）</td>
+    <td>&times; 46 层 = <b>9.5 ms/前向</b>纯 CPU</td><td><span class="pill warn">建议</span></td></tr>
+<tr><td class="num">11</td><td>D=256 不支持</td>
+    <td><b>对 model-n32 不适用</b>（D=128 原生支持）；是 D=256 那类模型的阻塞项</td>
+    <td><span class="pill">不适用</span></td></tr>
+<tr><td class="num">12</td><td>decode 路径要求 <code>qhead_per_kv=16</code></td>
+    <td>本模型是 8，只覆盖 prefill</td><td><span class="pill warn">建议</span></td></tr>
+</tbody></table></div>
+
+<h3>8.1 <span class="pill bad">最高优先级</span> indexer GPU 时间超二次增长</h3>
+
+<div class="scroll"><table>
+<thead><tr><th class="num">kv_len</th><th class="num">dense causal (ms)</th><th class="num">&times;上一档</th>
+  <th class="num">indexer keep (ms)</th><th class="num">&times;上一档</th>
+  <th class="num">indexer 占 baseline 流水线</th></tr></thead>
+<tbody>
+<tr><td class="num">4K</td><td class="num">0.105</td><td class="num">—</td><td class="num">0.022</td><td class="num">—</td><td class="num">4%</td></tr>
+<tr><td class="num">8K</td><td class="num">0.385</td><td class="num">3.67&times;</td><td class="num">0.049</td><td class="num">2.20&times;</td><td class="num">5%</td></tr>
+<tr><td class="num">16K</td><td class="num">1.513</td><td class="num">3.93&times;</td><td class="num">0.167</td><td class="num">3.41&times;</td><td class="num">9%</td></tr>
+<tr><td class="num">20K</td><td class="num">2.456</td><td class="num">1.62&times;</td><td class="num">0.271</td><td class="num">1.62&times;</td><td class="num">12%</td></tr>
+<tr><td class="num">24K</td><td class="num">3.550</td><td class="num">1.45&times;</td><td class="num">0.413</td><td class="num">1.52&times;</td><td class="num">15%</td></tr>
+<tr><td class="num">32K</td><td class="num">6.467</td><td class="num">1.82&times;</td><td class="num">0.828</td><td class="num">2.01&times;</td><td class="num">21%</td></tr>
+<tr><td class="num">64K</td><td class="num">27.270</td><td class="num">4.22&times;</td><td class="num">5.074</td><td class="num">6.13&times;</td><td class="num">45%</td></tr>
+<tr class="hl"><td class="num">128K</td><td class="num">108.954</td><td class="num">4.00&times;</td><td class="num">35.072</td>
+    <td class="num"><b>6.91&times;</b></td><td class="num"><b>72%</b></td></tr>
+</tbody></table></div>
+
+<p>causal attention 的计算量是 O(S&sup2;)，dense 参照组精确地按 &times;4.0 走。
+indexer 每翻倍却是 <b>&times;6.1–6.9</b>，明显超二次。后果是它在稀疏流水线里的占比
+从 4K 的 4% 一路涨到 128K 的 <b>72%</b>——<b>稀疏注意力省下的时间正在被打分器吃掉</b>。</p>
+
+<p>另一个角度：128K 下 indexer 做 4 head &times; (131072&sup2;/2) &times; 128 &times; 2 = 8.8 TFLOP，
+用时 35.07 ms &rarr; <b>251 TFLOPS</b>；同一块卡上 dense BF16 attention 跑到 1291 TFLOPS。
+一个 <b>FP4</b> 的、只做 QK 的 pass 却只有 BF16 全量 attention 吞吐的 19%，说明至少有一个量级的余量。</p>
+
+<p>建议：先用 nsys 定位（怀疑点是 causal compact 调度的负载不均随 S 增长、
+以及 K 的分页 TMA 与分数写出之间的 DRAM page 冲突），不要凭猜改。
+<b>这决定 MSA 在长上下文上还能不能持续赢</b>——稀疏相对 dense 的优势在 <b>64K 见顶
+（cfg03 2.39&times;）</b>，到 128K 已回落到 2.21&times;。曲线已经掉头了。</p>
+
+<h3>8.2 <span class="pill ok">已加守卫</span> indexer 分数张量的 Int32 寻址上限</h3>
+
+<p>这是本轮 benchmark 撞出来的一个真 bug。128K + <code>head=sum</code> 直接
+<code>CUDA error: an illegal memory access</code>，而且会污染整个 CUDA context，
+导致后续所有配置连带失败。</p>
+
+<p>根因：<code>fp4_indexer_interface.py</code> 把分数张量的 CuTe layout 用
+<code>Int32(...)</code> 构造，kernel 内部因此以 32 位有符号算术计算线性偏移，
+可寻址的最后一个元素是 2<sup>31</sup>−1。分数张量的元素数是
+<code>scorer_heads &times; ceil(S/128) &times; total_q</code>：</p>
+
+<div class="scroll"><table>
+<thead><tr><th>head_mode</th><th class="num">scorer heads</th>
+  <th class="num">S=32K</th><th class="num">S=64K</th><th class="num">S=128K</th><th class="num">S=256K</th>
+  <th class="num">可跑的最大 S</th></tr></thead>
+<tbody>
+<tr><td class="mono">keep</td><td class="num">4 (=Hkv)</td>
+    <td class="num">0.034e9</td><td class="num">0.134e9</td><td class="num">0.537e9</td>
+    <td class="num">2.147e9<br>（正好 =2<sup>31</sup>）</td><td class="num"><b>262,144</b></td></tr>
+<tr class="hl"><td class="mono">sum / max</td><td class="num">32 (=Hq)</td>
+    <td class="num">0.268e9</td><td class="num">1.074e9</td>
+    <td class="num"><span style="color:var(--bad)">4.295e9 溢出</span></td>
+    <td class="num"><span style="color:var(--bad)">17.18e9 溢出</span></td>
+    <td class="num"><b>92,672</b></td></tr>
+</tbody></table></div>
+
+<p>也就是说 <code>keep</code> 恰好能撑到 256K（一个巧合般的边界），
+而 <code>sum</code>/<code>max</code> 在 <b>92,672 token</b> 就断了。
+本轮已在 <code>fp4_indexer_block_scores</code> 入口加了显式校验，
+把「静默内存踩踏」换成一条带诊断的 <code>ValueError</code>：</p>
+<pre>ValueError: FP4 indexer score tensor would need 4294967296 elements
+(Hq=32 x k_tiles=1024 x total_q=131072), above the Int32-addressable limit of
+2147483648. Reduce the scorer head count (e.g. per-KV-head scoring instead of
+per-query-head), split the batch, or chunk the prefill.</pre>
+<p><code>MsaSparseAttention.max_scorer_seqlen()</code> 把同一个上界暴露给调用方做容量规划。
+根治要么把 layout 换成 Int64 extent，要么按 §8.5 把 GQA 归约下沉到 indexer——
+后者顺带把 <code>sum</code>/<code>max</code> 的分数张量降 8&times;，上限直接推到和 <code>keep</code> 一样。</p>
+
+<div class="card warn">
+  <div class="title">这条也改变了 §7 的读法</div>
+  <p>128K 下 cfg05–cfg12 的 indexer 跑不了，但 top-k / CSR / attention 三级仍能测。
+  <b>把跑得通的几级加起来当总耗时是错的</b>——那等于把跑不通的那部分当成免费的，
+  会得出「sum/max 在 128K 最快」这种完全反的结论。§7 的表格已把这些行排除在排名之外并单独标注。</p>
+</div>
+
+<h3>8.3 <span class="pill ok">已修复</span> indexer 的 O(q_tiles&sup2;) host 循环</h3>
+
+<p>现象：<code>fp4_indexer_block_scores</code> 的 eager 延迟远高于 GPU 时间，
+且<b>与 head 数无关</b>——2 head 和 16 head 都是同一个数，而 GPU 计算量差 8&times;。</p>
+
+<p>根因在 <code>_causal_compact_task_bound</code>：它枚举 <code>q_tile_count</code> 个候选 q 长度，
+每个候选再调 <code>_causal_compact_task_count</code> 循环 <code>q_tile_count</code> 次——
+整体 <b>O(q_tiles&sup2;) 的纯 Python</b>，且在<b>每一次</b> indexer 调用时重算。
+它只是给 kernel 算一个 grid 上界，与张量内容毫无关系。</p>
+
+<div class="scroll"><table>
+<thead><tr><th class="num">上下文</th><th class="num">q_tiles</th><th class="num">内层迭代</th>
+  <th class="num">修复前 host</th><th class="num">修复后 host</th><th class="num">加速</th>
+  <th class="num">&times;46 层（修复前）</th></tr></thead>
+<tbody>
+<tr><td class="num">8K</td><td class="num">64</td><td class="num">~2.1K</td><td class="num">1.321</td><td class="num">0.269</td><td class="num">4.9&times;</td><td class="num">61 ms</td></tr>
+<tr class="hl"><td class="num">32K</td><td class="num">256</td><td class="num">~33K</td><td class="num">15.656</td><td class="num">0.254</td><td class="num"><b>61.6&times;</b></td><td class="num"><b>720 ms</b></td></tr>
+<tr><td class="num">128K</td><td class="num">1024</td><td class="num">~525K</td><td class="num">~250（推算）</td><td class="num">0.193</td><td class="num">~1300&times;</td><td class="num">11.5 s</td></tr>
+</tbody></table></div>
+
+<p>model-n32 每次前向有 46 层 full attention，32K prefill 下这一项修复前就是
+<b>720 ms 的纯 CPU 时间</b>——比整条稀疏流水线的 GPU 时间还高一个量级。
+修复：给两个纯整数函数加 <code>functools.lru_cache</code>。
+后续可把这个上界写成闭式（<code>_causal_compact_task_count</code> 对 <code>q_len</code>
+是分段线性的），把首次调用的 O(n&sup2;) 也去掉。</p>
+
+<h3>8.4 <span class="pill warn">建议</span> partial-O 流量 &prop; topk —— 决定了配置怎么选</h3>
+
+<p>把 token 预算固定住，只改 block/topk 的分配：</p>
+
+<div class="scroll"><table>
+<thead><tr><th class="num">kv_len</th><th class="num">cfg03 attn<br>block=64, topk=16<br>1024 tok</th>
+  <th class="num">cfg02 attn<br>block=32, topk=32<br>1024 tok</th><th class="num">比值</th>
+  <th class="num">cfg01 attn<br>block=32, topk=16<br>512 tok</th></tr></thead>
+<tbody>
+<tr><td class="num">4K</td><td class="num">0.278</td><td class="num">0.466</td><td class="num">1.68&times;</td><td class="num">0.264</td></tr>
+<tr><td class="num">8K</td><td class="num">0.491</td><td class="num">0.918</td><td class="num">1.87&times;</td><td class="num">0.517</td></tr>
+<tr><td class="num">16K</td><td class="num">1.075</td><td class="num">1.798</td><td class="num">1.67&times;</td><td class="num">1.043</td></tr>
+<tr><td class="num">20K</td><td class="num">1.339</td><td class="num">2.299</td><td class="num">1.72&times;</td><td class="num">1.298</td></tr>
+<tr><td class="num">24K</td><td class="num">1.538</td><td class="num">2.845</td><td class="num">1.85&times;</td><td class="num">1.587</td></tr>
+<tr><td class="num">32K</td><td class="num">2.124</td><td class="num">3.863</td><td class="num">1.82&times;</td><td class="num">2.116</td></tr>
+<tr><td class="num">64K</td><td class="num">4.240</td><td class="num">7.916</td><td class="num">1.87&times;</td><td class="num">4.373</td></tr>
+<tr class="hl"><td class="num">128K</td><td class="num">8.732</td><td class="num">16.230</td><td class="num"><b>1.86&times;</b></td><td class="num">9.066</td></tr>
+</tbody></table></div>
+
+<p>cfg02 与 cfg03 访问的 KV token 数完全相同（1024），耗时却差 1.8&times;。
+更直接的证据在最后一列：cfg01 只访问 512 token，cfg03 访问 1024 token，
+两者 topk 都是 16——<b>耗时几乎一样</b>。
+<b>耗时跟 topk 走，不跟 token 数走。</b></p>
+
+<p>根因在 <code>cute/interface.py::_sparse_atten_csr_varlen_forward</code>：</p>
+<pre>O_partial   = torch.empty(topK, total_q, head_q, dim, dtype=partial_dtype, ...)
+LSE_partial = torch.empty(topK, total_q, head_q, dtype=torch.float32, ...)</pre>
+
+<p>一个 CTA 处理 <code>m_block_size=128</code> 个 packed Q-head（qhead_per_kv=8 时即 16 个
+query token）&times; <b>1 个</b> KV block，每个 tile 写出一条 partial O，最后由
+<code>combine</code> 归约。partial 的写出量因此是
+<code>topk &times; total_q &times; Hq &times; D</code>，<b>与 block_size 无关</b>：</p>
+
+<div class="scroll"><table>
+<thead><tr><th class="num">上下文</th><th class="num">topk</th><th class="num">O_partial (bf16)</th><th class="num">写+读往返</th></tr></thead>
+<tbody>
+<tr><td class="num">32K</td><td class="num">16</td><td class="num">4.29 GB</td><td class="num">8.6 GB</td></tr>
+<tr><td class="num">32K</td><td class="num">32</td><td class="num">8.59 GB</td><td class="num">17.2 GB</td></tr>
+<tr class="hl"><td class="num">128K</td><td class="num">32</td><td class="num"><b>34.36 GB</b></td><td class="num">68.7 GB</td></tr>
+</tbody></table></div>
+
+<p>副作用是 <b>block 越小，epilogue 与计算的比值越差</b>：CTA 的 MMA 工作量是
+<code>128 &times; block_size &times; 128</code>，而 partial 写出恒为 <code>128 &times; 128</code>，
+所以 block=32 的单位计算 epilogue 开销是 block=128 的 4 倍。这正是 12 组配置里
+小 block 没能换来收益的原因。</p>
+
+<p>建议（按代价从低到高）：</p>
+<ol>
+  <li><b>每个 split 吃 G 个 KV block（G&gt;1）</b>。选择结果本来就按块索引升序，CTA 可以连续
+      处理 G 个块、在 TMEM 里用 online-softmax 累加，只写一条 partial，流量降为 <code>topk/G</code>。
+      block=32 取 G=4 就能把 epilogue 比恢复到 block=128 的水平。收益最大且与现有 CSR/schedule 兼容。</li>
+  <li><b>partial dtype 降到 fp8</b>。<code>partial_dtype</code> 已是参数（支持 fp8_e4m3），流量直接减半。</li>
+  <li><b>partial 槽位数跟随 schedule 实际 split 数</b>而非 <code>topK</code> 上界；
+      <code>split_counts</code> 已经算出来了，目前只用于 combine，没用来收缩分配。</li>
+</ol>
+
+<h3>8.5 <span class="pill warn">建议</span> 三件事落在同一处 indexer epilogue，建议合并做</h3>
+
+<ul>
+<li><b>GQA 归约下沉</b>（收益最大）：<code>sum</code>/<code>max</code> 现在要写出 Hq=32 行分数、
+    top-k 再读回来归约。在 indexer 的 CTA 内先把同组 8 个 head 归约掉，
+    分数张量、写带宽、top-k 读入、workspace 全部降 8&times;，<b>并且 §8.2 的 Int32 上限
+    从 92,672 直接推到和 keep 一样的 262,144</b>。无法避免的只有 QK 的 MMA 量。
+    64K 下 <code>sum</code> 的选择级现在是 40.4 ms（keep 只要 5.1 ms），这一项做完应大幅回落。</li>
+<li><b>子块粒度</b>：现在 epilogue 对整个 128 列 N tile 做一次 row-max。
+    改成 <code>128/block_size</code> 个子块累加器即可原生支持 block=32/64。
+    B300 走的是 <code>tcgen05.LdRed32x32bOp(Repetition.x128, ..., MAX)</code> 的硬件整行归约，
+    改成按列区间发 <code>Repetition.x32</code> 四次就能拿到 32 粒度。
+    <br><b>注意</b>：本轮 benchmark 中 block=32/64 的 top-k / CSR / attention 三级都是真实精确的，
+    唯独打分级仍产出 128 粒度分数（其 MMA 量与 block 无关，只有写出量会变），这是唯一的测量偏差。</li>
+<li><b>直接写转置布局</b>：<code>sparse_topk_select</code> 的第一级要把
+    <code>[H, K, qo]</code> 转成 <code>[H, qo, K]</code> 存进 workspace——128K/block32/keep 时是
+    <b>8.6 GB</b> 的额外一读一写。indexer 的 epilogue 本来就是逐 (q, ktile) 标量写，
+    直接写成转置布局即可整个省掉 transpose kernel（需评估写合并度）。</li>
+</ul>
+
+<h3>8.6 <span class="pill warn">建议</span> 其他</h3>
+
+<div class="scroll"><table>
+<thead><tr><th>项</th><th>说明</th></tr></thead>
+<tbody>
+<tr><td>wrapper 常量 host 开销</td><td>修掉 §8.3 后四级合计仍有约 0.21 ms/次中位数
+    （每次调用重做张量校验、compile-key 构造、输出分配、cute tensor 转换）。
+    <b>&times;46 层 = 9.5 ms/前向</b>的纯 CPU，在 4K/8K 这种短上下文下比 GPU 时间还多。
+    建议引入 plan/run 拆分——仓库里 <code>SparseDecodePagedAttentionWrapper</code> 已有这个模式。</td></tr>
+<tr><td>其余 JIT 模块</td><td><code>jit.py</code> 的 variant / plan / reduction 三个模块仍是
+    <code>if so_path.exists(): return</code>，与 §8 已修的是同一类风险，应统一换成指纹机制。</td></tr>
+<tr><td><code>max_k_tiles &lt; 12288</code></td><td>top-k 内核只实现了插入排序路径。256K + block=32 = 8192 块尚可，
+    512K 或 block=16 会超。radix-sort 路径在 fork 时被删掉了。</td></tr>
+<tr><td>decode 路径未覆盖</td><td><code>sparse_decode_atten_func</code> 要求
+    <code>qhead_per_kv=16</code> 且 <code>page_size=128</code>，model-n32 是 8，本轮只覆盖 prefill。
+    这是<b>推理侧的实际缺口</b>：长上下文服务的主要成本在 decode。</td></tr>
+<tr><td>D=256</td><td>对 model-n32 不适用。model-n16 类模型（head_dim=256）仍被
+    <code>interface.py</code> / <code>atten_fwd.py</code> / FP4 indexer 的 D=128 断言挡住；
+    主要阻力在 TMEM（S 占 2&times;n_block_size 列、O 占 o_stage&times;head_dim 列，
+    D=256 时 O 单独就要 512 列，占满 SM100 上限）。</td></tr>
+<tr><td>容器构建适配</td><td>已修：<code>-arch</code> 按设备能力取（B300 是 sm_103）；
+    CUDA 12.8 起 <code>-static-global-template-stub</code> 默认值变更导致匿名 namespace 模板 kernel
+    编译失败；pip CUDA stack 的 <code>cusparse.h</code> 只在 wheel 里，但整目录加 <code>-I</code>
+    会遮蔽 nvcc 自带的 <code>crt/host_runtime.h</code>，改为只软链缺失的头。</td></tr>
+</tbody></table></div>
+
+<h3>8.7 配置选择结论</h3>
+
+<div class="card ok">
+<ol>
+<li><b>推荐生产配置：<code>force_init(128)-force_end(128)-block(64)-topk(16)-head(sum)</code>（cfg07）。</b>
+    全部 8 个上下文点上都是最快或并列最快：16K 1.03×、32K 2.12×、64K 2.73×、128K 2.39× dense。
+    交叉点 <b>~15.9K</b>，比 <code>keep</code> 系的 ~20.5K 早了近 5K token。</li>
+<li><b>若质量优先则选 cfg03（<code>head=keep</code>）。</b>
+    <code>keep</code> 给每个 KV head 一份选择，recall 比 <code>sum</code> 高 1.4–2.9 个点（§5.4），
+    代价是慢 1.08–1.27×、交叉点晚到 ~20.5K。
+    <b>≥64K 时 <code>sum</code> 的速度优势只剩 1.08–1.14×</b>，此时 <code>keep</code> 的质量更划算。</li>
+<li><b><code>max</code> 排除。</b>与 <code>sum</code> 速度差 &lt;2%（cfg11 vs cfg07 全程在 1% 内），
+    质量却始终差 3.2–4.2 个点——严格被支配。</li>
+<li><b><code>topk=16</code> 全面优于 <code>topk=32</code>。</b>
+    cfg07 (k16) vs cfg08 (k32) 在 128K 是 2.39× vs 2.05×。耗时跟 topk 走而不跟 token 预算走（§8.4），
+    所以同预算下永远选大 block / 小 topk。</li>
+<li><b>交叉点 ~15.9K–20.5K，取决于 head 模式。</b>模型当前的 4096 训练上下文远在其下——
+    4K 时最好的配置也只有 0.26×，×46 层每前向多花 13.4 ms。
+    <b>MSA 对这个模型的价值在长上下文推理，不在 4K 训练配置。</b></li>
+<li><b>优势在 64K 见顶随后回落</b>（cfg07 2.73× → 2.39×）。吃掉这部分的是 §8.1 的 indexer 超二次增长。</li>
+</ol>
+</div>
+
+<div class="card warn">
+  <div class="title">测量口径</div>
+  <p>机器上其它容器在跑，dense 参照组的 run-to-run 波动约 ±8%（16K 下 1.38–1.48 ms）。
+  <b>接近 1.0× 的格子应读作「约等于」</b>，不要用来区分 0.97× 和 1.03×。
+  ≥32K 的比值波动在 2% 以内，结论稳定。</p>
+</div>
+<!-- END:opt -->
+
+<!-- ===================================================================== -->
+<h2 id="s9"><span class="num">9</span>交付物与复现</h2>
+
+<h3>9.1 改动文件</h3>
+<div class="scroll">
+<table class="files">
+<thead><tr><th>文件</th><th>类型</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td>python/fmha_sm100/msa_config.py</td><td>新增</td><td>配置数据类、校验、序列化、12 组矩阵、模型几何注册表（model-n32 / model-n16）</td></tr>
+<tr><td>python/fmha_sm100/msa_pipeline.py</td><td>新增</td><td>配置驱动的端到端运行器</td></tr>
+<tr><td>python/fmha_sm100/csrc/include/sparse_topk_select.cuh</td><td>修改</td><td>运行时 topk、head 聚合、因果 force 窗口、输出布局</td></tr>
+<tr><td>python/fmha_sm100/csrc/sparse_topk_select.cu</td><td>修改</td><td>FFI 签名与校验</td></tr>
+<tr><td>python/fmha_sm100/api.py</td><td>修改</td><td><code>sparse_topk_select</code> 新参数与文档</td></tr>
+<tr><td>python/fmha_sm100/jit.py</td><td>修改</td><td>JIT 缓存源码指纹失效</td></tr>
+<tr><td>python/fmha_sm100/cute/src/sm100/build_k2q_csr/build_k2q_csr.cu</td><td>修改</td><td>blk_kv {32,64,128} 派发</td></tr>
+<tr><td>python/fmha_sm100/cute/src/sm100/build_k2q_csr/__init__.py</td><td>修改</td><td>CUDA header shim、模板 stub flag、按设备取 arch</td></tr>
+<tr><td>python/fmha_sm100/cute/src/sm100/prepare_k2q_csr.py</td><td>修改</td><td>blk_kv 校验放宽</td></tr>
+<tr><td>python/fmha_sm100/cute/fp4_indexer_interface.py</td><td>修改</td><td>O(q_tiles²) host 循环记忆化（§8.1）</td></tr>
+<tr><td>tests/regression/test_msa_topk_config.py</td><td>新增</td><td>38 用例选择正确性</td></tr>
+<tr><td>tests/regression/test_msa_block_size.py</td><td>新增</td><td>blk_kv 32/64/128 数值正确性</td></tr>
+<tr><td>benchmarks/bench_msa_configs.py</td><td>新增</td><td>分级配置 benchmark（单算子计时 + 输出 cos）</td></tr>
+<tr><td>benchmarks/eval_msa_selection_quality.py</td><td>新增</td><td>真实权重上的选择质量评估（注意力质量恢复率）</td></tr>
+<tr><td>benchmark.sh</td><td>新增</td><td>完整一键运行脚本，直接产出「单算子加速比」与「输出 cos」两张对比表</td></tr>
+<tr><td>scripts/render_log_results.py</td><td>新增</td><td>从 CSV 生成本文件 §6/§7 的表格</td></tr>
+<tr><td>docs/OPTIMIZATION_REPORT.md</td><td>新增</td><td>可优化点报告（§8 的独立 markdown 版）</td></tr>
+<tr><td>results/b300-20260808/*.csv</td><td>新增</td><td>本轮 benchmark 原始数据</td></tr>
+<tr><td>log.html</td><td>新增</td><td>本文件</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>9.2 复现步骤</h3>
+<pre># 完整跑（正确性门禁 + 基线 + 12 组配置，4 个上下文长度）
+./benchmark.sh
+
+# 快跑（8K / 32K，短计时窗口）
+QUICK=1 ./benchmark.sh
+
+# 只跑 12 组矩阵、指定上下文
+CONFIGS=matrix SEQLENS=32768,131072 ./benchmark.sh
+
+# 换目标模型几何（默认 model-n32）
+MODEL=n16 ./benchmark.sh
+
+# 跳过 cos 表（省掉每个配置一次 dense 量级的打分）／换回三视角计时
+COS= ./benchmark.sh
+TIMING=full ./benchmark.sh
+
+# 单独跑某几组
+python3 benchmarks/bench_msa_configs.py --configs cfg04,cfg08,cfg12 --seqlens 65536</pre>
+
+<h3>9.3 配置的程序化使用</h3>
+<pre>from fmha_sm100.msa_config import MsaSparseConfig, CONFIG_MATRIX
+from fmha_sm100.msa_pipeline import MsaSparseAttention
+
+cfg = MsaSparseConfig.parse("force_init(128)-force_end(128)-block(64)-topk(32)-head(max)")
+# 等价写法：MsaSparseConfig.parse("fi128-fe128-b64-k32-hmax")
+#           MsaSparseConfig.parse("block=64,topk=32,force_init=128,force_end=128,head=max")
+#           MsaSparseConfig.from_env()          # 读 MSA_CONFIG / MSA_BLOCK_SIZE / ...
+#           CONFIG_MATRIX[11]
+
+msa = MsaSparseAttention(cfg, num_qo_heads=32, num_kv_heads=4, causal=True)  # model-n32
+out = msa(q, k, v, block_scores,
+          cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+          seqlens_q=[S], seqlens_k=[S],
+          max_seqlen_q=S, max_seqlen_k=S, total_k=S)</pre>
+
+<footer>
+  MSA 可配置稀疏注意力改造工作日志 · 2026-08-08 ·
+  目标 model-n32 (Hq=32 / Hkv=4 / D=128) ·
+  硬件 NVIDIA B300 SXM6 (sm_103) · 容器 &lt;container&gt; ·
+  基线 MSA main @ 80434d7
+</footer>
+
+</div>
+<script>
+// Click a header to sort that column. 33 rows x 4 contexts is past what anyone
+// can compare by eye, and the interesting groupings (equal token budget, equal
+// topk) cut across the default row order.
+document.querySelectorAll("table.sortable").forEach(function (table) {
+  const body = table.tBodies[0];
+  table.querySelectorAll("th").forEach(function (th, col) {
+    let asc = false;
+    th.addEventListener("click", function () {
+      asc = !asc;
+      const rows = Array.from(body.rows);
+      const val = function (row) {
+        const cell = row.cells[col];
+        if (!cell) return null;
+        const raw = cell.textContent.trim().replace(/x$/, "");
+        const n = parseFloat(raw);
+        return isNaN(n) ? raw.toLowerCase() : n;
+      };
+      rows.sort(function (a, b) {
+        const x = val(a), y = val(b);
+        if (x === null || x === "n/a") return 1;
+        if (y === null || y === "n/a") return -1;
+        if (typeof x === "number" && typeof y === "number") return asc ? x - y : y - x;
+        return asc ? String(x).localeCompare(String(y)) : String(y).localeCompare(String(x));
+      });
+      rows.forEach(function (r) { body.appendChild(r); });
+    });
+  });
+});
+</script>
+</body>
+</html>

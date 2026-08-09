@@ -312,10 +312,74 @@ __device__ bool processHistogramStep(float const* logits, int rowEnd, uint32_t& 
 constexpr int kTransposeTile = 32;
 constexpr int kTransposeBlockRows = 8;
 
+// -----------------------------------------------------------------------------
+// v3.0_msa_config additions
+// -----------------------------------------------------------------------------
+//
+// The transpose stage is the only pass that already streams the whole score
+// tensor, so two configurable MSA features are fused into it instead of paying
+// for extra full-tensor passes:
+//
+//   (a) GQA head aggregation (`head_mode`).  The indexer may emit one score row
+//       per *query* head; the sparse attention kernel consumes one selection
+//       per *KV* head.  `kHeadReduceSum` / `kHeadReduceMax` reduce `group_size`
+//       consecutive input heads into one output head while transposing.
+//       `kHeadReduceNone` (group_size == 1) is the legacy per-KV-head path.
+//
+//   (b) Forced blocks (`force_init` / `force_end`) with per-query causal ends.
+//       `force_begin` blocks at the start of the sequence are always selected
+//       (attention sinks).  `force_end_blocks` blocks immediately at/below each
+//       query's causal position are always selected (local window).  When
+//       `causal_end_block == nullptr` the causal end degenerates to the global
+//       `num_valid_pages`, reproducing the pre-v3.0 decode-oriented behaviour.
+//
+// Forcing is expressed by rewriting the score to FLT_MAX, so the downstream
+// top-k selects those blocks first and the rest of the pipeline is unchanged.
+enum : int { kHeadReduceNone = 0, kHeadReduceSum = 1, kHeadReduceMax = 2 };
+
+// Reduce `group_size` input heads at one (k, q) coordinate into a single value.
+template <int REDUCE>
+__device__ __forceinline__ float ReduceHeadGroup(const float* __restrict__ in_group,
+                                                 size_t head_stride, uint32_t group_size,
+                                                 size_t offset) {
+  if constexpr (REDUCE == kHeadReduceNone) {
+    return in_group[offset];
+  } else {
+    float acc = (REDUCE == kHeadReduceSum) ? 0.0f : -FLT_MAX;
+    for (uint32_t g = 0; g < group_size; ++g) {
+      const float v = in_group[g * head_stride + offset];
+      acc = (REDUCE == kHeadReduceSum) ? (acc + v) : fmaxf(acc, v);
+    }
+    return acc;
+  }
+}
+
+// Is KV block `k` force-selected for query row `q`?
+//   sink window : [0, force_begin)
+//   local window: [q_end - force_end_blocks, q_end)  with q_end the query's
+//                 exclusive causal block bound.
+// `k + force_end_blocks >= q_end` avoids unsigned underflow when
+// force_end_blocks > q_end.
+__device__ __forceinline__ bool SparseTopKIsForced(uint32_t k, uint32_t q_end,
+                                                   uint32_t force_begin,
+                                                   uint32_t force_end_blocks) {
+  return (k < force_begin) || (k < q_end && k + force_end_blocks >= q_end);
+}
+
+__device__ __forceinline__ uint32_t SparseTopKQueryEnd(const int32_t* __restrict__ causal_end_block,
+                                                       uint32_t q, uint32_t num_valid_pages) {
+  if (causal_end_block == nullptr) return num_valid_pages;
+  const int32_t e = causal_end_block[q];
+  const uint32_t ue = (e < 0) ? 0u : static_cast<uint32_t>(e);
+  return (ue < num_valid_pages) ? ue : num_valid_pages;
+}
+
+template <int REDUCE>
 __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
     SparseTopKTransposeKernel(const float* __restrict__ in, float* __restrict__ out, uint32_t K,
-                              uint32_t qo, uint32_t force_begin, uint32_t force_end_start,
-                              uint32_t num_valid_pages) {
+                              uint32_t qo, uint32_t group_size, uint32_t force_begin,
+                              uint32_t force_end_blocks, uint32_t num_valid_pages,
+                              const int32_t* __restrict__ causal_end_block) {
   __shared__ float tile[kTransposeTile][kTransposeTile + 1];
 
   const uint32_t q_base = blockIdx.x * kTransposeTile;
@@ -324,7 +388,8 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
   const uint32_t tx = threadIdx.x;
   const uint32_t ty = threadIdx.y;
 
-  const float* in_head = in + static_cast<size_t>(head) * K * qo;
+  const size_t head_stride = static_cast<size_t>(K) * qo;
+  const float* in_group = in + static_cast<size_t>(head) * group_size * head_stride;
   float* out_head = out + static_cast<size_t>(head) * qo * K;
 
   const uint32_t q_load = q_base + tx;
@@ -332,18 +397,19 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
   for (int dk = 0; dk < kTransposeTile; dk += kTransposeBlockRows) {
     const uint32_t k_load = k_base + ty + dk;
     if (q_load < qo && k_load < K) {
-      tile[ty + dk][tx] = in_head[static_cast<size_t>(k_load) * qo + q_load];
+      tile[ty + dk][tx] = ReduceHeadGroup<REDUCE>(in_group, head_stride, group_size,
+                                                  static_cast<size_t>(k_load) * qo + q_load);
     }
   }
   __syncthreads();
 
   const uint32_t k_store = k_base + tx;
-  const bool is_forced = (k_store < force_begin) ||
-                         (k_store >= force_end_start && k_store < num_valid_pages);
 #pragma unroll
   for (int dq = 0; dq < kTransposeTile; dq += kTransposeBlockRows) {
     const uint32_t q_store = q_base + ty + dq;
     if (q_store < qo && k_store < K) {
+      const uint32_t q_end = SparseTopKQueryEnd(causal_end_block, q_store, num_valid_pages);
+      const bool is_forced = SparseTopKIsForced(k_store, q_end, force_begin, force_end_blocks);
       out_head[static_cast<size_t>(q_store) * K + k_store] = is_forced ? FLT_MAX : tile[tx][ty + dq];
     }
   }
@@ -373,10 +439,11 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
 //     the workspace pointer; transpose_buf offset is at the start so aligned)
 //
 // Grid: (qo / TILE, K / TILE, num_qo_heads), Block: TILE * TILE / 4 threads.
-template <int TILE>
+template <int TILE, int REDUCE>
 __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kernel(
     const float* __restrict__ in, float* __restrict__ out, uint32_t K, uint32_t qo,
-    uint32_t force_begin, uint32_t force_end_start, uint32_t num_valid_pages) {
+    uint32_t group_size, uint32_t force_begin, uint32_t force_end_blocks,
+    uint32_t num_valid_pages, const int32_t* __restrict__ causal_end_block) {
   constexpr int N_THR = TILE / 4;  // threads along N (qo) direction
 
   __shared__ float S[TILE * TILE];
@@ -389,14 +456,27 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
   const int tm = tx / N_THR;        // K-tile row index (0..TILE-1)
   const int tn = tx % N_THR;        // Q-tile col group (0..N_THR-1, covers 4 Q each)
 
-  const float* in_head  = in  + static_cast<size_t>(h) * K * qo;
+  const size_t head_stride = static_cast<size_t>(K) * qo;
+  const float* in_group = in  + static_cast<size_t>(h) * group_size * head_stride;
   float*       out_head = out + static_cast<size_t>(h) * qo * K;
 
   // ---- LOAD: float4 GMEM → XOR-swizzled SMEM ---------------------------
+  // With head aggregation the same float4 lane is loaded once per group member
+  // and combined in registers, so SMEM traffic stays at one tile.
   {
-    const float4* in4 = reinterpret_cast<const float4*>(
-        in_head + static_cast<size_t>(kb + tm) * qo + qb + tn * 4);
-    float4 v = *in4;
+    const size_t off = static_cast<size_t>(kb + tm) * qo + qb + tn * 4;
+    float4 v = *reinterpret_cast<const float4*>(in_group + off);
+    if constexpr (REDUCE != kHeadReduceNone) {
+      for (uint32_t g = 1; g < group_size; ++g) {
+        const float4 w = *reinterpret_cast<const float4*>(in_group + g * head_stride + off);
+        if constexpr (REDUCE == kHeadReduceSum) {
+          v.x += w.x; v.y += w.y; v.z += w.z; v.w += w.w;
+        } else {
+          v.x = fmaxf(v.x, w.x); v.y = fmaxf(v.y, w.y);
+          v.z = fmaxf(v.z, w.z); v.w = fmaxf(v.w, w.w);
+        }
+      }
+    }
 
     const int base = tm * TILE;
     S[base + ((tn * 4 + 0) ^ tm)] = v.x;
@@ -416,14 +496,14 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
     float v2 = S[(tn * 4 + 2) * TILE + (tm ^ (tn * 4 + 2))];
     float v3 = S[(tn * 4 + 3) * TILE + (tm ^ (tn * 4 + 3))];
 
-    auto is_forced = [&](uint32_t k) -> bool {
-      return (k < force_begin) || (k >= force_end_start && k < num_valid_pages);
-    };
+    // One causal-end lookup per thread: the 4 lanes share the same query row.
+    const uint32_t q_end =
+        SparseTopKQueryEnd(causal_end_block, static_cast<uint32_t>(q_out), num_valid_pages);
     const uint32_t uk0 = static_cast<uint32_t>(k0);
-    if (is_forced(uk0))     v0 = FLT_MAX;
-    if (is_forced(uk0 + 1)) v1 = FLT_MAX;
-    if (is_forced(uk0 + 2)) v2 = FLT_MAX;
-    if (is_forced(uk0 + 3)) v3 = FLT_MAX;
+    if (SparseTopKIsForced(uk0,     q_end, force_begin, force_end_blocks)) v0 = FLT_MAX;
+    if (SparseTopKIsForced(uk0 + 1, q_end, force_begin, force_end_blocks)) v1 = FLT_MAX;
+    if (SparseTopKIsForced(uk0 + 2, q_end, force_begin, force_end_blocks)) v2 = FLT_MAX;
+    if (SparseTopKIsForced(uk0 + 3, q_end, force_begin, force_end_blocks)) v3 = FLT_MAX;
 
     float4 out_v = {v0, v1, v2, v3};
     float4* out4 = reinterpret_cast<float4*>(
@@ -444,16 +524,20 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
 // max_k_tiles (or any value >= max_k_tiles) to disable clamping.
 __global__ void SparseTopKIdentityFillKernel(int32_t* __restrict__ out, uint32_t total_qo_len,
                                              uint32_t num_qo_heads, uint32_t max_k_tiles,
-                                             uint32_t topk, uint32_t num_valid_pages) {
+                                             uint32_t topk, uint32_t num_valid_pages,
+                                             uint32_t head_outermost) {
   // grid = (num_rows = total_qo_len * num_qo_heads,), block = (min(topk, 256),)
   // bid encodes (qo_head_idx, t) with t innermost: bid = qo_head_idx * total_qo_len + t
-  // out physical layout: (total_qo_len, num_qo_heads, topk) row-major contiguous
-  //   element (t, qo_head_idx, k) at offset = (t * num_qo_heads + qo_head_idx) * topk + k
+  // out physical layout, selected by head_outermost:
+  //   0: (total_qo_len, num_qo_heads, topk) — legacy qo-outermost
+  //   1: (num_qo_heads, total_qo_len, topk) — what build_k2q_csr consumes
   const uint32_t bid = blockIdx.x;
   const uint32_t tx = threadIdx.x;
   const uint32_t qo_head_idx = bid / total_qo_len;
   const uint32_t t = bid % total_qo_len;
-  int32_t* row = out + (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk;
+  int32_t* row = out + (head_outermost
+                            ? static_cast<size_t>(bid) * topk
+                            : (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk);
   // valid_count = min(max_k_tiles, num_valid_pages); positions [valid_count, topk) → -1
   const uint32_t valid_count = (num_valid_pages < max_k_tiles) ? num_valid_pages : max_k_tiles;
   for (uint32_t i = tx; i < topk; i += blockDim.x) {
@@ -583,7 +667,11 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     // and sorted to the tail.  Pass num_valid_pages = max_k_tiles to disable
     // (the comparison `idx >= num_valid_pages` will then never trigger because
     // every valid idx is in [0, max_k_tiles)).
-    uint32_t num_valid_pages) {
+    uint32_t num_valid_pages,
+    // v3.0_msa_config: 1 writes (num_qo_heads, qo, topk) instead of the legacy
+    // (qo, num_qo_heads, topk).  `build_k2q_csr` wants head-outermost, so the
+    // production path would otherwise pay a full permute+copy of the selection.
+    uint32_t head_outermost) {
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
   constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
@@ -621,10 +709,12 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   const uint32_t bid = blockIdx.x;
   const uint32_t qo_head_idx = bid / total_qo_len;
   const uint32_t t = bid % total_qo_len;
-  // qo_outermost output offset:
-  //   out (t, qo_head_idx, k) at offset (t*num_qo_heads + qo_head_idx) * topk + k
+  // Output offset for element (t, qo_head_idx, k):
+  //   qo-outermost  : (t * num_qo_heads + qo_head_idx) * topk + k
+  //   head-outermost: (qo_head_idx * total_qo_len + t) * topk + k  == bid * topk + k
   const size_t row_offset_out =
-      (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk;
+      head_outermost ? static_cast<size_t>(bid) * topk
+                     : (static_cast<size_t>(t) * num_qo_heads + qo_head_idx) * topk;
 
   // Per-row input pointer (transposed layout: row stride = max_k_tiles).
   const float* logits = in + static_cast<size_t>(bid) * max_k_tiles;
@@ -772,59 +862,94 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
 // Host-side dispatcher
 // =============================================================================
 
+// `num_qo_heads` is the *output* head count.  The input tensor carries
+// `num_qo_heads * group_size` head rows; the transpose stage reduces each
+// group of `group_size` consecutive rows into one output row.
 cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transposed, int32_t* out,
                                           uint32_t total_qo_len, uint32_t num_qo_heads,
                                           uint32_t max_k_tiles, uint32_t topk,
                                           uint32_t num_valid_pages,
-                                          uint32_t force_begin, uint32_t force_end_start,
+                                          uint32_t force_begin, uint32_t force_end_blocks,
+                                          uint32_t group_size, int head_reduce,
+                                          const int32_t* causal_end_block,
+                                          uint32_t head_outermost,
                                           cudaStream_t stream) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
 
-  // ---- (1) Transpose: dispatch to TransposeXorF4<32> fast path when
-  //          preconditions are met (qo & K both divisible by 32 and 4),
-  //          otherwise fall back to the original padded-tile transpose.
+  // ---- (1) Transpose (+ optional head aggregation, + forced blocks) ------
+  //          Dispatch to TransposeXorF4<32> fast path when preconditions are
+  //          met (qo & K both divisible by 32 and 4), otherwise fall back to
+  //          the original padded-tile transpose.
   {
     constexpr int kXorTile = 32;
     const bool xor_path_ok = (total_qo_len % kXorTile == 0) &&
                              (max_k_tiles % kXorTile == 0) &&
                              (total_qo_len % 4 == 0) &&
                              (max_k_tiles % 4 == 0);
+    void* tr_args[] = {(void*)&in_strided,      (void*)&transposed,      (void*)&max_k_tiles,
+                       (void*)&total_qo_len,    (void*)&group_size,      (void*)&force_begin,
+                       (void*)&force_end_blocks, (void*)&num_valid_pages, (void*)&causal_end_block};
+    const void* tr_kernel = nullptr;
+    dim3 grid, block;
     if (xor_path_ok) {
-      dim3 grid(total_qo_len / kXorTile, max_k_tiles / kXorTile, num_qo_heads);
-      dim3 block(kXorTile * kXorTile / 4);  // = 256 threads
-      void* tr_args[] = {(void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles,
-                         (void*)&total_qo_len, (void*)&force_begin, (void*)&force_end_start,
-                         (void*)&num_valid_pages};
-      cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeXorF4Kernel<kXorTile>,
-                                         grid, block, tr_args, 0, stream);
-      if (err != cudaSuccess) return err;
+      grid = dim3(total_qo_len / kXorTile, max_k_tiles / kXorTile, num_qo_heads);
+      block = dim3(kXorTile * kXorTile / 4);  // = 256 threads
+      switch (head_reduce) {
+        case kHeadReduceSum:
+          tr_kernel = (const void*)SparseTopKTransposeXorF4Kernel<kXorTile, kHeadReduceSum>;
+          break;
+        case kHeadReduceMax:
+          tr_kernel = (const void*)SparseTopKTransposeXorF4Kernel<kXorTile, kHeadReduceMax>;
+          break;
+        default:
+          tr_kernel = (const void*)SparseTopKTransposeXorF4Kernel<kXorTile, kHeadReduceNone>;
+          break;
+      }
     } else {
-      dim3 grid((total_qo_len + kTransposeTile - 1) / kTransposeTile,
-                (max_k_tiles + kTransposeTile - 1) / kTransposeTile, num_qo_heads);
-      dim3 block(kTransposeTile, kTransposeBlockRows);
-      void* tr_args[] = {(void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles,
-                         (void*)&total_qo_len, (void*)&force_begin, (void*)&force_end_start,
-                         (void*)&num_valid_pages};
-      cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeKernel, grid, block,
-                                         tr_args, 0, stream);
-      if (err != cudaSuccess) return err;
+      grid = dim3((total_qo_len + kTransposeTile - 1) / kTransposeTile,
+                  (max_k_tiles + kTransposeTile - 1) / kTransposeTile, num_qo_heads);
+      block = dim3(kTransposeTile, kTransposeBlockRows);
+      switch (head_reduce) {
+        case kHeadReduceSum:
+          tr_kernel = (const void*)SparseTopKTransposeKernel<kHeadReduceSum>;
+          break;
+        case kHeadReduceMax:
+          tr_kernel = (const void*)SparseTopKTransposeKernel<kHeadReduceMax>;
+          break;
+        default:
+          tr_kernel = (const void*)SparseTopKTransposeKernel<kHeadReduceNone>;
+          break;
+      }
     }
+    cudaError_t err = cudaLaunchKernel(tr_kernel, grid, block, tr_args, 0, stream);
+    if (err != cudaSuccess) return err;
   }
 
   // ---- (2) IndexerTopK + fused sort + write to qo_outermost layout -------
+  //          MAX_TOPK only sizes the fused warp bitonic sort, so the smallest
+  //          template bin that covers the runtime topk is selected.
   {
-    auto kernel = IndexerTopKWithSortKernel<16>;
+    const void* kernel = nullptr;
+    if (topk <= 16) {
+      kernel = (const void*)IndexerTopKWithSortKernel<16>;
+    } else if (topk <= 32) {
+      kernel = (const void*)IndexerTopKWithSortKernel<32>;
+    } else if (topk <= kSparseTopkMaxK) {
+      kernel = (const void*)IndexerTopKWithSortKernel<kSparseTopkMaxK>;
+    } else {
+      return cudaErrorInvalidValue;
+    }
     const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
     cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(dyn_smem_bytes));
     if (err != cudaSuccess) return err;
     void* args[] = {(void*)&transposed, (void*)&out, (void*)&total_qo_len,
                     (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
-                    (void*)&num_valid_pages};
+                    (void*)&num_valid_pages, (void*)&head_outermost};
     dim3 grid(num_rows);
     dim3 block(kIndexerNumThreadsPerBlock);
-    return cudaLaunchKernel((const void*)kernel, grid, block, args, dyn_smem_bytes, stream);
+    return cudaLaunchKernel(kernel, grid, block, args, dyn_smem_bytes, stream);
   }
 }
 
@@ -839,31 +964,44 @@ inline size_t SparseTopKWorkspaceSize(uint32_t total_qo_len, uint32_t num_qo_hea
 // =============================================================================
 // Top-level dispatcher
 // =============================================================================
-//   in        : (num_qo_heads, max_k_tiles, total_qo_len) contiguous fp32
-//   out       : (total_qo_len, num_qo_heads, topk=16) contiguous int32 asc by k_tile index
+//   in        : (num_qo_heads * group_size, max_k_tiles, total_qo_len) fp32
+//   out       : (total_qo_len, num_qo_heads, topk) contiguous int32 asc by k_tile index
 //   workspace : int32, at least SparseTopKWorkspaceSize(...) elements
+//   topk      : 1..64.  Selects the IndexerTopKWithSortKernel template bin.
 //   num_valid_pages : indices >= num_valid_pages are emitted as -1 (sorted to
 //                     tail).  Pass max_k_tiles (or any value >= max_k_tiles)
 //                     to disable clamping.
+//   force_begin / force_end : sink / local-window blocks that are always
+//                     selected (see SparseTopKIsForced).
+//   group_size / head_reduce : GQA head aggregation folded into the transpose.
+//                     head_reduce == kHeadReduceNone requires group_size == 1.
+//   causal_end_block : optional [total_qo_len] int32 of per-query exclusive
+//                     causal block bounds.  nullptr → global num_valid_pages.
 //
-//   * max_k_tiles <= 16      → SparseTopKIdentityFillKernel (trivial)
-//   * 16 < max_k_tiles < 12288 → Transpose + IndexerTopKWithSortKernel<16>
-//   * max_k_tiles >= 12288   → cudaErrorNotSupported
+//   * max_k_tiles <= topk      → SparseTopKIdentityFillKernel (trivial)
+//   * topk < max_k_tiles < 12288 → Transpose + IndexerTopKWithSortKernel<bin>
+//   * max_k_tiles >= 12288     → cudaErrorNotSupported
 inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* workspace,
                                     uint32_t total_qo_len, uint32_t num_qo_heads,
                                     uint32_t max_k_tiles, uint32_t num_valid_pages,
-                                    uint32_t force_begin, uint32_t force_end,
+                                    uint32_t force_begin, uint32_t force_end, uint32_t topk,
+                                    uint32_t group_size, int head_reduce,
+                                    const int32_t* causal_end_block, uint32_t head_outermost,
                                     cudaStream_t stream) {
-  constexpr uint32_t topk = 16;
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
+  if (topk == 0 || topk > kSparseTopkMaxK) return cudaErrorInvalidValue;
+  if (group_size == 0) return cudaErrorInvalidValue;
+  if (head_reduce == kHeadReduceNone && group_size != 1) return cudaErrorInvalidValue;
 
   // ---- Trivial path: max_k_tiles <= topk → identity fill -----------------
+  // Every block is selected, so head aggregation and forcing are no-ops.
   if (max_k_tiles <= topk) {
     dim3 grid(num_rows);
     dim3 block(topk);
-    void* args[] = {(void*)&out, (void*)&total_qo_len, (void*)&num_qo_heads,
-                    (void*)&max_k_tiles, (void*)&topk, (void*)&num_valid_pages};
+    void* args[] = {(void*)&out,        (void*)&total_qo_len,    (void*)&num_qo_heads,
+                    (void*)&max_k_tiles, (void*)&topk,           (void*)&num_valid_pages,
+                    (void*)&head_outermost};
     return cudaLaunchKernel((const void*)SparseTopKIdentityFillKernel, grid, block, args, 0,
                             stream);
   }
@@ -871,13 +1009,11 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   // ---- IndexerTopK insertion-sort path ------------------------------------
   if (max_k_tiles >= 12288) return cudaErrorNotSupported;
 
-  const uint32_t force_end_start =
-      (force_end <= num_valid_pages) ? num_valid_pages - force_end : 0;
-
   float* transpose_buf = reinterpret_cast<float*>(workspace);
   return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, total_qo_len, num_qo_heads,
-                                       max_k_tiles, topk, num_valid_pages,
-                                       force_begin, force_end_start, stream);
+                                       max_k_tiles, topk, num_valid_pages, force_begin, force_end,
+                                       group_size, head_reduce, causal_end_block, head_outermost,
+                                       stream);
 }
 
 }  // namespace sparse_topk

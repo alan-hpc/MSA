@@ -30,3 +30,7 @@ profiles/
 *.swp
 .DS_Store
 tests/logs/
+results/
+
+# Local-only helper for pushing to an internal dev box
+scripts/sync_to_remote.sh

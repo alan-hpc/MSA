@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -38,6 +39,12 @@ _PUBLIC_SCALE_LAYOUT = "public"
 _PREORDERED_MMA_SCALE_LAYOUT = "preordered_mma"
 _FP4_COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 
+#: Largest score tensor the indexer can address.  Its CuTe layout is built from
+#: ``Int32`` extents (see the ``Int32(...)`` argument pack below), so the kernel
+#: computes linear offsets in 32-bit signed arithmetic and the last addressable
+#: element is ``2**31 - 1``.
+_SCORE_TENSOR_MAX_ELEMS = 2**31
+
 
 def _device_arch(device: torch.device) -> tuple[int, int]:
     major, minor = torch.cuda.get_device_capability(device)
@@ -69,6 +76,7 @@ def normalize_scale_layout(scale_layout: str) -> str:
     return scale_layout
 
 
+@lru_cache(maxsize=1024)
 def _causal_compact_task_count(q_len: int, k_len: int, k_tiles_per_cta: int) -> int:
     if q_len <= 0 or k_len <= 0:
         return 0
@@ -86,8 +94,18 @@ def _causal_compact_task_count(q_len: int, k_len: int, k_tiles_per_cta: int) -> 
     return tasks
 
 
+@lru_cache(maxsize=1024)
 def _causal_compact_task_bound(max_q_len: int, max_k_len: int, k_tiles_per_cta: int) -> int:
-    """Conservative X-grid bound for per-batch causal prefill compact mapping."""
+    """Conservative X-grid bound for per-batch causal prefill compact mapping.
+
+    Memoised: this is pure integer arithmetic over ``(max_q_len, max_k_len,
+    k_tiles_per_cta)``, but it is O(q_tiles^2) in Python and runs on *every*
+    ``fp4_indexer_block_scores`` call.  Uncached that is ~1 ms of host time at
+    8K context, ~16 ms at 32K and ~250 ms at 128K — far above the kernel it is
+    sizing, and enough to make the indexer host-dispatch bound.  A serving loop
+    repeats the same few (max_seqlen_q, max_seqlen_k) pairs, so the cache hits
+    essentially always.
+    """
 
     if max_q_len <= 0 or max_k_len <= 0:
         return 0
@@ -863,6 +881,21 @@ def fp4_indexer_block_scores(
     m_extent = int(max_seqlen_q)
     max_k_tiles = ceil_div(int(max_seqlen_k), _PAGE_SIZE)
     n_aligned = max_k_tiles * _PAGE_SIZE
+
+    # The score tensor's CuTe layout is built from Int32 extents, so the kernel
+    # addresses it with 32-bit arithmetic: past 2**31 elements the linear index
+    # wraps and the kernel scribbles over unrelated memory (an illegal access if
+    # you are lucky, silent corruption if you are not).  Fail here instead.
+    score_elems = heads_q * max_k_tiles * total_q
+    if score_elems > _SCORE_TENSOR_MAX_ELEMS:
+        raise ValueError(
+            f"FP4 indexer score tensor would need {score_elems} elements "
+            f"(Hq={heads_q} x k_tiles={max_k_tiles} x total_q={total_q}), above the "
+            f"Int32-addressable limit of {_SCORE_TENSOR_MAX_ELEMS}. Reduce the scorer "
+            f"head count (e.g. per-KV-head scoring instead of per-query-head), split the "
+            f"batch, or chunk the prefill."
+        )
+
     if max_k_tiles == 0:
         return torch.full(
             (heads_q, 0, total_q),

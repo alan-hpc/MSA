@@ -32,8 +32,9 @@ The current public support contract is intentionally narrow:
 | Head dimension | `D=128` |
 | Input dtype | `torch.bfloat16`, `torch.float16` |
 | Sparse attention forward | `qhead_per_kv` in `{1, 2, 4, 8, 16}` |
-| CSR builder | `topK` in `{4, 8, 16, 32}`, `blk_kv=128` |
+| CSR builder | `topK` in `{4, 8, 16, 32}`, `blk_kv` in `{32, 64, 128}` |
 | Sparse page attention | Forward-only, `qhead_per_kv` in `{1, 2, 4, 8, 16}` |
+| Block-sparse forward `blk_kv` | `{32, 64, 128}`, numerically verified in `tests/regression/test_msa_block_size.py` |
 | FP8 KV prefill | Forward-only, BF16 Q + FP8 e4m3 K/V -> BF16 attention/output, flat and paged KV |
 | Mixed FP8 QKV prefill | Forward-only, FP8 e4m3 Q/K/V storage with FP8 QK and BF16 PV, flat and paged KV |
 | NVFP4 KV prefill | Forward-only, BF16 or FP8 e4m3 Q + packed NVFP4 K/V, flat and paged KV |

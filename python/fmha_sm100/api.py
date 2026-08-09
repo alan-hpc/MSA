@@ -1176,6 +1176,13 @@ def fmha_sm100(
 # ============================================================================
 
 
+#: ``head_mode`` -> kernel ``head_reduce`` enum (see sparse_topk_select.cuh).
+_HEAD_REDUCE_MODES = {"keep": 0, "sum": 1, "max": 2}
+
+#: Largest ``topk`` the fused warp bitonic sort supports (``kSparseTopkMaxK``).
+SPARSE_TOPK_MAX_K = 64
+
+
 def sparse_topk_select(
     max_score: torch.Tensor,
     topk: int,
@@ -1183,23 +1190,32 @@ def sparse_topk_select(
     output: Optional[torch.Tensor] = None,
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
+    head_mode: str = "keep",
+    num_out_heads: Optional[int] = None,
+    causal_end_block: Optional[torch.Tensor] = None,
+    head_outermost: bool = False,
 ) -> torch.Tensor:
-    r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
+    r"""Select top-k KV-block indices per (output head, token) row from a block-score tensor.
 
-    Designed for the MQA proxy-KV sparse attention path where the dense pass uses
-    ``num_kv_heads_dense=1``, so ``max_score.shape[0] == num_kv_heads_real`` and
-    each head row is processed independently (no GQA reduction inside this call).
+    The classic use is the MQA proxy-KV sparse attention path, where the dense
+    pass runs with ``num_kv_heads_dense=1`` so ``max_score.shape[0] ==
+    num_kv_heads_real`` and each head row is selected independently
+    (``head_mode="keep"``).  When the scorer instead emits one row per *query*
+    head, ``head_mode="sum"`` / ``"max"`` reduce each GQA group of
+    ``num_in_heads // num_out_heads`` consecutive rows down to the KV-head
+    selection the sparse attention kernel consumes.  The reduction is fused into
+    the transpose stage, so it costs no extra pass over the score tensor.
 
     Parameters
     ----------
     max_score : torch.Tensor
-        Shape ``(num_qo_heads, max_k_tiles, total_qo_len)``, contiguous, float32.
-        Slots beyond the actual KV tile count must be pre-filled with ``-inf``
+        Shape ``(num_in_heads, max_k_tiles, total_qo_len)``, contiguous, float32.
+        Slots beyond the actual KV block count must be pre-filled with ``-inf``
         (fmha_sm100 does this automatically via ``torch.full``).
     topk : int
-        Must be exactly 16.
+        Number of blocks selected per row, in ``[1, 64]``.
     num_valid_pages : int, optional
-        Actual number of KV pages in the page table, i.e. ``ceil(kv_len / page_size)``.
+        Actual number of KV blocks in the page table, i.e. ``ceil(kv_len / block_size)``.
         ``max_k_tiles`` is round-up-aligned and always >= ``num_valid_pages``.
         The kernel may select tile indices in ``[num_valid_pages, max_k_tiles-1]``
         (all-``-inf`` padding tiles). Passing ``num_valid_pages`` replaces those
@@ -1212,23 +1228,71 @@ def sparse_topk_select(
         always include in the top-k result, regardless of their scores.  Useful
         for sink tokens.  Default 0.
     force_end_blocks : int
-        Number of KV blocks at the end of the valid sequence (indices
-        nvp-N..nvp-1, closest to the current query) to always include.  Useful
-        for local-window attention.  Default 0.
+        Number of KV blocks immediately at/below each query's causal position to
+        always include.  Useful for local-window attention.  The causal position
+        comes from ``causal_end_block`` when given, otherwise from the global
+        ``num_valid_pages`` (correct for decode, where every query sits at the
+        end of its sequence).  Default 0.
+    head_mode : str
+        ``"keep"`` (no reduction; ``num_in_heads == num_out_heads``), ``"sum"``
+        or ``"max"`` (reduce each GQA group of input rows).  Default ``"keep"``.
+    num_out_heads : int, optional
+        Output head count.  Required when ``head_mode`` reduces and ``output``
+        is not supplied; defaults to ``num_in_heads``.
+    causal_end_block : torch.Tensor, optional
+        Shape ``(total_qo_len,)``, int32, on the same device.  Per-query
+        *exclusive* causal block bound, i.e. ``kv_pos(q) // block_size + 1``.
+        Only affects the ``force_end_blocks`` window.
+    head_outermost : bool
+        ``False`` (default) writes ``(total_qo_len, num_out_heads, topk)``, the
+        historical layout.  ``True`` writes ``(num_out_heads, total_qo_len, topk)``,
+        which is what ``build_k2q_csr`` consumes — using it removes a full
+        permute + copy of the selection from the production pipeline.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(total_qo_len, num_qo_heads, topk)``, int32, ascending by tile index.
-        Out-of-range entries (if any) are ``-1`` at the tail.
+        ``(total_qo_len, num_out_heads, topk)`` int32, or
+        ``(num_out_heads, total_qo_len, topk)`` when ``head_outermost=True``.
+        Ascending by tile index; out-of-range entries (if any) are ``-1`` at the tail.
     """
 
     assert max_score.dtype == torch.float32, f"max_score must be float32, got {max_score.dtype}"
     assert max_score.dim() == 3, f"max_score must be 3D, got {max_score.shape}"
     assert max_score.is_contiguous(), "max_score must be contiguous"
-    assert topk == 16, f"topk must be 16, got {topk}"
+    assert 1 <= topk <= SPARSE_TOPK_MAX_K, f"topk must be in [1, {SPARSE_TOPK_MAX_K}], got {topk}"
+    assert head_mode in _HEAD_REDUCE_MODES, (
+        f"head_mode must be one of {sorted(_HEAD_REDUCE_MODES)}, got {head_mode!r}"
+    )
 
-    num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
+    head_outermost = bool(head_outermost)
+    num_in_heads, max_k_tiles, total_qo_len = max_score.shape
+    if num_out_heads is None:
+        if output is not None:
+            num_out_heads = output.shape[0] if head_outermost else output.shape[1]
+        else:
+            num_out_heads = num_in_heads
+    num_out_heads = int(num_out_heads)
+    assert num_out_heads > 0 and num_in_heads % num_out_heads == 0, (
+        f"max_score head count ({num_in_heads}) must be a multiple of "
+        f"num_out_heads ({num_out_heads})"
+    )
+    assert head_mode != "keep" or num_in_heads == num_out_heads, (
+        "head_mode='keep' requires max_score to already have one row per output head; "
+        f"got {num_in_heads} input rows for {num_out_heads} output heads"
+    )
+    if causal_end_block is not None:
+        assert causal_end_block.dtype == torch.int32, "causal_end_block must be int32"
+        assert causal_end_block.shape == (total_qo_len,), (
+            f"causal_end_block must have shape ({total_qo_len},), got {tuple(causal_end_block.shape)}"
+        )
+        assert causal_end_block.is_contiguous(), "causal_end_block must be contiguous"
+        assert causal_end_block.device == max_score.device, (
+            "causal_end_block must be on the same device as max_score"
+        )
+
+    # The kernel indexes rows by output head; everything below is per-output-head.
+    num_qo_heads = num_out_heads
 
     # v2.3 kernel only supports the insertion-sort path (K < 12288).
     assert max_k_tiles < 12288, (
@@ -1252,6 +1316,9 @@ def sparse_topk_select(
         f"force_begin_blocks={force_begin_blocks} and force_end_blocks={force_end_blocks} "
         f"must be non-negative"
     )
+    # The forced windows are materialised as FLT_MAX scores, so together they
+    # must fit inside the top-k budget or the selection would be fully pinned
+    # (and the sink/local windows would evict each other non-deterministically).
     assert force_begin_blocks + force_end_blocks <= topk, (
         f"force_begin_blocks({force_begin_blocks}) + force_end_blocks({force_end_blocks}) "
         f"= {force_begin_blocks + force_end_blocks} exceeds topk={topk}"
@@ -1265,10 +1332,12 @@ def sparse_topk_select(
     if output is not None:
         output_indices = output
     else:
-        output_indices = torch.empty(
-            total_qo_len, num_qo_heads, topk,
-            dtype=torch.int32, device=max_score.device,
+        out_shape = (
+            (num_qo_heads, total_qo_len, topk)
+            if head_outermost
+            else (total_qo_len, num_qo_heads, topk)
         )
+        output_indices = torch.empty(out_shape, dtype=torch.int32, device=max_score.device)
 
     module = get_sparse_topk_module()
     # MQA dense pass: num_kv_heads_dense=1, so h_r=num_qo_heads.
@@ -1278,12 +1347,18 @@ def sparse_topk_select(
     # v2.5_oob_clamp_in_kernel: OOB clamp is folded into the kernel — the prior
     # post-process torch.where + sort + torch.where chain (~84-101 us / call)
     # is replaced by passing num_valid_pages directly to the kernel.
+    #
+    # v3.0_msa_config: topk, GQA head reduction and the per-query causal bound
+    # for the force_end window are all runtime kernel arguments.
     module.sparse_topk_select(
         max_score, output_indices, workspace_buffer,
         topk,
         nvp_arg,
         int(force_begin_blocks),
         int(force_end_blocks),
+        _HEAD_REDUCE_MODES[head_mode],
+        causal_end_block,
+        int(head_outermost),
         torch.cuda.current_stream().cuda_stream,
     )
 

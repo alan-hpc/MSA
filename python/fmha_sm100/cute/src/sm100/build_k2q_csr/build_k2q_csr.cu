@@ -680,6 +680,44 @@ static void launch_pipeline(
     }
 }
 
+// ---------------------------------------------------------------------------
+// v3.0_msa_config: (topK, blk_kv) dispatch.
+// ---------------------------------------------------------------------------
+// `kBlockK` only feeds the `ceil(seqlen_k / kBlockK)` row-count arithmetic in
+// k2q_build_row_map_kernel, so the pipeline generalises to any block width; the
+// instantiation set is what bounds compile time.  32 / 64 / 128 covers the MSA
+// configuration matrix.
+#define MSA_K2Q_DISPATCH_BLK(TOPK, ...)                                       \
+    do {                                                                      \
+        if (blk_kv == 128) {                                                  \
+            launch_pipeline<TOPK, 128>(__VA_ARGS__);                          \
+        } else if (blk_kv == 64) {                                            \
+            launch_pipeline<TOPK, 64>(__VA_ARGS__);                           \
+        } else {                                                              \
+            launch_pipeline<TOPK, 32>(__VA_ARGS__);                           \
+        }                                                                     \
+    } while (0)
+
+#define MSA_K2Q_DISPATCH(...)                                                 \
+    do {                                                                      \
+        if (topk == 16) {                                                     \
+            MSA_K2Q_DISPATCH_BLK(16, __VA_ARGS__);                            \
+        } else if (topk == 8) {                                               \
+            MSA_K2Q_DISPATCH_BLK(8, __VA_ARGS__);                             \
+        } else if (topk == 32) {                                              \
+            MSA_K2Q_DISPATCH_BLK(32, __VA_ARGS__);                            \
+        } else if (topk == 4) {                                               \
+            MSA_K2Q_DISPATCH_BLK(4, __VA_ARGS__);                             \
+        } else {                                                              \
+            TORCH_CHECK(false, "unsupported topK ", topk,                     \
+                        " (expected 4, 8, 16, or 32)");                       \
+        }                                                                     \
+    } while (0)
+
+#define MSA_K2Q_CHECK_BLK_KV(blk_kv)                                          \
+    TORCH_CHECK((blk_kv) == 32 || (blk_kv) == 64 || (blk_kv) == 128,          \
+                "build_k2q_csr supports blk_kv in {32, 64, 128}, got ", (blk_kv))
+
 void run_build_k2q_csr(
     torch::Tensor q2k,
     torch::Tensor cu_q,
@@ -696,7 +734,7 @@ void run_build_k2q_csr(
     CHECK_INPUT(cu_k);
     CHECK_INPUT(row_ptr);
     CHECK_INPUT(q_idx);
-    TORCH_CHECK(blk_kv == 128, "build_k2q_csr only supports blk_kv == 128");
+    MSA_K2Q_CHECK_BLK_KV(blk_kv);
     int H = (int)q2k.size(0);
     int S_Q = (int)q2k.size(1);
     int tr = (int)total_rows;
@@ -718,17 +756,7 @@ void run_build_k2q_csr(
         return;
     }
 
-    if (topk == 16) {
-        launch_pipeline<16, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else if (topk == 8) {
-        launch_pipeline<8, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else if (topk == 32) {
-        launch_pipeline<32, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else if (topk == 4) {
-        launch_pipeline<4, 128>(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
-    } else {
-        TORCH_CHECK(false, "unsupported topK ", topk, " (expected 4, 8, 16, or 32)");
-    }
+    MSA_K2Q_DISPATCH(q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv);
 }
 
 void run_build_k2q_csr_with_schedule(
@@ -758,7 +786,7 @@ void run_build_k2q_csr_with_schedule(
     CHECK_INPUT(work_count);
     CHECK_INPUT(qsplit_idx);
     CHECK_INPUT(split_counts);
-    TORCH_CHECK(blk_kv == 128, "build_k2q_csr only supports blk_kv == 128");
+    MSA_K2Q_CHECK_BLK_KV(blk_kv);
     int H = (int)q2k.size(0);
     int S_Q = (int)q2k.size(1);
     int tr = (int)total_rows;
@@ -796,29 +824,10 @@ void run_build_k2q_csr_with_schedule(
         return;
     }
 
-    if (topk == 16) {
-        launch_pipeline<16, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else if (topk == 8) {
-        launch_pipeline<8, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else if (topk == 32) {
-        launch_pipeline<32, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else if (topk == 4) {
-        launch_pipeline<4, 128>(
-            q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
-            scheduler_metadata, work_count, qsplit_idx, split_counts,
-            target, capacity, max_sq);
-    } else {
-        TORCH_CHECK(false, "unsupported topK ", topk, " (expected 4, 8, 16, or 32)");
-    }
+    MSA_K2Q_DISPATCH(
+        q2k, cu_q, cu_k, row_ptr, q_idx, tr, mkv,
+        scheduler_metadata, work_count, qsplit_idx, split_counts,
+        target, capacity, max_sq);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

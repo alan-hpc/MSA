@@ -168,6 +168,73 @@ Common invocations (output is TSV):
 | Quick CI smoke | `python benchmarks/bench_sparse_attention_ops.py --dtype fp8 --sections prefill,decode,sparse_decode --seqs 8192,16384 --tp 1,4 --decode-k 8192,131072 --decode-b 32 --dry-run-ms 50 --repeat-ms 200 -o /tmp/msa_smoke.tsv` |
 | Output-mode checks (dense/paged) | `--output_mode maxscore` or `--output_mode full` |
 
+## Sparse attention configuration
+
+The block-sparse path is configurable along five axes, described declaratively
+by `fmha_sm100.msa_config.MsaSparseConfig`:
+
+| Knob | Values | Meaning |
+|---|---|---|
+| `block_size` | `32`, `64`, `128` | KV granularity shared by the scorer, the top-k selection and `blk_kv` |
+| `topk` | `4`, `8`, `16`, `32` | KV blocks attended per query (token budget = `topk * block_size`) |
+| `force_init_tokens` | tokens | Leading tokens always attended (attention sinks) |
+| `force_end_tokens` | tokens | Trailing tokens always attended, relative to each query's causal position |
+| `head_mode` | `keep`, `sum`, `max` | How indexer scores map onto the per-KV-head selection |
+
+The forced windows are expressed in **tokens** (rounded up to whole blocks) and
+consume part of the `topk` budget, so a configuration keeps its meaning as
+`block_size` changes. `head_mode` handling, both forced windows, and the
+head-outermost output layout are fused into `sparse_topk_select`'s transpose
+stage — none of them costs an extra pass over the score tensor.
+
+```python
+from fmha_sm100.msa_config import MsaSparseConfig, CONFIG_MATRIX, DEFAULT_MODEL
+from fmha_sm100.msa_pipeline import MsaSparseAttention
+
+cfg = MsaSparseConfig.parse("force_init(128)-force_end(128)-block(64)-topk(16)-head(keep)")
+# also accepts "fi128-fe128-b64-k16-hkeep", "block=64,topk=16,...", or MsaSparseConfig.from_env()
+
+msa = MsaSparseAttention(cfg, num_qo_heads=32, num_kv_heads=4, causal=True)
+out = msa(q, k, v, block_scores,
+          cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+          seqlens_q=[S], seqlens_k=[S],
+          max_seqlen_q=S, max_seqlen_k=S, total_k=S)
+```
+
+`./benchmark.sh` runs the correctness gate, a baseline evaluation and a
+configuration sweep, then prints two comparison tables covering `dense gqa`,
+the MSA baseline and every swept configuration:
+
+| Table | What it shows |
+|---|---|
+| 1a / 1b | single-operator latency and speedup vs the dense GQA operator |
+| 2 | cosine similarity of each configuration's attention output against dense |
+
+Timing is plain CUDA-event measurement of one operator by default
+(`TIMING=simple`); `TIMING=full` adds CUDA-graph and host-dispatch views for
+diagnosing dispatch-bound stages. `COS=` disables the cosine table, which is
+otherwise on and costs a dense attention's worth of FLOPs per configuration
+(the selection has to come from the real Q/K for the number to mean anything).
+
+```bash
+./benchmark.sh                                  # full run
+QUICK=1 ./benchmark.sh                          # 4K/32K, short timing windows
+CONFIGS=matrix SEQLENS=32768,131072 ./benchmark.sh
+MODEL=n16 ./benchmark.sh                     # a different attention geometry
+COS= TIMING=full ./benchmark.sh                 # skip cosine, add graph/host timing views
+python benchmarks/bench_msa_configs.py --help
+```
+
+Benchmark shapes come from a model geometry registered in
+`fmha_sm100.msa_config.MODEL_SHAPES`; the default is `model-n32`
+(Hq=32, Hkv=4, GQA 8x, D=128). `MsaSparseAttention.max_scorer_seqlen()` reports
+how long a context a given configuration can score, which matters because the
+FP4 indexer addresses its score tensor with 32-bit arithmetic — see
+[`docs/OPTIMIZATION_REPORT.md`](docs/OPTIMIZATION_REPORT.md) §2.
+
+Measured results and the resulting optimisation analysis live in `log.html`
+and [`docs/OPTIMIZATION_REPORT.md`](docs/OPTIMIZATION_REPORT.md).
+
 ## Layout
 
 ```

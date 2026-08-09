@@ -11,6 +11,7 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
 
 import itertools
 import fcntl
+import hashlib
 import logging
 import os
 import shutil
@@ -53,6 +54,31 @@ def _acquire_file_lock(lock_path):
 def _release_file_lock(fd):
     fcntl.flock(fd, fcntl.LOCK_UN)
     os.close(fd)
+
+
+def _source_fingerprint(paths):
+    """Content hash over the given sources, used to invalidate a JIT cache dir.
+
+    Content rather than mtime: editable installs, `git checkout` and container
+    bind-mounts all move mtimes around without changing what nvcc would see.
+    """
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(str(path).encode())
+        try:
+            digest.update(Path(path).read_bytes())
+        except OSError:
+            # A source that cannot be read is itself part of the state; hashing
+            # the marker keeps the fingerprint stable while it stays missing.
+            digest.update(b"\0<missing>\0")
+    return digest.hexdigest()
+
+
+def _read_stamp(stamp_path):
+    try:
+        return Path(stamp_path).read_text().strip()
+    except OSError:
+        return None
 
 
 # Kernel sources and CUTLASS headers are shipped inside the package directory
@@ -490,13 +516,26 @@ def _do_compile_sparse_topk():
     cache_dir = CACHE_BASE / "sparse_topk"
     so_path = cache_dir / "sparse_topk_select.so"
 
-    if so_path.exists():
+    # `sparse_topk_select.cuh` is pulled in via -I from the source tree rather
+    # than copied into the cache dir, so an existing .so alone is not proof the
+    # cache is fresh.  Fingerprint every source that feeds this module and
+    # rebuild whenever the fingerprint moves — otherwise a kernel edit is
+    # silently ignored until the user wipes ~/.cache/minfer by hand.
+    src_cu = _FMHA_VARLEN_DIR / "sparse_topk_select.cu"
+    fingerprint = _source_fingerprint(
+        [src_cu, _FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
+         _FMHA_VARLEN_DIR / "tvm_ffi_utils.h"]
+    )
+    stamp_path = cache_dir / "sparse_topk_select.srchash"
+    if so_path.exists() and _read_stamp(stamp_path) == fingerprint:
         return
 
     logger.info("JIT compiling sparse_topk_select module")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    # Drop the stamp first: a crash mid-build must not leave a stale .so paired
+    # with a fresh fingerprint.
+    stamp_path.unlink(missing_ok=True)
 
-    src_cu = _FMHA_VARLEN_DIR / "sparse_topk_select.cu"
     shutil.copy2(src_cu, cache_dir / "sparse_topk_select.cu")
 
     for name in ["tvm_ffi_utils.h"]:
@@ -542,6 +581,7 @@ build {so_path}: nvcc_link {obj}
             f"stdout: {result.stdout}\n"
             f"stderr: {result.stderr}"
         )
+    stamp_path.write_text(fingerprint)
 
 
 def get_sparse_topk_module():
