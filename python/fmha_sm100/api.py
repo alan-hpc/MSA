@@ -941,6 +941,38 @@ def _fmha_sm100(
     return out, max_score
 
 
+#: The FMHA kernels index the Q/O tensors with 32-bit arithmetic, so the whole
+#: ``[total_qo_len, num_qo_heads, head_dim]`` tensor has to stay inside the
+#: Int32-addressable range.  Reaching it is not a graceful failure: the kernel
+#: illegal-accesses, which poisons the CUDA context and takes down everything
+#: that runs after it in the same process.  Measured on B300: 458752 tokens
+#: (1.88e9 elements) runs, 524288 (exactly 2**31) faults every time in a fresh
+#: process.  Note that it does *not* always fault -- a run that reached this
+#: shape after seven shorter ones once completed and reported a plausible
+#: latency -- which is the worst property such a bug can have, and the reason
+#: this is a hard check rather than a warning.
+_QO_TENSOR_MAX_ELEMS = 2**31
+
+
+def _check_qo_int32_addressable(q: torch.Tensor) -> None:
+    if q.ndim != 3:
+        return
+    total_qo_len, num_qo_heads, head_dim = (int(x) for x in q.shape)
+    elems = total_qo_len * num_qo_heads * head_dim
+    if elems < _QO_TENSOR_MAX_ELEMS:
+        return
+    max_tokens = (_QO_TENSOR_MAX_ELEMS - 1) // (num_qo_heads * head_dim)
+    raise ValueError(
+        f"Q/O tensor would need {elems} elements "
+        f"(total_qo_len={total_qo_len} x num_qo_heads={num_qo_heads} x head_dim={head_dim}), "
+        f"at or above the Int32-addressable limit of {_QO_TENSOR_MAX_ELEMS}. "
+        f"The kernels index these tensors with 32-bit arithmetic and illegal-access here, "
+        f"which poisons the CUDA context for the rest of the process.\n"
+        f"At this head geometry the ceiling is {max_tokens} query tokens; split the batch, "
+        f"shorten the context, or chunk the prefill."
+    )
+
+
 def fmha_sm100_plan(
     qo_segment_lens: torch.Tensor,
     kv_segment_lens: torch.Tensor,
@@ -1084,6 +1116,7 @@ def fmha_sm100(
         output was disabled.  When both decode and prefill sub-plans are used,
         outputs are concatenated back into the original batch order.
     """
+    _check_qo_int32_addressable(q)
     has_mixed_prefill, split, batch_size, decode, prefill = plan_info
     if not has_mixed_prefill:
         return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)

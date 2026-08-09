@@ -1148,6 +1148,21 @@ while (kWarps_pick &gt; 1 &amp;&amp; (kWarps_pick * per_warp_smem) * 2 &gt; 228*
   4 个 batch）；补上 top-k 的 radix-sort 路径以突破 12288 块。</p>
 </div>
 
+<div class="card bad">
+  <div class="title">512K 那一列的 dense 分母作废</div>
+  <p>重跑全网格后发现，<b>dense 参照组在 512K prefill 会非法访存</b>。
+  <code>total_qo_len × num_qo_heads × head_dim = 524288 × 32 × 128 = 2,147,483,648</code>，
+  <b>正好等于 2³¹</b>——和 §8 里 indexer 那条 Int32 守卫是同一类问题，只是这次在
+  dense/attention 路径上，原本没有守卫。实测边界：262144 与 458752 正常，524288 每次都崩。</p>
+  <p><b>最坏的性质是它不总是崩。</b>完整 run 里 dense@512K 报出 1739.684 ms 并写进了表格，
+  而同一 shape 在干净进程里三次全崩（真实 Q/K 与随机 Q/K 都一样）。区别只在分配器状态，
+  这正是 2³¹ 边界问题的典型表现：是否触发取决于基址而非数值。
+  <b>所以上面各表 512K 那一列的分母不可信，应当作废。</b></p>
+  <p>已在 <code>fmha_sm100()</code> 入口按 <code>q.shape</code> 加守卫，把非法访存换成带诊断的
+  <code>ValueError</code>。验证后 512K 干净报错且 <b>CUDA context 存活</b>——
+  之前一个坏 shape 会污染 context、带走整场扫描的后续全部配置。</p>
+</div>
+
 <!-- ===================================================================== -->
 <h2 id="s7e"><span class="num">7e</span>KV-outer 后端对比（<code>fireworks-msa</code> 分支）</h2>
 
