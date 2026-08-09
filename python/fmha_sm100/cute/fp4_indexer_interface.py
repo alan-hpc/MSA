@@ -45,6 +45,23 @@ _FP4_COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 #: element is ``2**31 - 1``.
 _SCORE_TENSOR_MAX_ELEMS = 2**31
 
+#: Query chunk for causal prefill scoring.  The compact causal schedule decodes
+#: each CTA's flat task id into (q_tile, k_group) by walking q tiles from zero,
+#: so its cost per CTA is proportional to the number of q tiles in the call and
+#: the total is O(S^3) against O(S^2) of arithmetic.  Splitting the queries caps
+#: that walk without changing the result: chunk j covers queries [lo, hi) against
+#: keys [0, hi + causal_offset), which is exactly the causal extent those queries
+#: had unchunked.  Measured on B300 at Hkv=4/D=128 (128K and 256K causal):
+#:
+#:      chunk    32K     16K     8K      4K      2K     unchunked
+#:      128K   11.19    8.60   7.39    9.17   13.08      35.09 ms
+#:      256K   42.12   24.22  23.98   27.88   35.98     257.68 ms
+#:
+#: 8192 is the floor at both: larger leaves the walk too long, smaller pays more
+#: launches and re-reads K more often.  (A DSA-style FP8 indexer fixes this at
+#: 4096 for the same reason.)  0 disables chunking.
+_DEFAULT_Q_CHUNK = 8192
+
 
 def _device_arch(device: torch.device) -> tuple[int, int]:
     major, minor = torch.cuda.get_device_capability(device)
@@ -801,6 +818,7 @@ def fp4_indexer_block_scores(
     causal: bool = False,
     qo_offset: Optional[torch.Tensor] = None,
     scale_layout: str = _PREORDERED_MMA_SCALE_LAYOUT,
+    q_chunk: int = _DEFAULT_Q_CHUNK,
 ) -> torch.Tensor:
     """Return FP4 QK max scores per 128-token KV page.
 
@@ -988,20 +1006,37 @@ def fp4_indexer_block_scores(
             use_tmem_load_red=use_tmem_load_red,
         )
         return scores
+    # Chunking only helps -- and is only correct as written -- on the compact
+    # causal prefill path with a single request: the chunk's causal extent is
+    # expressed by shrinking cu_seqlens_k, which assumes one contiguous KV run.
+    chunk_len = 0
+    if (causal and has_qo_offset == 0 and batch == 1 and int(q_chunk) > 0
+            and total_q > int(q_chunk)):
+        chunk_len = int(q_chunk)
+
     prefill_compact_task_count = 0
     prefill_compact_schedule = False
     if causal and has_qo_offset == 0:
         k_tiles_per_cta = k_tiles_per_cta_for(causal)
-        q_tile_count = ceil_div(m_extent, _MMA_TILER_MN[0])
+        # Decide the schedule from the shape a *chunk* presents, since that is
+        # what each launch will actually see.
+        decide_q = min(chunk_len, m_extent) if chunk_len else m_extent
+        q_tile_count = ceil_div(decide_q, _MMA_TILER_MN[0])
         k_group_count = ceil_div(max_k_tiles, k_tiles_per_cta)
         rectangular_task_count = q_tile_count * k_group_count
         prefill_compact_task_count = min(
             rectangular_task_count,
-            _causal_compact_task_bound(m_extent, int(max_seqlen_k), k_tiles_per_cta),
+            _causal_compact_task_bound(decide_q, int(max_seqlen_k), k_tiles_per_cta),
         )
         prefill_compact_schedule = prefill_compact_task_count * 20 <= rectangular_task_count * 19
         if prefill_compact_schedule:
             scores.fill_(float("-inf"))
+        else:
+            # Without the compact schedule there is no walk to cap, and chunking
+            # would only add launches.
+            chunk_len = 0
+    else:
+        chunk_len = 0
     q_ptr = make_ptr(
         cutlass.Uint8,
         q_bytes.data_ptr(),
@@ -1062,55 +1097,97 @@ def fp4_indexer_block_scores(
         cute.AddressSpace.gmem,
         assumed_align=4,
     )
-    problem_size = (
-        Int32(m_extent),
-        Int32(n_aligned),
-        Int32(_HEAD_DIM),
-        Int32(batch * heads_q),
-        Int32(page_count * heads_k),
-        Int32(heads_q),
-        Int32(heads_k),
-        Int32(batch),
-        Int32(max_k_tiles),
-        Int32(total_q),
-        Int32(has_qo_offset),
-        Int32(prefill_compact_task_count),
-    )
     stream = cuda.CUstream(torch.cuda.current_stream(q_fp4.device).cuda_stream)
-    compiled = _compile_fp4_qk_kernel(
-        fmt=spec,
-        causal=causal,
-        preordered_q_scale_tma=use_preordered_q_scale_tma,
-        compact_schedule=prefill_compact_schedule,
-        device_arch=device_arch,
-        use_tmem_load_red=use_tmem_load_red,
-        q_ptr=q_ptr,
-        k_ptr=k_ptr,
-        q_scale_ptr=q_scale_ptr,
-        k_scale_ptr=k_scale_ptr,
-        scores_ptr=scores_ptr,
-        kv_indices_ptr=kv_indices_ptr,
-        cu_seqlens_q_ptr=cu_seqlens_q_ptr,
-        cu_seqlens_k_ptr=cu_seqlens_k_ptr,
-        cu_page_offsets_ptr=cu_page_offsets_ptr,
-        qo_offset_ptr=qo_offset_ptr,
-        problem_size=problem_size,
-        stream=stream,
+
+    def _launch(cu_q_p, cu_k_p, cu_pages_p, m_ext, n_align, task_count):
+        # max_k_tiles and total_q stay at their full values: they only size the
+        # score tensor's layout (stride ``max_k_tiles * total_q, total_q, 1``)
+        # and bound ``ktile``.  The kernel writes at ``q_begin + q_local``, and
+        # q_begin comes from cu_seqlens_q -- so passing absolute [lo, hi) puts a
+        # chunk's rows straight into the right columns of the full tensor, with
+        # no pointer arithmetic and no copy.
+        problem_size = (
+            Int32(m_ext),
+            Int32(n_align),
+            Int32(_HEAD_DIM),
+            Int32(batch * heads_q),
+            Int32(page_count * heads_k),
+            Int32(heads_q),
+            Int32(heads_k),
+            Int32(batch),
+            Int32(max_k_tiles),
+            Int32(total_q),
+            Int32(has_qo_offset),
+            Int32(task_count),
+        )
+        compiled = _compile_fp4_qk_kernel(
+            fmt=spec,
+            causal=causal,
+            preordered_q_scale_tma=use_preordered_q_scale_tma,
+            compact_schedule=prefill_compact_schedule,
+            device_arch=device_arch,
+            use_tmem_load_red=use_tmem_load_red,
+            q_ptr=q_ptr,
+            k_ptr=k_ptr,
+            q_scale_ptr=q_scale_ptr,
+            k_scale_ptr=k_scale_ptr,
+            scores_ptr=scores_ptr,
+            kv_indices_ptr=kv_indices_ptr,
+            cu_seqlens_q_ptr=cu_q_p,
+            cu_seqlens_k_ptr=cu_k_p,
+            cu_page_offsets_ptr=cu_pages_p,
+            qo_offset_ptr=qo_offset_ptr,
+            problem_size=problem_size,
+            stream=stream,
+        )
+        compiled(
+            q_ptr,
+            k_ptr,
+            q_scale_ptr,
+            k_scale_ptr,
+            scores_ptr,
+            kv_indices_ptr,
+            cu_q_p,
+            cu_k_p,
+            cu_pages_p,
+            qo_offset_ptr,
+            problem_size,
+            stream,
+        )
+
+    if chunk_len <= 0:
+        _launch(cu_seqlens_q_ptr, cu_seqlens_k_ptr, cu_page_offsets_ptr,
+                m_extent, n_aligned, prefill_compact_task_count)
+        return scores
+
+    # One [lo, hi, 0, k_hi, 0, pages_hi] descriptor per chunk, staged in a single
+    # host->device copy so the loop adds launches but not synchronisations.
+    causal_offset = int(max_seqlen_k) - total_q
+    bounds = []
+    for lo in range(0, total_q, chunk_len):
+        hi = min(lo + chunk_len, total_q)
+        k_hi = min(int(max_seqlen_k), hi + causal_offset)
+        bounds.append((lo, hi, k_hi, ceil_div(k_hi, _PAGE_SIZE)))
+    meta = torch.tensor(
+        [v for lo, hi, k_hi, pg in bounds for v in (lo, hi, 0, k_hi, 0, pg)],
+        dtype=torch.int32, device=q_fp4.device,
     )
-    compiled(
-        q_ptr,
-        k_ptr,
-        q_scale_ptr,
-        k_scale_ptr,
-        scores_ptr,
-        kv_indices_ptr,
-        cu_seqlens_q_ptr,
-        cu_seqlens_k_ptr,
-        cu_page_offsets_ptr,
-        qo_offset_ptr,
-        problem_size,
-        stream,
-    )
+    k_tiles_per_cta = k_tiles_per_cta_for(causal)
+    for i, (lo, hi, k_hi, _pg) in enumerate(bounds):
+        base = meta.data_ptr() + i * 6 * 4
+        cu_q_p = make_ptr(cutlass.Int32, base, cute.AddressSpace.gmem, assumed_align=4)
+        cu_k_p = make_ptr(cutlass.Int32, base + 2 * 4, cute.AddressSpace.gmem, assumed_align=4)
+        cu_pg_p = make_ptr(cutlass.Int32, base + 4 * 4, cute.AddressSpace.gmem, assumed_align=4)
+        clen = hi - lo
+        _launch(
+            cu_q_p, cu_k_p, cu_pg_p,
+            clen,
+            ceil_div(k_hi, _PAGE_SIZE) * _PAGE_SIZE,
+            min(
+                ceil_div(clen, _MMA_TILER_MN[0]) * ceil_div(max_k_tiles, k_tiles_per_cta),
+                _causal_compact_task_bound(clen, k_hi, k_tiles_per_cta),
+            ),
+        )
     return scores
 
 
