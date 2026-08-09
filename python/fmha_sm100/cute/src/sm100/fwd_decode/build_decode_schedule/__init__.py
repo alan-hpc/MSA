@@ -13,16 +13,32 @@ from torch.utils.cpp_extension import load
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_THIS_DIR, "build_decode_schedule.cu")
 
+# This extension needs exactly the build fixes build_k2q_csr already carries, so
+# it imports them instead of drifting from them.  Without the include shim it
+# fails on `cusparse.h: No such file or directory` -- torch's CUDAContextLight.h
+# pulls it in and a pip CUDA stack ships it only inside the wheels; and -arch was
+# pinned to sm_100, which makes a B300 (sm_103) run through PTX JIT.
+from ...build_k2q_csr import (  # noqa: E402
+    _cuda_arch_flag,
+    _nvidia_wheel_include_dirs,
+    _template_stub_flags,
+)
+
 _extra_cflags = ["-O3"]
-_extra_cuda_cflags = [
-    "-O3",
-    "--use_fast_math",
-    "-lineinfo",
-    "-arch=sm_100",
-    "--ptxas-options=-v",
-    "--expt-relaxed-constexpr",
-    "-I/usr/local/cuda/include/cccl",
-]
+
+
+def _cuda_flags():
+    return [
+        "-O3",
+        "--use_fast_math",
+        "-lineinfo",
+        _cuda_arch_flag(),
+        "--ptxas-options=-v",
+        "--expt-relaxed-constexpr",
+        "-I/usr/local/cuda/include/cccl",
+        *_template_stub_flags(),
+    ]
+
 
 _ext = None
 
@@ -34,7 +50,8 @@ def _load_ext():
             name="sparse_decode_schedule_ext",
             sources=[_SRC],
             extra_cflags=_extra_cflags,
-            extra_cuda_cflags=_extra_cuda_cflags,
+            extra_cuda_cflags=_cuda_flags(),
+            extra_include_paths=_nvidia_wheel_include_dirs(),
             verbose=False,
         )
     return _ext

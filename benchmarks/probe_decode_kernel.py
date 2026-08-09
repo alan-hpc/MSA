@@ -61,11 +61,11 @@ def reference(q_b, k_pages, v_pages, sel_b, page_size, scale, group):
     if not blocks:
         return torch.zeros((hq, d), device=q_b.device)
     idx = torch.tensor(blocks, device=q_b.device, dtype=torch.long)
-    k = k_pages[idx].reshape(-1, hkv, d).float()          # [T, Hkv, D]
-    v = v_pages[idx].reshape(-1, hkv, d).float()
+    k = k_pages[idx].reshape(-1, hkv, d).to(torch.float32)
+    v = v_pages[idx].reshape(-1, hkv, d).to(torch.float32)
     k = k.repeat_interleave(group, dim=1)
     v = v.repeat_interleave(group, dim=1)
-    s = torch.einsum("hd,thd->ht", q_b.float(), k) * scale
+    s = torch.einsum("hd,thd->ht", q_b.to(torch.float32), k) * scale
     p = torch.softmax(s, dim=-1)
     return torch.einsum("ht,thd->hd", p, v)
 
@@ -84,7 +84,10 @@ def main() -> int:
 
     from fmha_sm100.cute.interface import SparseDecodePagedAttentionWrapper
 
-    dev, dt = torch.device("cuda"), torch.bfloat16
+    # The paged decode kernel takes an FP8 e4m3 KV cache -- that is a real
+    # format requirement, not a guard: this path exists to read a quantised
+    # cache.  Q is FP8 too.
+    dev, dt = torch.device("cuda"), torch.float8_e4m3fn
     B, S, HQ, HKV, D = args.batch, args.kv_len, args.head_q, args.head_kv, args.dim
     group, scale = HQ // HKV, 1.0 / (D ** 0.5)
     page = args.blk
@@ -137,7 +140,7 @@ def main() -> int:
         ref = reference(q[b], k[b * npage_per_seq:(b + 1) * npage_per_seq],
                         v[b * npage_per_seq:(b + 1) * npage_per_seq],
                         sel[:, b] % npage_per_seq, page, scale, group)
-        c = torch.nn.functional.cosine_similarity(out[b].float(), ref, dim=-1)
+        c = torch.nn.functional.cosine_similarity(out[b].to(torch.float32), ref, dim=-1)
         worst = min(worst, float(c.min()))
         print(f"   请求 {b:>3}: cos 均值={float(c.mean()):.6f} 最差={float(c.min()):.6f}")
 

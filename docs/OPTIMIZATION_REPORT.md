@@ -777,49 +777,54 @@ indexer 的 Int32 分数张量（§2）与 blk=32/topk=32 的内存墙（§20）
 ---
 ---
 
-## 23. 🔴 decode 的「qhead_per_kv 必须是 16」是包装层守卫，不是内核限制
+## 23. 🔴 decode 快不起来的真正原因：前向内核本身没有实现
 
-本报告此前反复引用一条结论：模型的 `qhead_per_kv=8`，而 sparse paged decode 要求 16，
-所以 decode 只能走 prefill 内核，实测最好 0.39×。**这条结论的来源是一句 docstring，
-不是代码。** 追下去发现：
+本报告此前把 decode 的 0.39× 归因于「模型 `qhead_per_kv=8`，而 sparse paged decode
+要求 16」。**这个归因是错的**，来源是一句 docstring。逐层追下去，一共有四层：
 
-| 位置 | 实际约束 |
-|---|---|
-| `SparseDecodePagedAttentionWrapper.plan` docstring | 「requires num_qo_heads / num_kv_heads == 16 at run time」 |
-| `plan()` 的运行时校验 | **只检查 `head_dim==128` 和 `Hq % Hkv == 0`** |
-| CuTe 注意力内核 `fwd_decode/atten_fwd.py:97` | `qhead_per_kv not in (16, 8, 4, 2, 1)` 才报错 —— **8 是支持的** |
-| `decode_schedule.py:144` | `!= 16` → `NotImplementedError` ← **真正卡住的地方** |
+| # | 位置 | 性质 | 结果 |
+|---|---|---|---|
+| 1 | `sparse_decode_schedule_ext` 编译失败（`cusparse.h` 找不到） | **构建缺陷** | ✅ 已修，见下 |
+| 2 | `decode_schedule.py:144` `!= 16` | 守卫 | 放开后可继续 |
+| 3 | `build_decode_schedule.cu:529` `TORCH_CHECK(... == 16)` | 守卫 | 放开后可继续 |
+| 4 | `interface.py` run 路径 `!= _SUPPORTED_DECODE_QHEAD_PER_KV` | 守卫 | 放开后可继续 |
+| 5 | **`SM100 paged fp8 sparse decode forward is not implemented yet`** | **真的没实现** | 🔴 **到底了** |
 
-也就是说，限制既不在内核、也不在 API 校验，而是**调度构建器里的一句守卫**；
-而 `build_decode_schedule` 本身是把 head 数当参数收的。这与 §22 的 12288 上限
-是同一个形态：一句声明未被代码支撑。
+**结论：快速 decode 路径在本仓库里不存在。** 包装器、调度器、三层参数校验都在，
+CuTe 内核也接受 `qhead_per_kv in (16, 8, 4, 2, 1)`，**但前向内核是个占位**。
+`qhead_per_kv=16` 从来不是原因——把它改成 16 也一样跑不起来。
 
-**尚未验证。** 放宽守卫后测试卡在另一个问题上：
+前三层守卫我放开验证过、随后**撤回了**：它们只是把报错从"不支持 8"推到
+"没实现"，留着反而让人以为 16 就能用。修法应当是把第 2/3/4 层的报错文案
+改成指向第 5 层，而不是放宽它们。
 
-```
-sparse_decode_schedule_ext 编译失败
-  fatal error: cusparse.h: No such file or directory
-```
+### ✅ 已修：decode 调度扩展从未编译成功过
 
-这正是 §10 记过的容器头文件问题，但当时的修复只加在 `build_k2q_csr/__init__.py`，
-`sparse_decode_schedule_ext` 是**另一个扩展、另一套构建配置**，没被覆盖到。
-**所以这条 decode 路径在本容器里从未编译成功过**——这也解释了为什么它一直没被真正测过。
+`build_decode_schedule/__init__.py` 缺两样，都是 §10 已在 `build_k2q_csr` 修过的：
 
-### 下一步（按顺序）
+- 没有 `extra_include_paths` → `cusparse.h: No such file`
+  （torch 的 `CUDAContextLight.h` 引它，而 pip 版 CUDA 只把它放在 wheel 里）
+- `-arch=sm_100` 写死 → B300 是 sm_103，会走 PTX JIT
 
-1. **把 `_nvidia_wheel_include_dirs()` 的头文件补丁套到 decode 调度扩展的构建器上。**
-   §10 已有现成实现：只软链 CUDA_HOME 缺失的头，不要整目录加 `-I`（那会遮蔽
-   nvcc 自带的 `crt/host_runtime.h`）。
-2. 编译通过后，用 `benchmarks/probe_decode_kernel.py` 在 `qhead_per_kv=8` 下验正确性
-   （对 fp32 参考、只在选中块上做 attention）。**通过之前不要报任何 decode 性能数字。**
-3. 正确后再测延迟。带宽账在 §17：128K decode 只需读 0.78% 的 KV，
-   带宽下界约 0.008 ms，而当前 prefill 内核路径是 3.1 ms —— **差 380 倍的空间在这里**。
+现在改为复用 `build_k2q_csr` 的 `_nvidia_wheel_include_dirs()` /
+`_cuda_arch_flag()` / `_template_stub_flags()`，而不是各写一份。
+**这解释了为什么这条路径从未被真正跑到过**：它连编译都没成功。
 
-> 这是同一个模式第三次出现（§21 的串行扫描、§22 的 12288、本节）：
-> **一句写在注释或文档里的限制，代码并不支撑，而它挡住的是最大的那块收益。**
-> 遇到「不支持 X」时，先确认它是不是真的。
+### decode 要变快，需要什么
 
----
+按 §17 的带宽账：128K decode 只需读 0.78% 的 KV，带宽下界约 **0.008 ms**，
+而当前经 prefill 内核的路径是 **3.1 ms**——空间是 380×，但要拿到它必须
+**实现 SM100 paged fp8 sparse decode forward**。这是一个真实的内核工作项，
+不是放开某个开关。
+
+`benchmarks/probe_decode_kernel.py` 已备好：内核一旦存在，它在
+`qhead_per_kv=8` 下对 fp32 参考验正确性，并按"只读选中块"的口径报带宽。
+
+> 同一模式第三次出现（§21、§22、本节），但这次结论相反：
+> **前两次"文档写的限制"是假的，这次是真的——只是写错了地方。**
+> 真正的限制比文档说的更靠后、也更根本。
+
+
 ## 配置选择结论
 
 > **最终推荐（33 组网格 + FA4 分母）：`block=128, topk=8`（cfg24）。**
