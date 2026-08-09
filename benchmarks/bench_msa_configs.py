@@ -534,6 +534,10 @@ def _load_fa4(repo_path):
     return flash_attn_varlen_func
 
 
+def _ceil_div(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
 def _fa4_pick_num_splits(fa4_fn, run, *, batch, seqlen_q, seqlen_k, head_kv,
                          dry_ms, rep_ms):
     """Choose FA4's KV-split factor, or ``None`` when it is not a knob.
@@ -882,10 +886,15 @@ def main(argv=None) -> int:
             print(f"NOTE      : only {qkv_seqlen} real tokens available, so kv_len "
                   f"{', '.join(str(s) for s in over)} fall back to random Q/K "
                   f"(timing only — cosine is capped at {args.cos_max_seqlen}).")
-            if any(s <= args.cos_max_seqlen for s in over):
-                print("WARNING   : --cos-max-seqlen exceeds the real-token supply; "
-                      "cosine at those points would be measured on random Q/K and "
-                      "is not meaningful. Lower --cos-max-seqlen.")
+            if args.cos and args.cos_max_seqlen > qkv_seqlen:
+                # A cosine computed against random Q/K is not a weak measurement,
+                # it is a different measurement (random attention is near-uniform,
+                # so every selector scores ~0.33 instead of ~0.99).  Silently
+                # reporting it in the same column as the real ones would be worse
+                # than reporting nothing, so cap the column instead of warning.
+                print(f"NOTE      : capping --cos-max-seqlen {args.cos_max_seqlen} -> "
+                      f"{qkv_seqlen} so no cosine is computed on random Q/K.")
+                args.cos_max_seqlen = qkv_seqlen
         del cap
         torch.cuda.empty_cache()
     configs = list(iter_configs(args.configs))

@@ -32,7 +32,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def build_prompt_text(min_chars: int, *, allow_short: bool = False) -> str:
+def build_prompt_text(min_chars: int, *, allow_short: bool = True) -> str:
     """A long, non-repeating natural prompt built from this repo's own sources.
 
     Repeating one passage to reach the target length would manufacture
@@ -60,11 +60,11 @@ def build_prompt_text(min_chars: int, *, allow_short: bool = False) -> str:
         total += len(parts[-1])
         if total >= min_chars:
             break
-    if total < min_chars and not allow_short:
-        raise RuntimeError(
-            f"only gathered {total} chars, need {min_chars}. Ask for a shorter capture, "
-            f"or pass allow_short=True if the caller tiles the result (decode does)."
-        )
+    # Deliberately no shortfall check here.  Characters are not tokens — the
+    # ratio is corpus- and tokenizer-specific (~3.4 for this source, not the 4
+    # a caller would guess) — so rejecting on a character count rejects inputs
+    # that would in fact tokenise to enough.  The caller checks the real token
+    # count after tokenising, which is the only number that matters.
     return "".join(parts)
 
 
@@ -183,8 +183,27 @@ def capture_qk(model_path: str, *, seqlen: int, layer: int, device: torch.device
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    text = build_prompt_text(min_chars=seqlen * 4, allow_short=allow_short)
-    ids = tok(text, return_tensors="pt").input_ids[0, :seqlen]
+    # Over-ask: build_prompt_text stops at the first file past the target, so a
+    # generous target simply means "give me everything available".
+    text = build_prompt_text(min_chars=seqlen * 6)
+    all_ids = tok(text, return_tensors="pt").input_ids
+    if text and all_ids.numel() == 0:
+        # A checkpoint directory with no tokenizer files still yields a
+        # tokenizer object from AutoTokenizer — one that maps every input to the
+        # empty sequence.  Left unchecked it produces a zero-length capture and
+        # every downstream number is silently computed on random data instead.
+        present = sorted(
+            f for f in os.listdir(model_path)
+            if "tokenizer" in f or "vocab" in f or "merges" in f
+        )
+        raise RuntimeError(
+            f"the tokenizer at {model_path} produced 0 tokens from {len(text)} characters, "
+            f"so it cannot be used to build a real capture.\n"
+            f"tokenizer files present: {present or 'NONE — this checkpoint ships weights only'}\n"
+            f"Point --qk-model at a checkpoint that includes its tokenizer, or use "
+            f"--qk-source random (timing stays valid; the cosine table does not)."
+        )
+    ids = all_ids[0, :seqlen]
     if ids.numel() < seqlen:
         if not allow_short:
             raise RuntimeError(

@@ -190,6 +190,7 @@
       <li><a href="#s7b">head 模式的成本来源</a></li>
       <li><a href="#s7c">完整配置网格（33 组）</a></li>
       <li><a href="#s7d">Decode</a></li>
+      <li><a href="#s7e">KV-outer 分支对比</a></li>
       <li><a href="#s8">可优化点报告</a></li>
       <li><a href="#s9">交付物与复现</a></li>
     </ol>
@@ -1147,6 +1148,97 @@ while (kWarps_pick &gt; 1 &amp;&amp; (kWarps_pick * per_warp_smem) * 2 &gt; 228*
   4 个 batch）；补上 top-k 的 radix-sort 路径以突破 12288 块。</p>
 </div>
 
+<!-- ===================================================================== -->
+<h2 id="s7e"><span class="num">7e</span>KV-outer 后端对比（<code>fireworks-msa</code> 分支）</h2>
+
+<p><code>MiniMax-AI/MSA</code> 的 <code>fireworks-msa</code> 分支加了一个约 6000 行的
+<code>kvouter</code> 模块，用 <b>KV-stationary 循环 + LSE merge</b> 替换掉当前的
+<code>build_k2q_csr</code> + Q-outer forward。这正对着 §8 里那条最大的结构性问题：
+当前实现的 <code>O_partial = empty(topK, total_q, head_q, dim)</code> 让
+partial-O 流量 ∝ topk，而不是 ∝ 实际访问的 token 数。</p>
+
+<div class="card">
+  <div class="title">对比口径</div>
+  <ul>
+    <li>两侧用<b>同一份 <code>selected</code></b>、同一份 Q/K/V（两个 checkout 都提供
+      <code>fmha_sm100</code> 包，无法同进程导入，所以走两段式：双方用相同种子逐位重建
+      Q/K/V，只把 selection 和输出落盘交换）。</li>
+    <li><b>只比 stage 3–4。</b>FP4 indexer 与 top-k select 两侧完全相同，不计入任何一边。</li>
+    <li>KV-outer 有 <code>assert block_size == 128 and head_dim == 128</code>，
+      所以对比<b>只在 block=128 上成立</b>——正好是 §7c 推荐配置所在的那一列。</li>
+    <li>KV-outer 吃分页 KV cache，当前实现吃扁平 KV；打包是 setup，不计时。</li>
+    <li><b>跑的是 Python CuTe-DSL 后端</b>，因为容器里 <code>cpp_backend_available()</code>
+      为 False。分支自己把 AOT C++ 路径列为优先、Python 为 fallback，
+      所以下表<b>低估</b>了分支的真实水平，小 shape 上尤甚。</li>
+  </ul>
+</div>
+
+<p><b>正确性先行</b>：两侧输出 cos 全部为 <code>0.99999</code>，即数值等价——
+这保证下面比的是同一件事的两种算法，而不是两个不同的近似。</p>
+
+<div class="tablewrap"><table>
+  <thead><tr><th>kv_len</th><th>topk</th><th>csr</th><th>attn</th><th>q-outer 合计</th>
+    <th>kv-outer</th><th>加速比</th></tr></thead>
+  <tbody>
+    <tr><td>32K</td><td>4</td><td class='num'>0.155</td><td class='num'>0.877</td><td class='num'>1.032</td><td class='num'>1.537</td><td class='num' style='color:var(--bad)'>0.67×</td></tr>
+    <tr><td>32K</td><td>8</td><td class='num'>0.156</td><td class='num'>1.453</td><td class='num'>1.610</td><td class='num'>1.967</td><td class='num' style='color:var(--bad)'>0.82×</td></tr>
+    <tr><td>32K</td><td>16</td><td class='num'>0.179</td><td class='num'>2.424</td><td class='num'>2.603</td><td class='num'>2.802</td><td class='num' style='color:var(--bad)'>0.93×</td></tr>
+    <tr><td>32K</td><td>32</td><td class='num'>0.226</td><td class='num'>4.456</td><td class='num'>4.682</td><td class='num'>4.562</td><td class='num'>1.03×</td></tr>
+    <tr><td>64K</td><td>4</td><td class='num'>0.173</td><td class='num'>1.648</td><td class='num'>1.822</td><td class='num'>2.205</td><td class='num' style='color:var(--bad)'>0.83×</td></tr>
+    <tr><td>64K</td><td>8</td><td class='num'>0.179</td><td class='num'>2.708</td><td class='num'>2.886</td><td class='num'>3.075</td><td class='num' style='color:var(--bad)'>0.94×</td></tr>
+    <tr><td>64K</td><td>16</td><td class='num'>0.213</td><td class='num'>4.718</td><td class='num'>4.931</td><td class='num'>4.795</td><td class='num'>1.03×</td></tr>
+    <tr><td>64K</td><td>32</td><td class='num'>0.290</td><td class='num'>8.837</td><td class='num'>9.127</td><td class='num'>8.355</td><td class='num'>1.09×</td></tr>
+    <tr><td>128K</td><td>4</td><td class='num'>0.169</td><td class='num'>3.162</td><td class='num'>3.330</td><td class='num'>3.577</td><td class='num' style='color:var(--bad)'>0.93×</td></tr>
+    <tr><td>128K</td><td>8</td><td class='num'>0.194</td><td class='num'>5.277</td><td class='num'>5.470</td><td class='num'>5.314</td><td class='num'>1.03×</td></tr>
+    <tr><td>128K</td><td>16</td><td class='num'>0.283</td><td class='num'>9.379</td><td class='num'>9.662</td><td class='num'>8.773</td><td class='num'>1.10×</td></tr>
+    <tr><td>128K</td><td>32</td><td class='num'>0.532</td><td class='num'>17.546</td><td class='num'>18.077</td><td class='num'>15.972</td><td class='num'>1.13×</td></tr>
+    <tr><td>256K</td><td>4</td><td class='num'>0.300</td><td class='num'>6.288</td><td class='num'>6.588</td><td class='num'>6.308</td><td class='num'>1.04×</td></tr>
+    <tr><td>256K</td><td>8</td><td class='num'>0.388</td><td class='num'>10.555</td><td class='num'>10.943</td><td class='num'>9.810</td><td class='num'>1.12×</td></tr>
+    <tr><td>256K</td><td>16</td><td class='num'>0.605</td><td class='num'>18.776</td><td class='num'>19.381</td><td class='num'>16.863</td><td class='num'>1.15×</td></tr>
+    <tr><td>256K</td><td>32</td><td class='num'>0.997</td><td class='num'>35.328</td><td class='num'>36.324</td><td class='num'>31.490</td><td class='num'>1.15×</td></tr>
+  </tbody>
+</table></div>
+
+<div class="card">
+  <div class="title">结论：优势沿对角线出现，且和推荐配置错位</div>
+  <ol>
+    <li><b>KV-outer 赢在长上下文 + 大 topk。</b>32K 要 topk≥32 才追平，256K 从 topk=4
+      就领先，最高 1.15×。交叉线大致是一条对角线：上下文每翻一倍，追平所需的 topk 减半。</li>
+    <li><b>短上下文 + 小 topk 反而慢，最差 0.67×。</b>KV-outer 的 index build 与 LSE merge
+      是固定开销，小规模摊不掉——而这部分很可能就是 Python fallback 的 dispatch 开销，
+      C++ 路径下未必成立。</li>
+    <li><b>和 §7c 的推荐配置错位。</b>本仓库的扫描结论是「往大 block、小 topk 走」
+      （cfg24 = blk128/topk8）。而 KV-outer 恰恰在<b>大 topk</b> 上收益最大，
+      在 topk=8 这一列只有 1.03×（128K）到 1.12×（256K）。
+      换句话说：<b>它没有改变最优配置的位置，只是把远离最优点那一侧的惩罚变轻了。</b></li>
+    <li><b>topk 的伸缩性确实改善了，但没有质变。</b>topk 从 4 涨到 32（8× 的 KV 读取量），
+      q-outer 耗时涨 4.5–5.5×，KV-outer 涨 3.0–5.0×。两者都低于 8×，说明小 topk 侧
+      都是被固定开销主导的；KV-outer 只是把 topk 相关的那部分斜率压低，
+      并没有把 partial-O 的代价完全消掉。</li>
+  </ol>
+  <p><b>因此这条分支值得合，但它不是 §8 里 #1 优先级的答案。</b>
+  在推荐工作点（blk128/topk8）上它带来 1.03–1.12×，而同一位置 indexer 占了
+  长上下文下流水线的 72%——收益量级差一个数量级。真正的顺序仍是：
+  先修 indexer 的超二次增长，再考虑换 forward。</p>
+</div>
+
+<div class="card warn">
+  <div class="title">跑通分支遇到的三个版本问题（都不是分支的 bug）</div>
+  <ol>
+    <li><code>cute.core.ThrMma</code> 与 <code>cute.make_fragment</code> 在容器装的
+      cutlass-dsl <b>4.6.0</b> 里都已移除（本仓库 main 的 <code>047c25b</code> 修的是同一件事），
+      而分支 pin 的是 4.5.1。</li>
+    <li>分支要 <code>flash-attn-4==4.0.0b15</code>；手头的 FA4 checkout 版本不符，
+      报 <code>FlashAttentionForwardSm100.__init__() got an unexpected keyword argument 'is_persistent'</code>。</li>
+    <li>b15 自身也用 <code>cute.core.ThrMma</code>，整条依赖链锁死在 cutlass-dsl 4.5.x。</li>
+  </ol>
+  <p>最后没有去 patch 别人发布的 wheel，而是建了个 <code>--system-site-packages</code> 的 venv
+  装上分支声明的版本（cutlass-dsl 4.5.1 / quack 0.4.1 / flash-attn-4 b15），
+  让分支跑在它自己的依赖上，并撤回了我为 4.6.0 临时打的补丁。
+  复现命令见 <code>benchmark.sh</code> 的 <code>KVOUTER_PATH</code> / <code>KVOUTER_PYTHON</code>。</p>
+</div>
+
+<!-- ===================================================================== -->
 <!-- ===================================================================== -->
 <h2 id="s8"><span class="num">8</span>可优化点报告</h2>
 

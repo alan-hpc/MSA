@@ -45,6 +45,10 @@
 #   COS         set empty to skip the cosine table      (default 1)
 #   FA4_PATH    flash-attention checkout (FA4 reference)  (default ../flash-attention)
 #   NO_FA4      set to 1 to skip the FA4 reference row
+#   KVOUTER_PATH     fireworks-msa checkout; empty skips the KV-outer A/B
+#   KVOUTER_PYTHON   interpreter with the branch's pinned deps (default PYTHON)
+#   KVOUTER_FA4_PATH FA4 checkout for the KV-outer role, if not already importable
+#   KVOUTER_SEQLENS / KVOUTER_TOPKS   A/B grid (block is fixed at 128 by the branch)
 #   COS_MAX_SEQLEN  cosine only at or below this kv_len  (default 32768)
 #   QK_SOURCE   'model' | 'random'                       (default model: real layer Q/K/V)
 #   QK_MODEL    checkpoint for QK_SOURCE=model           (default <checkpoint>)
@@ -75,6 +79,11 @@ DECODE="${DECODE:-1}"
 DECODE_SEQLENS="${DECODE_SEQLENS:-32768,131072,524288}"
 DECODE_BATCH="${DECODE_BATCH:-32}"
 FA4_PATH="${FA4_PATH:-../flash-attention}"
+KVOUTER_PATH="${KVOUTER_PATH:-}"
+KVOUTER_PYTHON="${KVOUTER_PYTHON:-}"
+KVOUTER_FA4_PATH="${KVOUTER_FA4_PATH:-}"
+KVOUTER_SEQLENS="${KVOUTER_SEQLENS:-32768,65536,131072,262144}"
+KVOUTER_TOPKS="${KVOUTER_TOPKS:-4,8,16,32}"
 NO_FA4="${NO_FA4:-}"
 
 if [[ "${QUICK:-0}" == "1" ]]; then
@@ -270,11 +279,44 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+section "3c. KV-outer backend A/B (fireworks-msa branch)"
+# -----------------------------------------------------------------------------
+if [[ -z "$KVOUTER_PATH" ]]; then
+    echo "SKIPPED (KVOUTER_PATH= ) — set it to a fireworks-msa checkout to run this."
+    echo "The branch replaces the selection-consuming half of the pipeline (CSR build +"
+    echo "Q-outer forward) with a KV-stationary loop plus an LSE merge, which is the"
+    echo "structural answer to the partial-O traffic reported in the optimisation report."
+else
+    echo "Same selection, same Q/K/V, same shapes; only stages 3-4 differ."
+    echo "checkout : $KVOUTER_PATH"
+    echo "python   : ${KVOUTER_PYTHON:-$PYTHON} (the branch pins cutlass-dsl 4.5.x / flash-attn-4 b15)"
+    echo "NOTE     : KV-outer asserts block_size==128 and head_dim==128, so the A/B is"
+    echo "           only defined at block=128 — which is where the sweep's recommended"
+    echo "           configuration already sits."
+    echo
+    rm -rf "$OUT_DIR/kvab" && mkdir -p "$OUT_DIR/kvab"
+    "$PYTHON" benchmarks/bench_kvouter.py --role qouter \
+        --exchange "$OUT_DIR/kvab" --model "$MODEL" \
+        --seqlens "$KVOUTER_SEQLENS" --topks "$KVOUTER_TOPKS" \
+        --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
+        || echo "q-outer role reported failures"
+    "${KVOUTER_PYTHON:-$PYTHON}" benchmarks/bench_kvouter.py --role kvouter \
+        --exchange "$OUT_DIR/kvab" --model "$MODEL" \
+        --seqlens "$KVOUTER_SEQLENS" --topks "$KVOUTER_TOPKS" \
+        --kvouter-path "$KVOUTER_PATH" ${KVOUTER_FA4_PATH:+--fa4-path "$KVOUTER_FA4_PATH"} \
+        --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
+        || echo "kv-outer role reported failures"
+    "$PYTHON" benchmarks/summarise_kvouter.py "$OUT_DIR/kvab" || true
+fi
+
+# -----------------------------------------------------------------------------
 section "4. Summary — comparison tables"
 # -----------------------------------------------------------------------------
-"$PYTHON" - "$OUT_DIR/sweep.csv" <<'PYSUM'
-import csv, sys
+QK_SOURCE="$QK_SOURCE" "$PYTHON" - "$OUT_DIR/sweep.csv" <<'PYSUM'
+import csv, os, sys
 from collections import OrderedDict
+
+QK_SOURCE = os.environ.get("QK_SOURCE", "random")
 
 rows = list(csv.DictReader(open(sys.argv[1])))
 if not rows:
@@ -362,9 +404,11 @@ emit(f"Table 1b  single-operator speedup vs {REF_LABEL} (>1 = sparse faster)",
 if any(f(r, "cos_mean") is not None for r in rows):
     emit("Table 2  output cosine similarity vs dense gqa (per (token, head) vector, averaged)",
          "note: selections come from exact block scores over these very Q/K; 1.0000 == identical to dense.\n"
-         "      Q/K here are random, so the attention is near-uniform and top-k can only capture\n"
-         "      roughly its token-budget share of the mass -- read these as a pessimistic floor.\n"
-         "      For selection quality on a trained checkpoint see benchmarks/eval_msa_selection_quality.py.",
+         + ("      Q/K are a real layer's post-RoPE activations, so these are the cosines a\n"
+            "      deployed model would see." if QK_SOURCE == "model" else
+            "      Q/K here are random, so the attention is near-uniform and top-k can only capture\n"
+            "      roughly its token-budget share of the mass -- read these as a pessimistic floor.")
+         + "\n      For selection quality on a trained checkpoint see benchmarks/eval_msa_selection_quality.py.",
          lambda r, s: (f"{f(r, 'cos_mean'):>9.4f}"
                        if (r is not None and not r.get("errors")
                            and f(r, "cos_mean") is not None)
