@@ -119,28 +119,62 @@ def capture_qk(model_path: str, *, seqlen: int, layer: int, device: torch.device
     head_q = int(cfg["num_attention_heads"])
     head_kv = int(cfg["num_key_value_heads"])
 
-    prefix = f"model.layers.{layer}.self_attn."
-    wanted = {
-        "embed": "model.embed_tokens.weight",
-        "in_norm": f"model.layers.{layer}.input_layernorm.weight",
-        "q_proj": prefix + "q_proj.weight",
-        "k_proj": prefix + "k_proj.weight",
-        "v_proj": prefix + "v_proj.weight",
-        "q_norm": prefix + "q_layernorm.weight",
-        "k_norm": prefix + "k_layernorm.weight",
-    }
-    got: dict[str, torch.Tensor] = {}
-    for shard in sorted(glob.glob(os.path.join(model_path, "*.safetensors"))):
+    # Checkpoints disagree on two independent things: whether tensors carry a
+    # "model." prefix, and whether the QK norms are called q_layernorm/k_layernorm
+    # or q_norm/k_norm.  Both variants are common, and hard-coding one turns a
+    # perfectly usable checkpoint into a wall of "missing tensors".  Accept any
+    # combination, and report what was actually present when none of them match.
+    _MODEL_PREFIXES = ("model.", "")
+    _QK_NORM_NAMES = ("q_layernorm", "k_layernorm"), ("q_norm", "k_norm")
+
+    def _candidates(mp, qn, kn):
+        pre = f"{mp}layers.{layer}."
+        return {
+            "embed": [f"{mp}embed_tokens.weight"],
+            "in_norm": [pre + "input_layernorm.weight"],
+            "q_proj": [pre + "self_attn.q_proj.weight"],
+            "k_proj": [pre + "self_attn.k_proj.weight"],
+            "v_proj": [pre + "self_attn.v_proj.weight"],
+            "q_norm": [pre + f"self_attn.{qn}.weight"],
+            "k_norm": [pre + f"self_attn.{kn}.weight"],
+        }
+
+    shards = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if not shards:
+        raise RuntimeError(f"no *.safetensors under {model_path}")
+    shard_keys = {}
+    for shard in shards:
         with safe_open(shard, framework="pt", device="cpu") as fh:
-            keys = set(fh.keys())
-            for name, key in wanted.items():
-                if name not in got and key in keys:
-                    got[name] = fh.get_tensor(key)
+            shard_keys[shard] = set(fh.keys())
+    available = set().union(*shard_keys.values())
+
+    wanted = None
+    for mp in _MODEL_PREFIXES:
+        for qn, kn in _QK_NORM_NAMES:
+            cand = {n: keys[0] for n, keys in _candidates(mp, qn, kn).items()}
+            if all(k in available for k in cand.values()):
+                wanted = cand
+                break
+        if wanted is not None:
+            break
+    if wanted is None:
+        sample = sorted(k for k in available if f"layers.{layer}." in k)[:12]
+        raise RuntimeError(
+            f"layer {layer}: could not resolve q/k/v projections in {model_path} under any "
+            f"known naming convention (model. prefix optional, q_layernorm/q_norm both tried).\n"
+            f"tensors present for this layer: {sample or sorted(available)[:12]}"
+        )
+
+    got: dict[str, torch.Tensor] = {}
+    for shard in shards:
+        need = [n for n, key in wanted.items() if n not in got and key in shard_keys[shard]]
+        if not need:
+            continue
+        with safe_open(shard, framework="pt", device="cpu") as fh:
+            for name in need:
+                got[name] = fh.get_tensor(wanted[name])
         if len(got) == len(wanted):
             break
-    missing = [n for n in wanted if n not in got]
-    if missing:
-        raise RuntimeError(f"layer {layer}: missing tensors {[wanted[m] for m in missing]}")
 
     head_dim = got["q_proj"].shape[0] // head_q
     if got["k_proj"].shape[0] // head_kv != head_dim:

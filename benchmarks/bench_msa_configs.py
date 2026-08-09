@@ -857,19 +857,35 @@ def main(argv=None) -> int:
     fa4_fn = None if args.no_fa4 else _load_fa4(args.fa4_path)
 
     qkv = None
+    qkv_seqlen = None
     if args.qk_source == "model":
         from real_qk import capture_qk  # noqa: PLC0415
 
-        # Decode tiles K/V across the batch, so a capture shorter than the
-        # longest context is fine there; prefill needs the full span.
+        # Decode tiles K/V across the batch, so a short capture is always fine
+        # there.  Prefill needs the full span, and the amount of real text on
+        # hand is finite — but refusing to run at all would throw away every
+        # shorter point too.  Capture what exists; points beyond it fall back to
+        # random Q/K and say so.  That is sound because real Q/K only matters
+        # for the cosine table (``--cos-max-seqlen``, far below this ceiling);
+        # kernel *latency* does not depend on the value distribution.
         cap = capture_qk(args.qk_model, seqlen=max(seqlens), layer=args.qk_layer,
-                         device=device, allow_short=(args.mode == "decode"))
+                         device=device, allow_short=True)
         qkv = tuple(t.to(dtype).contiguous() for t in (cap["q"], cap["k"], cap["v"]))
+        qkv_seqlen = int(cap["seqlen"])
         print(f"Q/K/V     : layer {args.qk_layer} of {args.qk_model} "
               f"(Hq={cap['head_q']} Hkv={cap['head_kv']} D={cap['head_dim']}, "
-              f"{cap['seqlen']} real tokens captured"
-              + ("; tiled across the batch for longer contexts)" if cap['seqlen'] < max(seqlens)
+              f"{qkv_seqlen} real tokens captured"
+              + ("; tiled across the batch for longer contexts)" if args.mode == "decode"
                  else ")"))
+        if args.mode != "decode" and qkv_seqlen < max(seqlens):
+            over = [s for s in seqlens if s > qkv_seqlen]
+            print(f"NOTE      : only {qkv_seqlen} real tokens available, so kv_len "
+                  f"{', '.join(str(s) for s in over)} fall back to random Q/K "
+                  f"(timing only — cosine is capped at {args.cos_max_seqlen}).")
+            if any(s <= args.cos_max_seqlen for s in over):
+                print("WARNING   : --cos-max-seqlen exceeds the real-token supply; "
+                      "cosine at those points would be measured on random Q/K and "
+                      "is not meaningful. Lower --cos-max-seqlen.")
         del cap
         torch.cuda.empty_cache()
     configs = list(iter_configs(args.configs))
@@ -917,6 +933,12 @@ def main(argv=None) -> int:
         print(f"\n### kv_len={seqlen_k} q_len={seqlen_q} batch={args.batch}")
         print_header()
 
+        # Prefill consumes the capture as a contiguous prefix, so a point longer
+        # than the capture has to use random Q/K; decode tiles it and never does.
+        qkv_here = qkv
+        if qkv is not None and args.mode != "decode" and qkv_seqlen < seqlen_k:
+            qkv_here = None
+
         dense_ms = None
         dense_out = None
         if not args.no_dense:
@@ -925,7 +947,7 @@ def main(argv=None) -> int:
                     model=model, batch=args.batch, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
                     dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
                     seed=args.seed, timing=args.timing,
-                    want_output=args.cos and seqlen_k <= args.cos_max_seqlen, qkv=qkv)
+                    want_output=args.cos and seqlen_k <= args.cos_max_seqlen, qkv=qkv_here)
                 dense_ms = dense["pipeline_gpu_ms"]
                 rows.append(dense)
                 print_row(dense)
@@ -939,7 +961,7 @@ def main(argv=None) -> int:
                         fa4_fn, model=model, batch=args.batch, seqlen_q=seqlen_q,
                         seqlen_k=seqlen_k, dtype=dtype, device=device,
                         dry_ms=args.dry_ms, rep_ms=args.rep_ms, seed=args.seed,
-                        timing=args.timing, qkv=qkv)
+                        timing=args.timing, qkv=qkv_here)
                     rows.append(fa4_row)
                     print_row(fa4_row, dense_ms)
                 except Exception as exc:  # noqa: BLE001
@@ -952,7 +974,7 @@ def main(argv=None) -> int:
                     cfg, model=model, batch=args.batch, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
                     dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
                     indexer_mode=args.indexer_mode, seed=args.seed,
-                    timing=args.timing, dense_out=dense_out, qkv=qkv,
+                    timing=args.timing, dense_out=dense_out, qkv=qkv_here,
                 )
             except Exception as exc:  # noqa: BLE001 - never abort the sweep
                 row = {**cfg.to_dict(), "batch": args.batch, "seqlen_q": seqlen_q,
