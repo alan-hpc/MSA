@@ -363,6 +363,58 @@ def _auto_chunk_q(model, seqlen_k: int) -> int:
     return max(1, _SCORE_TENSOR_MAX_ELEMS // denom)
 
 
+#: build_k2q_csr keeps a 2-byte histogram entry per CSR row in shared memory.
+_CSR_MAX_ROWS = 116224
+#: The FP4 scale-reorder kernel's own 32-bit indexing limit.
+_SCALE_REORDER_MAX_ELEMS = 2**30
+#: nvfp4 scale groups per 128-token page row.
+_SCALE_GROUPS = 8
+
+
+def _auto_chunk_batch(cfg, model, seqlen_k, batch):
+    """Largest batch group that clears the two limits that scale with batch.
+
+    Both bind on ``batch * blocks``: the CSR builder's shared-memory histogram
+    (one 2-byte counter per row, rows = batch * ceil(S/blk)) and the scale
+    reorder's 32-bit indexing.  Decode reaches them because it multiplies the
+    context by the batch where prefill runs one request at a time -- so the
+    context is not what makes them bind, the batch is, and splitting it is the
+    direct fix.  The CSR of one request is independent of another's, so this is
+    exact, not an approximation.
+    """
+    blocks = cfg.num_blocks(seqlen_k)
+    pages = (seqlen_k + 127) // 128
+    sel_heads = cfg.num_selection_heads(model.num_kv_heads)
+    by_csr = _CSR_MAX_ROWS // max(1, blocks)
+    per_seq_scale = pages * sel_heads * 128 * _SCALE_GROUPS
+    by_scale = (_SCALE_REORDER_MAX_ELEMS - 1) // max(1, per_seq_scale)
+    return max(1, min(batch, by_csr, by_scale))
+
+
+def _merge_batch(rows, *, batch, chunk_batch):
+    """Fold per-batch-group rows into one.  Stage costs add; the groups are
+    independent requests, so the result is what the unsplit call would produce."""
+    base = dict(rows[0])
+    base.update({"batch": batch, "chunk_batch": chunk_batch, "num_batch_chunks": len(rows)})
+    stages, errors = {}, {}
+    for r in rows:
+        for name, st in r.get("stages", {}).items():
+            acc = stages.setdefault(name, {"ms": 0.0, "iters": 0})
+            acc["ms"] += st.get("ms", 0.0)
+            acc["iters"] = max(acc["iters"], st.get("iters", 0))
+        for k, v in r.get("errors", {}).items():
+            errors.setdefault(k, v)
+    base["stages"], base["errors"] = stages, errors
+    ok = not {k: v for k, v in errors.items() if k != "cos"}
+    base["supported"] = ok
+    total = sum(st["ms"] for st in stages.values()) if ok else None
+    base["pipeline_ms"] = base["pipeline_gpu_ms"] = total
+    base["attn_ms_only"] = stages.get("attn", {}).get("ms") if ok else None
+    for k in ("cos_mean", "cos_p1", "cos_min", "ms_host", "pipeline_host_ms"):
+        base.pop(k, None)
+    return base
+
+
 def _merge_chunked(rows, *, seqlen_q, seqlen_k, chunk_q):
     """Fold per-chunk rows into the single row the tables expect.
 
@@ -834,7 +886,7 @@ def write_csv(rows, path, *, quiet=False):
         "indexer_host_ms", "topk_host_ms", "csr_host_ms", "attn_host_ms",
         "selection_ms", "pipeline_ms", "pipeline_gpu_ms", "pipeline_host_ms", "attn_ms_only",
         "attn_tflops", "cos_mean", "cos_p1", "cos_min", "supported", "chunk_q",
-        "num_chunks", "errors",
+        "num_chunks", "chunk_batch", "num_batch_chunks", "errors",
     ]
     with open(path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
@@ -1109,13 +1161,34 @@ def main(argv=None) -> int:
                     row = _merge_chunked(parts, seqlen_q=seqlen_q, seqlen_k=seqlen_k,
                                          chunk_q=chunk)
                 else:
-                    row = bench_config(
-                        cfg, model=model, batch=args.batch, seqlen_q=seqlen_q,
-                        seqlen_k=seqlen_k,
-                        dtype=dtype, device=device, dry_ms=args.dry_ms, rep_ms=args.rep_ms,
-                        indexer_mode=args.indexer_mode, seed=args.seed,
-                        timing=args.timing, dense_out=dense_out, qkv=qkv_here,
-                    )
+                    # Decode multiplies context by batch, which is what makes the
+                    # CSR histogram and the scale reorder bind; split the batch so
+                    # each call stays under both.  Requests are independent, so
+                    # this is exact.
+                    cb = (_auto_chunk_batch(cfg, model, seqlen_k, args.batch)
+                          if args.mode == "decode" else args.batch)
+                    if cb < args.batch:
+                        parts = []
+                        for lo in range(0, args.batch, cb):
+                            n = min(cb, args.batch - lo)
+                            parts.append(bench_config(
+                                cfg, model=model, batch=n, seqlen_q=seqlen_q,
+                                seqlen_k=seqlen_k, dtype=dtype, device=device,
+                                dry_ms=args.dry_ms, rep_ms=args.rep_ms,
+                                indexer_mode=args.indexer_mode, seed=args.seed,
+                                timing=args.timing, dense_out=None, qkv=qkv_here,
+                            ))
+                            torch.cuda.empty_cache()
+                        row = _merge_batch(parts, batch=args.batch, chunk_batch=cb)
+                    else:
+                        row = bench_config(
+                            cfg, model=model, batch=args.batch, seqlen_q=seqlen_q,
+                            seqlen_k=seqlen_k,
+                            dtype=dtype, device=device, dry_ms=args.dry_ms,
+                            rep_ms=args.rep_ms,
+                            indexer_mode=args.indexer_mode, seed=args.seed,
+                            timing=args.timing, dense_out=dense_out, qkv=qkv_here,
+                        )
             except Exception as exc:  # noqa: BLE001 - never abort the sweep
                 row = {**cfg.to_dict(), "batch": args.batch, "seqlen_q": seqlen_q,
                        "seqlen_k": seqlen_k,
