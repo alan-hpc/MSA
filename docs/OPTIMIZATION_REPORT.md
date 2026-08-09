@@ -30,7 +30,9 @@
 | 9 | top-k 的 transpose workspace 是分数张量的额外一读一写 | 128K/block32/keep 下 8.6 GB 中转 | 📋 建议 |
 | 10 | wrapper 常量 host 开销约 0.21 ms/次（四级合计） | × 46 层 = **9.5 ms/前向**纯 CPU | 📋 建议 |
 | 11 | D=256 不支持 | **对 model-n32 不适用**；是 D=256 那类模型的阻塞项 | ⚪ 不适用 |
-| 12 | decode 路径要求 `qhead_per_kv=16` | 本模型是 8，只覆盖 prefill | 📋 建议 |
+| 12 | decode 被三条独立限制卡住（内核 `qhead_per_kv=16` / CSR SMEM / top-k 12288 块） | 实测最好 **0.41×**，从未赢过 dense；B=32 时 512K 与 1M 全部不可达 | 🔴 **推理侧缺口** |
+| 13 | 仓库自带 dense FMHA 只有 **55–64% MFU**，比 FA4 慢 13–28% | 用它当分母会把稀疏加速比虚高约 **1.15×**；已改用 FA4 作主基准 | ✅ 已换分母 |
+| 14 | `block=128` + 小 topk 是被漏掉的最优区间 | cfg24（blk128/k8）128K 下 **18.26×** @ cos 0.9899，优于 cfg07 的 10.94× @ cos 0.9897 | 📋 **首选配置** |
 
 ### 关键实测（batch=1, causal, bf16, GPU-only 单层时间）
 
@@ -58,6 +60,12 @@
 | 32K | 297.5 ms | 179.5 ms | 178.3 ms | −119.2 ms |
 | 64K | 1254.4 ms | 522.6 ms | 522.6 ms | −731.8 ms |
 | 128K | 5011.9 ms | 2229.0 ms | 2229.0 ms | **−2782.8 ms** |
+
+> **这两张表的分母是仓库自带的 dense FMHA，不是 FA4。** 后续接入 FlashAttention-4 作
+> 独立对照后测得：FA4 比仓库 dense 快 **13–28%**（FA4 1389–1781 TFLOPS，仓库 dense 只有
+> 55–64% MFU）。因此上表所有 "vs dense" 倍数按 FA4 分母应 **×0.87 左右**，交叉点相应右移。
+> 详见 §13。表内数值保留原样，因为它们是"稀疏 vs 本仓库 dense"这一问题的正确答案；
+> 只是不该被当成"稀疏 vs 最强 dense"来读。
 
 ---
 
@@ -237,14 +245,50 @@ compile-cache key 构造、输出分配、cute tensor 转换。
 
 ---
 
-## 9. 📋 decode 路径未覆盖
+## 9. 🔴 decode 被三条独立限制卡住
 
-`sparse_decode_atten_func` / `SparseDecodePagedAttentionWrapper` 硬性要求
-`qhead_per_kv=16` 且 `page_size=128`，model-n32 是 8，因此本轮只覆盖 prefill。
+decode（B=32, q_len=1）实测最好只有 **0.41×**，从来没赢过 dense。原因不是一条，是三条，
+必须分开处理：
+
+**(a) 走不到 decode 内核。** `sparse_decode_atten_func` /
+`SparseDecodePagedAttentionWrapper` 硬性要求 `qhead_per_kv=16` 且 `page_size=128`，
+model-n32 是 8。所以实测走的是 prefill 内核：`m_block_size=128` 打包 Q-head，
+`qhead_per_kv=8` 时一个 tile 只有 16 个 query token，B=32 总共 2 个 tile，SM 大量闲置。
+128K 下只选 1.6% 的 token，理论该快 60 倍，实测 attention 1.17 ms vs dense 1.21 ms。
+
+**(b) CSR builder 的 SMEM 直方图溢出（已加守卫，未根治）。**
+`build_k2q_csr.cu` 的降级循环有个下界缺陷：
+
+```cpp
+int per_warp_smem = ((total_rows + 1) >> 1) * sizeof(int);   // = total_rows × 2 字节
+int kWarps_pick = 4;
+while (kWarps_pick > 1 && (kWarps_pick * per_warp_smem) * 2 > 228*1024) {
+    kWarps_pick >>= 1;                    // 只降到 1 就停
+}
+```
+
+降到 1 warp 后退出，**但从不检查单 warp 的直方图是否还放得下**，
+`cudaFuncSetAttribute` 失败后向上只剩一句 `CUDA error: invalid argument`。
+精确边界 `total_rows × 2 B ≤ 227 KB` → **`total_rows ≤ 116,224`**，
+其中 `total_rows = batch × ⌈S/block⌉`。实测卡死在这条线上：512K/blk128
+B=28（114,688 行）跑通、B=32（131,072 行）失败。prefill 因 batch=1 从未暴露。
+现已在 `prepare_k2q_csr.py` 前置检查并报出行数/上限/绕行办法。
+**根治方案**：global-memory 直方图回退，或按 batch 分块——后者最廉价，
+且 512K/blk128 只差 4 个 batch。
+
+**(c) top-k 的 12288 块上限**（见 §10），blk=32 在 512K、blk=64 在 1M 直接不可达。
+
+三条叠加后 **B=32 decode 的可行域**：
+
+| ctx | blk=32 | blk=64 | blk=128 |
+|---|---|---|---|
+| 32K | ✓ | ✓ | ✓ |
+| 128K | ✗ csr（131,072 行） | ✓ | ✓ |
+| 512K | ✗ topk（16,384 块） | ✗ csr（262,144 行） | ✗ csr（131,072 行，B≤28 可过） |
+| 1M | ✗ topk | ✗ topk（16,384 块） | ✗ csr（262,144 行，B≤14 可过） |
 
 **这是推理侧的实际缺口**：长上下文服务的主要成本在 decode，而 decode 恰恰是稀疏收益
-最大的场景（每个 token 只看 topk×block 个 KV）。要落地必须先放开 `qhead_per_kv` 与
-`page_size` 的限制。
+最大的场景。优先级 (a) > (b) > (c)——(a) 决定有没有收益，(b)(c) 只决定跑不跑得起来。
 
 ---
 
@@ -252,7 +296,7 @@ compile-cache key 构造、输出分配、cute tensor 转换。
 
 | 项 | 说明 |
 |---|---|
-| `max_k_tiles < 12288` | top-k 内核只实现了插入排序路径。256K + block=32 = 8192 块尚可，512K 或 block=16 会超。radix-sort 路径在 fork 时被删掉了。 |
+| `max_k_tiles < 12288` | top-k 内核只实现了插入排序路径，radix-sort 路径在 fork 时被删掉了。`max_k_tiles = ⌈kv_len / block⌉`，与 batch 无关，所以按 block 换算可达上下文为 **blk32/64/128 → 393K / 786K / 1.5M token**。原断言把上限写成固定的 `12288 × 128` token，只在 block=128 时正确，已改为按 block 表述。 |
 | 容器构建适配（已修） | `-arch` 按设备能力取（B300 是 sm_103，原本固定 sm_100 要走 PTX JIT）；CUDA 12.8 起 `-static-global-template-stub` 默认值变更导致匿名 namespace 模板 kernel 编译失败；pip CUDA stack 的 `cusparse.h` 只在 wheel 里，但整目录加 `-I` 会遮蔽 nvcc 自带的 `crt/host_runtime.h`，改为只软链缺失的头。 |
 | benchmark 韧性（已修） | 长扫描中途遇到不可恢复的 CUDA 故障会污染 context 导致后续全挂；现在每行落盘一次、context 不可用时干净退出并保留已测数据。 |
 
@@ -315,10 +359,53 @@ MSA 本身不训练它，上表的质量数字用的是均值池化的未训练 
 
 ---
 
+## 13. ✅ dense 分母换成 FlashAttention-4
+
+只拿仓库自带的 dense FMHA 当分母，无法区分「加速来自稀疏」还是「分母太弱」。接入
+FA4（`flash_attn/cute`，CuTe-DSL，无需 nvcc 构建）作独立对照后：
+
+| | 仓库 dense FMHA | FA4 |
+|---|---|---|
+| MFU | 55–64% | — |
+| TFLOPS | — | 1389–1781 |
+| 相对快慢 | 基准 | **快 13–28%** |
+
+**结论**：仓库的 dense 内核本身有 36–45% 的性能留在桌上，这是一个独立于稀疏的优化点。
+所有对外报的加速比都应以 FA4 为分母；benchmark.sh 已默认跑 FA4 行（`NO_FA4=1` 关闭）。
+
+**decode 下的一个坑（已修）**：FA4 默认 `num_splits=1`，而 q_len=1 时工作量只分解成
+`batch × head_kv` 个 CTA（B=32/Hkv=4 → 128 个，不到一波），不切 KV 就跑不满机器，
+一度测出 FA4 比仓库 dense 慢（0.88×）——那是基准不公平，不是 FA4 慢。现已按
+`batch × head_kv` 与 SM 数实测挑选 `num_splits`，并把选中值记进结果行。
+
+---
+
+## 14. 📋 `block=128` + 小 topk 是被漏掉的最优区间
+
+最初的 12 组只覆盖 `block ∈ {32,64}`、`topk ∈ {16,32}`。把网格扩到 33 组
+（加 `block=128`、`topk ∈ {4,8}`）后，最优点整体移到了角落上：
+
+| 配置 | block | topk | 128K vs FA4 | cos |
+|---|---|---|---|---|
+| cfg07 | 64 | 16 | 10.94× | 0.9897 |
+| **cfg24**（=cfg17 同参） | **128** | **8** | **18.26×** | **0.9899** |
+
+**同等甚至更好的质量下快 1.67×。** 这是 §4 的直接推论：耗时跟 `topk` 走而不跟 token
+预算走，所以在固定预算（`block × topk`）下应当一路推向**大 block / 小 topk**。
+cos 由 token 预算决定、与 block/topk 如何拆分几乎无关（实测 2048 预算 → 0.9945–0.9946，
+1024 预算 → 0.9897–0.9903，跨配置差异在第 4 位小数），这条规律让这次外推是安全的。
+
+**注意**：大 block 同时缓解 §9 的两条 decode 限制（`total_rows` 和 `max_k_tiles` 都
+∝ 1/block），所以 `block=128` 在 decode 侧还有额外的可用性收益。
+
+---
+
 ## 配置选择结论
 
-> 按修正后的 `head_mode` 语义（`sum`/`max` 归约 keep 的 Hkv 行 → 1 份共享选择，
-> 打分器工作量与 keep 相同）重测全部 12 组 × 8 个上下文，无 n/a。
+> **最终推荐（33 组网格 + FA4 分母）：`block=128, topk=8`（cfg24）。**
+> 128K 下 **18.26× vs FA4**，cos 0.9899——比原先的 cfg07 快 1.67× 且质量不降。
+> 下面第 1–6 条是 12 组网格 + 仓库 dense 分母那一轮的结论，`head_mode` 与
+> `sum`/`max` 的取舍仍然成立，但速度倍数请按 §13 换算、最优 block/topk 以 §14 为准。
 
 1. **推荐生产配置：`force_init(128)-force_end(128)-block(64)-topk(16)-head(sum)`（cfg07）。**
    8 个上下文点全部最快或并列最快：16K 1.03×、32K 2.12×、64K 2.73×、128K 2.39× dense。

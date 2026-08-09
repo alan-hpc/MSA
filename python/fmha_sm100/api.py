@@ -1294,10 +1294,15 @@ def sparse_topk_select(
     # The kernel indexes rows by output head; everything below is per-output-head.
     num_qo_heads = num_out_heads
 
-    # v2.3 kernel only supports the insertion-sort path (K < 12288).
+    # v2.3 kernel only supports the insertion-sort path (K < 12288).  One "tile"
+    # here is one selectable KV block, so the reachable context is
+    # 12288 * block_size tokens — quoting a fixed token count would be wrong for
+    # every block size but the 128 the indexer happens to page at.
     assert max_k_tiles < 12288, (
         f"max_k_tiles={max_k_tiles} >= 12288: v2.3 kernel only supports K < 12288 "
-        f"(radix-sort path not yet implemented). kv_len must be < {12288 * 128} tokens."
+        f"(radix-sort path not yet implemented). max_k_tiles = ceil(kv_len / block_size), "
+        f"so this shape needs a larger block_size (or a shorter context) — "
+        f"block_size 32/64/128 reach 393216/786432/1572864 tokens respectively."
     )
 
     if num_valid_pages is not None:

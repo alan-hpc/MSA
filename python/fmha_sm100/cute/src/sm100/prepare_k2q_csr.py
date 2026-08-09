@@ -28,6 +28,37 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+#: The histogram stage keeps one packed int16 counter per CSR row per warp, in
+#: shared memory: ``per_warp_smem = ceil(total_rows / 2) * 4`` bytes, i.e. two
+#: bytes per row.  ``launch_pipeline`` halves its warp count until that fits two
+#: CTAs per SM, but it stops at one warp without checking that a single warp's
+#: histogram still fits the hardware limit — past that the launch fails with a
+#: bare ``cudaErrorInvalidValue``.  Catch it here, where the numbers can be
+#: explained.
+_CSR_SMEM_BYTES_PER_ROW = 2
+
+
+def _check_csr_smem_budget(total_rows: int, device) -> None:
+    if total_rows <= 0:
+        return
+    try:
+        limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    except (AttributeError, RuntimeError):
+        limit = 227 * 1024
+    needed = total_rows * _CSR_SMEM_BYTES_PER_ROW
+    if needed <= limit:
+        return
+    raise ValueError(
+        f"build_k2q_csr needs {needed / 1024:.0f} KB of shared memory for its row histogram "
+        f"({total_rows} CSR rows x {_CSR_SMEM_BYTES_PER_ROW} B), above this device's "
+        f"{limit / 1024:.0f} KB per-CTA limit.\n"
+        f"total_rows = batch * ceil(max_seqlen_k / blk_kv), so it grows with the batch — "
+        f"prefill (batch=1) rarely reaches it, decode does.\n"
+        f"Workarounds: a larger blk_kv, a smaller batch, or splitting the batch across calls. "
+        f"The kernel would need a global-memory histogram fallback to lift this."
+    )
+
+
 class SparseK2qCsrBuilderSm100:
     """Build the k2q CSR reverse index for sparse attention on SM100.
 
@@ -191,6 +222,7 @@ class SparseK2qCsrBuilderSm100:
                 return k2q_row_ptr, k2q_q_indices, schedule
             return k2q_row_ptr, k2q_q_indices
 
+        _check_csr_smem_budget(total_rows, q2k_indices.device)
         self._ensure_loaded()
         with torch.cuda.nvtx.range("SparseK2qCsr_Pipeline"):
             if schedule is None:

@@ -1102,9 +1102,26 @@ editable 安装、<code>git checkout</code>、容器 bind-mount 都会无意义�
   <div class="title">decode 走不通，而且是两个独立原因</div>
   <ol>
     <li><b>CSR builder 的 SMEM 直方图随 <code>total_rows = batch × ⌈S/block⌉</code> 爆掉。</b>
-      <code>k2q_hist_kernel</code> 在 shared memory 里开 <code>kWarps × total_rows</code> 的直方图，
-      B=32 时这个量是 prefill 的 32 倍。实测失败边界落在 6.5 万–13 万行之间，与 B300 每 CTA
-      227 KB 的 SMEM 上限（int16 打包约 11 万条目）吻合。这是 prefill 从未暴露过的限制。</li>
+      根因定位到 <code>build_k2q_csr.cu</code> 的降级循环本身：
+      <pre><code>int per_warp_smem = ((total_rows + 1) &gt;&gt; 1) * sizeof(int);   // = total_rows × 2 字节
+int kWarps_pick = 4;
+while (kWarps_pick &gt; 1 &amp;&amp; (kWarps_pick * per_warp_smem) * 2 &gt; 228*1024) {
+    kWarps_pick &gt;&gt;= 1;                    // 只降到 1 就停
+}</code></pre>
+      <code>kWarps_pick</code> 降到 1 后循环退出，<b>但从不检查单个 warp 的直方图是否还放得下</b>，
+      于是 <code>cudaFuncSetAttribute</code> 失败，向上只表现为一句
+      <code>CUDA error: invalid argument</code>。精确边界是
+      <code>total_rows × 2 B ≤ 227 KB</code>，即 <b><code>total_rows ≤ 116,224</code></b>。
+      实测卡在这条线上：512K/blk128 时 B=28（114,688 行）跑通、B=32（131,072 行）失败。
+      prefill 因为 batch=1、<code>total_rows</code> 只有 ⌈S/block⌉，从未暴露过这个限制。
+      现已在 <code>prepare_k2q_csr.py</code> 加了前置检查，报出具体行数、上限和绕行办法，
+      不再退化成 CUDA 通用错误。</li>
+    <li><b>blk=32 在 ≥512K 撞的是另一条限制，不是同一个。</b>
+      <code>sparse_topk_select</code> 只实现了插入排序路径，要求
+      <code>max_k_tiles = ⌈kv_len / block⌉ &lt; 12288</code>（radix-sort 路径未实现）。
+      按 block 换算可达上下文为 blk32/64/128 → 393K / 786K / 1.5M token。
+      两条限制叠加后，B=32 decode 的可行域是：32K 全通、128K 仅 blk≥64、
+      <b>512K 与 1M 全部不可达</b>。</li>
     <li><b>稀疏注意力在 decode 下拿不到收益。</b>128K/baseline 只选 2048/131072 ≈ 1.6% 的 token，
       理论该快 60 倍，实测 attention 阶段 1.17 ms vs dense 1.21 ms——几乎没省。
       原因是 prefill 内核 <code>m_block_size=128</code> 打包 Q-head，<code>qhead_per_kv=8</code> 时
@@ -1112,9 +1129,22 @@ editable 安装、<code>git checkout</code>、容器 bind-mount 都会无意义�
   </ol>
   <p>MSA 为此备了专用的 <code>sparse_decode_atten_func</code>，但它硬性要求
   <code>qhead_per_kv=16</code> 且 <code>page_size=128</code>——<b>model-n32 是 8，用不了</b>。
-  所以结论不是「decode 收益小」，而是<b>这个模型走不到那条 decode 内核上</b>。
-  要落地长上下文 decode，两件事都得做：放开 decode 内核的 <code>qhead_per_kv</code>，
-  以及把 CSR 直方图从 SMEM 挪到 global 或分块处理。</p>
+  所以结论不是「decode 收益小」，而是<b>这个模型走不到那条 decode 内核上</b>。</p>
+
+  <p><b>B=32 decode 的可行域</b>（✓ = 两条限制都过）：</p>
+  <div class="tablewrap"><table>
+    <thead><tr><th>ctx</th><th>blk=32</th><th>blk=64</th><th>blk=128</th></tr></thead>
+    <tbody>
+      <tr><td>32K</td><td>✓</td><td>✓</td><td>✓</td></tr>
+      <tr><td>128K</td><td>✗ csr（131,072 行）</td><td>✓</td><td>✓</td></tr>
+      <tr><td>512K</td><td>✗ topk（16,384 块）</td><td>✗ csr（262,144 行）</td><td>✗ csr（131,072 行，B≤28 可过）</td></tr>
+      <tr><td>1M</td><td>✗ topk</td><td>✗ topk（16,384 块）</td><td>✗ csr（262,144 行，B≤14 可过）</td></tr>
+    </tbody>
+  </table></div>
+
+  <p>要落地长上下文 decode，三件事都得做：放开 decode 内核的 <code>qhead_per_kv</code>；
+  把 CSR 直方图从 SMEM 挪到 global 或按 batch 分块（这条最廉价，且 512K/blk128 只差
+  4 个 batch）；补上 top-k 的 radix-sort 路径以突破 12288 块。</p>
 </div>
 
 <!-- ===================================================================== -->

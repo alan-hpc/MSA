@@ -224,6 +224,28 @@ def _graph_replay_ms(fn, *, warmup=3, iters=20):
         return None
 
 
+#: Torch appends four lines of generic advice to every CUDA error ("kernel errors
+#: might be asynchronously reported...", "consider passing CUDA_LAUNCH_BLOCKING=1",
+#: ...).  Repeated once per failing cell it buries the table it is annotating, and
+#: it says nothing the first line did not.  Keep the first line.
+_EXC_NOISE = (
+    "CUDA kernel errors might be asynchronously reported",
+    "For debugging consider passing CUDA_LAUNCH_BLOCKING",
+    "Compile with `TORCH_USE_CUDA_DSA`",
+    "Device-side assertion",
+)
+
+
+def _fmt_exc(exc: BaseException, *, limit: int = 400) -> str:
+    """One-line, de-boilerplated rendering of an exception for a table cell."""
+    lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
+    kept = [ln for ln in lines if not any(ln.startswith(n) for n in _EXC_NOISE)]
+    msg = " ".join(kept) if kept else (lines[0] if lines else "")
+    if len(msg) > limit:
+        msg = msg[: limit - 1] + "\u2026"
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
 def timed(fn, *, dry_ms, rep_ms, mode="simple"):
     """Latency of one operator.
 
@@ -385,7 +407,7 @@ def bench_config(
             del idx_in
             torch.cuda.empty_cache()
         except Exception as exc:  # noqa: BLE001 - one stage failing must not kill the sweep
-            row["errors"]["indexer"] = f"{type(exc).__name__}: {exc}"
+            row["errors"]["indexer"] = _fmt_exc(exc)
 
     # ---- stage: top-k selection -------------------------------------------
     # exact_block_scores assumes one self-attending sequence (q and k the same
@@ -421,7 +443,7 @@ def bench_config(
         torch.cuda.synchronize()
         row["stages"]["topk"] = timed(run_topk, dry_ms=dry_ms, rep_ms=rep_ms, mode=timing)
     except Exception as exc:  # noqa: BLE001
-        row["errors"]["topk"] = f"{type(exc).__name__}: {exc}"
+        row["errors"]["topk"] = _fmt_exc(exc)
         row["supported"] = False
         return row
 
@@ -438,7 +460,7 @@ def bench_config(
         torch.cuda.synchronize()
         row["stages"]["csr"] = timed(run_csr, dry_ms=dry_ms, rep_ms=rep_ms, mode=timing)
     except Exception as exc:  # noqa: BLE001
-        row["errors"]["csr"] = f"{type(exc).__name__}: {exc}"
+        row["errors"]["csr"] = _fmt_exc(exc)
         row["supported"] = False
         return row
 
@@ -459,7 +481,7 @@ def bench_config(
             row.update(output_cosine(out, dense_out))
         del out
     except Exception as exc:  # noqa: BLE001
-        row["errors"]["attn"] = f"{type(exc).__name__}: {exc}"
+        row["errors"]["attn"] = _fmt_exc(exc)
         row["supported"] = False
         return row
 
@@ -512,6 +534,50 @@ def _load_fa4(repo_path):
     return flash_attn_varlen_func
 
 
+def _fa4_pick_num_splits(fa4_fn, run, *, batch, seqlen_q, seqlen_k, head_kv,
+                         dry_ms, rep_ms):
+    """Choose FA4's KV-split factor, or ``None`` when it is not a knob.
+
+    Only worth doing for decode-shaped work; for prefill there is already ample
+    parallelism and ``num_splits=1`` is what FA4 wants.
+    """
+    import inspect
+
+    try:
+        if "num_splits" not in inspect.signature(fa4_fn).parameters:
+            return None
+    except (TypeError, ValueError):
+        return None
+    if seqlen_q > 8:
+        return 1
+
+    try:
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+    except Exception:  # noqa: BLE001
+        sms = 148
+    ctas = max(1, batch * head_kv)
+    kv_blocks = max(1, _ceil_div(seqlen_k, 128))
+    ceiling = min(kv_blocks, max(1, _ceil_div(sms * 4, ctas)))
+
+    best, best_ms = 1, None
+    cand, n = [], 1
+    while n <= ceiling:
+        cand.append(n)
+        n *= 2
+    for n in cand:
+        try:
+            run(n)
+            torch.cuda.synchronize()
+            ms = timed(lambda n=n: run(n), dry_ms=dry_ms, rep_ms=rep_ms,
+                       mode="simple")["ms"]
+        except Exception:  # noqa: BLE001 - an unsupported split is not fatal
+            torch.cuda.synchronize()
+            continue
+        if best_ms is None or ms < best_ms:
+            best, best_ms = n, ms
+    return best
+
+
 def bench_fa4(fa4_fn, *, model, batch, seqlen_q, seqlen_k, dtype, device,
               dry_ms, rep_ms, seed, timing="simple", want_output=False, qkv=None):
     """FlashAttention-4 on the same shapes — an independent dense reference.
@@ -529,13 +595,22 @@ def bench_fa4(fa4_fn, *, model, batch, seqlen_q, seqlen_k, dtype, device,
     cu_q = torch.arange(0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=device)
     cu_k = torch.arange(0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device=device)
 
-    def run():
+    def run(num_splits=None):
+        kw = {} if num_splits is None else {"num_splits": num_splits}
         return fa4_fn(q, k, v, cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
-                      max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k, causal=True)
+                      max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k, causal=True, **kw)
 
-    out = run()
+    # At q_len=1 the work decomposes into batch*head_kv CTAs — 128 of them at
+    # B=32/Hkv=4, under one wave on this GPU — so without a KV split FA4 leaves
+    # most of the machine idle and loses to a kernel it beats everywhere else.
+    # Splitting the KV dimension is what FA2/FA3/FA4 do for decode; pick the
+    # split the same way a serving stack would, by measuring.
+    split = _fa4_pick_num_splits(fa4_fn, run, batch=batch, seqlen_q=seqlen_q,
+                                 seqlen_k=seqlen_k, head_kv=head_kv,
+                                 dry_ms=dry_ms, rep_ms=rep_ms)
+    out = run(split)
     torch.cuda.synchronize()
-    stat = timed(run, dry_ms=dry_ms, rep_ms=rep_ms, mode=timing)
+    stat = timed(lambda: run(split), dry_ms=dry_ms, rep_ms=rep_ms, mode=timing)
     fa4_out = None
     if want_output:
         fa4_out = (out[0] if isinstance(out, (tuple, list)) else out).reshape(total_q, head_q, dim)
@@ -544,7 +619,9 @@ def bench_fa4(fa4_fn, *, model, batch, seqlen_q, seqlen_k, dtype, device,
                               head_q, True, stat["ms"])
     return {
         "name": "dense-fa4",
-        "label": "FlashAttention-4 causal (reference)",
+        "label": ("FlashAttention-4 causal (reference)" if split in (None, 1)
+                  else f"FlashAttention-4 causal (reference, num_splits={split})"),
+        "fa4_num_splits": split,
         "batch": batch, "seqlen_q": seqlen_q, "seqlen_k": seqlen_k,
         "head_q": head_q, "head_kv": head_kv, "head_dim": dim,
         "stages": {"attn": stat},
@@ -880,7 +957,7 @@ def main(argv=None) -> int:
             except Exception as exc:  # noqa: BLE001 - never abort the sweep
                 row = {**cfg.to_dict(), "batch": args.batch, "seqlen_q": seqlen_q,
                        "seqlen_k": seqlen_k,
-                       "errors": {"setup": f"{type(exc).__name__}: {exc}"}}
+                       "errors": {"setup": _fmt_exc(exc)}}
                 traceback.print_exc(limit=2)
             row["wall_s"] = round(time.time() - t0, 1)
             rows.append(row)
@@ -889,8 +966,8 @@ def main(argv=None) -> int:
             try:
                 torch.cuda.empty_cache()
             except Exception as exc:  # noqa: BLE001 - a poisoned context is fatal
-                print(f"\nFATAL: CUDA context is unusable after {cfg.resolved_name()}: "
-                      f"{type(exc).__name__}: {exc}")
+                print(f"\nFATAL: CUDA context is unusable after "
+                      f"{cfg.resolved_name()}: {_fmt_exc(exc)}")
                 print("Partial results have been written; rerun the remaining "
                       "configurations in a fresh process.")
                 flush()
