@@ -25,7 +25,7 @@
 # Usage
 # -----------------------------------------------------------------------------
 #   ./benchmark.sh                       # full run, results under results/<stamp>/
-#   SEQLENS=4096,32768 ./benchmark.sh    # custom context lengths
+#   SEQLENS=32768,131072 ./benchmark.sh  # custom context lengths
 #   MODEL=n16 ./benchmark.sh          # benchmark a different geometry
 #   CONFIGS=matrix ./benchmark.sh        # sweep only the 12 points, no baseline
 #   SKIP_TESTS=1 ./benchmark.sh          # skip the correctness gate
@@ -34,7 +34,7 @@
 # Environment:
 #   MODEL       target geometry (model-n32 | n16) (default model-n32)
 #   GPU         CUDA device index                       (default 0)
-#   SEQLENS     comma-separated KV lengths              (default 4096,8192,32768,65536,131072)
+#   SEQLENS     comma-separated KV lengths              (default 8192..1048576)
 #   BATCH       requests per measurement                (default 1)
 #   CONFIGS     'all' | 'matrix' | comma-separated list (default all)
 #   OUT_DIR     results directory                       (default results/<UTC stamp>)
@@ -58,7 +58,7 @@
 #   QK_MODEL    checkpoint for QK_SOURCE=model           (unset: falls back to random)
 #   QK_LAYER    which layer to read                      (default 0)
 #   DECODE      set empty to skip the decode sweep       (default 1)
-#   DECODE_SEQLENS / DECODE_BATCH                        (default 32768,131072,524288 / 32)
+#   DECODE_SEQLENS / DECODE_BATCH                        (default 8192..1048576 / 32)
 #   PYTHON      interpreter                             (default python3)
 # =============================================================================
 
@@ -80,7 +80,7 @@ QK_SOURCE="${QK_SOURCE:-model}"
 QK_MODEL="${QK_MODEL:-}"
 QK_LAYER="${QK_LAYER:-0}"
 DECODE="${DECODE-1}"    # likewise -- see COS above
-DECODE_SEQLENS="${DECODE_SEQLENS:-32768,131072,524288}"
+DECODE_SEQLENS="${DECODE_SEQLENS:-8192,16384,32768,65536,131072,262144,524288,1048576}"
 DECODE_BATCH="${DECODE_BATCH:-32}"
 FA4_PATH="${FA4_PATH:-../flash-attention}"
 PREFILL_CHUNK="${PREFILL_CHUNK:--1}"
@@ -92,13 +92,15 @@ KVOUTER_TOPKS="${KVOUTER_TOPKS:-4,8,16,32}"
 NO_FA4="${NO_FA4:-}"
 
 if [[ "${QUICK:-0}" == "1" ]]; then
-    SEQLENS="${SEQLENS:-4096,32768}"
+    SEQLENS="${SEQLENS:-8192,32768}"
     DRY_MS="${DRY_MS:-20}"
     REP_MS="${REP_MS:-60}"
 else
-    # 4096 is model-n32's configured training context; the longer points are
-    # where block-sparse attention is actually meant to pay off.
-    SEQLENS="${SEQLENS:-4096,8192,32768,65536,131072}"
+    # Sparse attention loses to dense below ~16K, so the grid starts at 8K --
+    # far enough down to show the crossover, without spending time on lengths
+    # where the answer is known and uninteresting.  The top two need query
+    # chunking (see PREFILL_CHUNK).
+    SEQLENS="${SEQLENS:-8192,16384,32768,65536,131072,262144,524288,1048576}"
     DRY_MS="${DRY_MS:-50}"
     REP_MS="${REP_MS:-200}"
 fi
