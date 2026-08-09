@@ -89,6 +89,26 @@ _CUTLASS_DIR = _PACKAGE_DIR / "cutlass"
 _CUTLASS_INCLUDE = _CUTLASS_DIR / "include"
 _CUTLASS_UTIL_INCLUDE = _CUTLASS_DIR / "tools" / "util" / "include"
 
+
+def _require_cutlass() -> None:
+    """Fail with the actual cause when the CUTLASS submodule is not checked out.
+
+    ``cutlass`` is a git submodule, so a plain ``git clone`` leaves the
+    directory empty.  Nothing notices until the first *uncached* kernel variant
+    is compiled, and then nvcc reports ``fatal error: cute/tensor.hpp: No such
+    file or directory`` from inside a build log -- which names a header, not the
+    submodule, and appears only for variants the JIT cache happens not to hold,
+    so a warm cache hides it until an unrelated shape is requested.
+    """
+    if (_CUTLASS_INCLUDE / "cute" / "tensor.hpp").is_file():
+        return
+    raise RuntimeError(
+        f"CUTLASS headers are missing from {_CUTLASS_DIR}.\n"
+        f"It is a git submodule; run:  git submodule update --init --recursive\n"
+        f"(A warm JIT cache can mask this -- previously compiled kernel variants "
+        f"keep working, and only a newly requested shape fails.)"
+    )
+
 _PACK_FACTORS = [1,2,4,6,8,16]
 # _PACK_FACTORS = [1, 6]
 
@@ -218,6 +238,7 @@ _ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
 def _get_nvcc_flags(cache_dir, fmha=True):
     tvm_include = _get_tvm_ffi_include()
     fmha_include = str(_FMHA_VARLEN_DIR / "include")
+    _require_cutlass()
     cutlass_include = str(_CUTLASS_INCLUDE)
     cutlass_util_include = str(_CUTLASS_UTIL_INCLUDE)
     nvcc_flags = [
