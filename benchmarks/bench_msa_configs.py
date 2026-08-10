@@ -660,6 +660,84 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _decode_fast_subprocess(python, *, model, batch, seqlen_k, block_size, topk,
+                            head_mode, dry_ms, rep_ms, seed, timeout=1800):
+    """Time MsaSparseAttention.decode_attend in another interpreter.
+
+    Two reasons it cannot run here.  The paged decode kernel only builds on
+    cutlass-dsl 4.5.x while this sweep runs on 4.6+ (where FA4 is 3.3x faster),
+    and the decode path wants an fp8 paged KV cache rather than the flat bf16
+    one the rest of the sweep uses.  Both are environment facts, not properties
+    of the configuration under test, so the measurement moves rather than the
+    sweep.
+
+    Returns (ms, worst_cos, reason).  Correctness travels with the number
+    because a decode figure without it invites exactly the misreading this
+    report has already made once.
+    """
+    import json as _json
+    import subprocess
+    import textwrap
+
+    src = textwrap.dedent(f"""
+        import json, sys, torch
+        sys.path.insert(0, {str(REPO_ROOT / "python")!r})
+        sys.path.insert(0, {str(REPO_ROOT / "python" / "fmha_sm100" / "cute")!r})
+        from fmha_sm100.msa_config import MsaSparseConfig
+        from fmha_sm100.msa_pipeline import MsaSparseAttention
+        B, S = {batch}, {seqlen_k}
+        HQ, HKV, D = {model.num_qo_heads}, {model.num_kv_heads}, {model.bench_head_dim()}
+        PAGE, TOPK = {block_size}, {topk}
+        npp = S // PAGE
+        cfg = MsaSparseConfig(block_size=PAGE, topk=TOPK, force_init_tokens=128,
+                              force_end_tokens=128, head_mode={head_mode!r})
+        msa = MsaSparseAttention(cfg, num_qo_heads=HQ, num_kv_heads=HKV,
+                                 head_dim=D, causal=True)
+        g = torch.Generator(device="cuda").manual_seed({seed})
+        dt = torch.float8_e4m3fn
+        q = torch.randn((B, HQ, D), generator=g, device="cuda").to(dt)
+        k = torch.randn((B*npp, HKV, PAGE, D), generator=g, device="cuda").to(dt)
+        v = torch.randn((B*npp, HKV, PAGE, D), generator=g, device="cuda").to(dt)
+        pt = torch.arange(B*npp, dtype=torch.int32, device="cuda").view(B, npp)
+        cg = torch.Generator().manual_seed({seed})
+        sel = torch.stack([torch.sort(torch.randperm(npp, generator=cg)[:TOPK]).values
+                           for _ in range(B)]).cuda()
+        run = lambda: msa.decode_attend(q, k, v, pt, sel, page_size=PAGE)
+        out = run(); torch.cuda.synchronize()
+        # fp32 over exactly the selected blocks, for one request
+        b = 0
+        idx = sel[b].long()
+        kk = k[b*npp:(b+1)*npp][idx].reshape(-1, HKV, D).float().repeat_interleave(HQ//HKV, 1)
+        vv = v[b*npp:(b+1)*npp][idx].reshape(-1, HKV, D).float().repeat_interleave(HQ//HKV, 1)
+        sc = torch.einsum("hd,thd->ht", q[b].float(), kk) * D ** -0.5
+        ref = torch.einsum("ht,thd->hd", torch.softmax(sc, -1), vv)
+        cos = torch.nn.functional.cosine_similarity(out[b].float(), ref, dim=-1)
+        flush = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
+        a, e = torch.cuda.Event(True), torch.cuda.Event(True)
+        flush.zero_(); a.record(); run(); e.record(); torch.cuda.synchronize()
+        one = max(a.elapsed_time(e), 1e-3)
+        for _ in range(max(1, int({dry_ms}/one))): flush.zero_(); run()
+        torch.cuda.synchronize()
+        t = []
+        for _ in range(max(3, int({rep_ms}/one))):
+            flush.zero_(); a.record(); run(); e.record()
+            torch.cuda.synchronize(); t.append(a.elapsed_time(e))
+        t.sort()
+        print("RESULT " + json.dumps({{"ms": t[len(t)//2], "cos": float(cos.min())}}))
+    """)
+    try:
+        r = subprocess.run([python, "-c", src], capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, None, "timed out"
+    for line in r.stdout.splitlines():
+        if line.startswith("RESULT "):
+            d = _json.loads(line[7:])
+            return d["ms"], d["cos"], None
+    tail = (r.stderr or r.stdout).strip().splitlines()
+    return None, None, (tail[-1][:110] if tail else f"exit {r.returncode}")
+
+
 def _fa4_subprocess(python, fa4_path, *, model, batch, seqlen_q, seqlen_k,
                     dry_ms, rep_ms, seed, timeout=1800):
     """Measure FA4 in another interpreter, so its cutlass version is its own.
@@ -1004,6 +1082,11 @@ def parse_args(argv=None):
                    help="only compute the cosine column at or below this KV length; the exact "
                         "block scores it needs cost a dense attention's worth of FLOPs per "
                         "configuration (default 32768)")
+    p.add_argument("--decode-python", default="",
+                   help="interpreter to run decode_attend in.  The paged decode "
+                        "kernel only builds on cutlass-dsl 4.5.x, so the fast "
+                        "decode path is measured there and reported alongside "
+                        "the in-process rows.")
     p.add_argument("--fa4-python", default="",
                    help="interpreter to measure FA4 in.  Use when the sweep's "
                         "cutlass-dsl version differs from the one FA4 is fastest "
@@ -1278,6 +1361,34 @@ def main(argv=None) -> int:
             row["wall_s"] = round(time.time() - t0, 1)
             rows.append(row)
             print_row(row, dense_ms)
+
+            # The rows above are the prefill kernel doing decode's work, which is
+            # what this sweep has always measured and why decode never beat
+            # dense.  The paged decode kernel is the right one for q_len=1; it
+            # lives in another environment, so measure it there and print it
+            # next to its in-process counterpart rather than leaving the table
+            # to imply the slow path is all there is.
+            if args.mode == "decode" and args.decode_python and cfg.head_mode != "keep":
+                ms, cos, why = _decode_fast_subprocess(
+                    args.decode_python, model=model, batch=args.batch,
+                    seqlen_k=seqlen_k, block_size=cfg.block_size, topk=cfg.topk,
+                    head_mode=cfg.head_mode, dry_ms=args.dry_ms,
+                    rep_ms=args.rep_ms, seed=args.seed)
+                if ms is None:
+                    print(f"      -- fast decode unavailable: {why}")
+                else:
+                    fast = {**cfg.to_dict(), "name": cfg.resolved_name() + "+fastdec",
+                            "batch": args.batch, "seqlen_q": seqlen_q,
+                            "seqlen_k": seqlen_k, "head_q": model.num_qo_heads,
+                            "head_kv": model.num_kv_heads,
+                            "head_dim": model.bench_head_dim(),
+                            "stages": {"attn": {"ms": ms}}, "pipeline_ms": ms,
+                            "pipeline_gpu_ms": ms, "attn_ms_only": ms,
+                            "cos_min": cos, "supported": True, "errors": {}}
+                    rows.append(fast)
+                    print_row(fast, dense_ms)
+                    print(f"      -- paged decode kernel, only the selected blocks; "
+                          f"worst cos {cos:.5f} vs fp32")
             flush()
             try:
                 torch.cuda.empty_cache()

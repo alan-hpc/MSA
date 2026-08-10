@@ -141,6 +141,13 @@ def prepare_decode_schedule(
     if int(num_qo_heads) % int(num_kv_heads) != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
     if int(num_qo_heads) // int(num_kv_heads) != 16:
+        # Measured, not assumed: relaxing this to the CuTe kernel's nominal set
+        # (16, 8, 4, 2, 1) builds and runs, but at qhead_per_kv=8 the output is
+        # wrong -- worst cosine -0.04 against fp32 over the selected blocks,
+        # where 16 gives 0.9983.  The surrounding code does derive from
+        # qhead_per_kv, which makes this look like a conservative guard; it is
+        # not.  See benchmarks/bench_msa_configs.py::_decode_fast_subprocess,
+        # which reports a cosine beside every latency so this cannot be missed.
         raise NotImplementedError("decode schedule currently supports only qhead_per_kv=16")
     if int(head_dim) != 128:
         raise NotImplementedError("decode schedule currently supports only head_dim=128")
