@@ -509,16 +509,33 @@ def bench_config(
         try:
             from fp4_indexer_interface import fp4_indexer_block_scores  # noqa: PLC0415
 
+            # Pad a short query up to the indexer's 128-row MMA tile.  A decode
+            # step has one query per request and lands on the kernel's predicated
+            # residue path, which measures 3.5-3.7x slower than the full-tile
+            # path for the same work -- 11% of streaming bandwidth against 43%.
+            # The extra rows are not free work: the causal convention puts the
+            # last query at the end of the context, so the padded rows sit just
+            # before it and their scores are discarded.  Verified bitwise: the
+            # padded run's last row per request reproduces the unpadded run's
+            # only row exactly, at 128K, 256K and 1M.
+            _idx_q_len = seqlen_q
+            if seqlen_q < _INDEXER_Q_TILE and int(seqlen_q) == 1:
+                _idx_q_len = _INDEXER_Q_TILE
+            _idx_total_q = batch * _idx_q_len
+            _idx_cu_q = (cu_seqlens_q if _idx_q_len == seqlen_q else
+                         torch.arange(0, (batch + 1) * _idx_q_len, _idx_q_len,
+                                      dtype=torch.int32, device=device))
             idx_in = make_fp4_indexer_inputs(
-                total_q=total_q, head_q=row["scorer_heads"], head_kv=sel_heads,
+                total_q=_idx_total_q, head_q=row["scorer_heads"], head_kv=sel_heads,
                 k_lengths=k_lengths, device=device, seed=seed + 7,
             )
+            row["indexer_q_pad"] = _idx_q_len if _idx_q_len != seqlen_q else None
 
             def run_indexer():
                 return fp4_indexer_block_scores(
                     idx_in["q_fp4"], idx_in["k_fp4"], idx_in["q_scale"], idx_in["k_scale"],
-                    cu_seqlens_q, cu_seqlens_k, idx_in["cu_page_offsets"],
-                    max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
+                    _idx_cu_q, cu_seqlens_k, idx_in["cu_page_offsets"],
+                    max_seqlen_q=_idx_q_len, max_seqlen_k=seqlen_k,
                     kv_indices=idx_in["kv_indices"], fp4_format="nvfp4", causal=True,
                     scale_layout="preordered_mma",
                 )
@@ -661,6 +678,9 @@ def _ceil_div(x: int, y: int) -> int:
 
 
 PAGE_FOR_FAST_DECODE = 128
+
+#: The FP4 indexer's MMA tile is 128 query rows.
+_INDEXER_Q_TILE = 128
 
 
 def _decode_fast_subprocess(python, *, model, batch, seqlen_k, block_size, topk,
