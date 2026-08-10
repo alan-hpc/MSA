@@ -135,6 +135,7 @@ class MsaSparseAttention:
         self._sparse_atten_func = None
         self._decode_wrapper = None
         self._decode_key = None
+        self._decode_pt = None
 
     # ---- lazy CuTe-DSL handles --------------------------------------------
 
@@ -288,26 +289,32 @@ class MsaSparseAttention:
         kv_len = topk * page_size
         seqused = torch.full((batch,), kv_len, dtype=torch.int32, device=q.device)
 
-        # Reuse the wrapper across steps: constructing it is pure overhead, and
-        # at these shapes the surrounding plan/dispatch already costs more than
-        # the kernel.  plan() itself must re-run each step -- the page table is
-        # what carries the selection, and that changes every token.
+        # Plan once per shape, not once per token.  The schedule depends on the
+        # shapes and seqused_k -- both constant across a decode loop -- while
+        # only the page table's *contents* change as the selection moves.  So
+        # keep the table as a buffer the plan already points at and copy each
+        # step's selection into it.  Re-planning every step costs ~0.3 ms
+        # against a 0.028 ms kernel, which is what made an earlier measurement
+        # of this path look 10x slower than it is.
         key = (batch, hq, dim, topk, page_size, kv_len, q_tokens)
         if self._decode_wrapper is None or self._decode_key != key:
+            self._decode_pt = sel_phys.clone()
             self._decode_wrapper = SparseDecodePagedAttentionWrapper(
                 blk_kv=page_size, causal=self.causal)
+            self._decode_wrapper.plan(
+                page_table=self._decode_pt,
+                seqused_k=seqused,
+                seqlen_q=q_tokens,
+                max_seqlen_k=kv_len,
+                q2k_indices=None,          # sparsity rides in the page table
+                num_qo_heads=hq,
+                num_kv_heads=self.num_kv_heads,
+                head_dim=dim,
+            )
             self._decode_key = key
+        else:
+            self._decode_pt.copy_(sel_phys)
         wrapper = self._decode_wrapper
-        wrapper.plan(
-            page_table=sel_phys,
-            seqused_k=seqused,
-            seqlen_q=q_tokens,
-            max_seqlen_k=kv_len,
-            q2k_indices=None,          # sparsity rides in the page table
-            num_qo_heads=hq,
-            num_kv_heads=self.num_kv_heads,
-            head_dim=dim,
-        )
         out = wrapper.run(q_packed, k_cache, v_cache,
                           softmax_scale=softmax_scale or dim ** -0.5)
         out = out[0] if isinstance(out, (tuple, list)) else out

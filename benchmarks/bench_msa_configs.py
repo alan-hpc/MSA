@@ -660,82 +660,114 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+PAGE_FOR_FAST_DECODE = 128
+
+
 def _decode_fast_subprocess(python, *, model, batch, seqlen_k, block_size, topk,
                             head_mode, dry_ms, rep_ms, seed, timeout=1800):
-    """Time MsaSparseAttention.decode_attend in another interpreter.
+    """Time the real paged sparse decode kernel in another interpreter.
 
     Two reasons it cannot run here.  The paged decode kernel only builds on
     cutlass-dsl 4.5.x while this sweep runs on 4.6+ (where FA4 is 3.3x faster),
     and the decode path wants an fp8 paged KV cache rather than the flat bf16
-    one the rest of the sweep uses.  Both are environment facts, not properties
-    of the configuration under test, so the measurement moves rather than the
-    sweep.
+    one the prefill kernel takes.  Returns (ms, worst_cos, reason).
 
-    Returns (ms, worst_cos, reason).  Correctness travels with the number
-    because a decode figure without it invites exactly the misreading this
-    report has already made once.
+    Inputs and reference both come from the repo's own test suite rather than
+    being rebuilt here.  Five separate wrong-cosine incidents on this path all
+    traced to inputs I wrote myself, never to a kernel; the most recent passed
+    a single query row to a kernel that reads a packed tile of
+    ``seqlen_q * qhead_per_kv == 128`` rows, so it attended over uninitialised
+    memory and scored cosine ~0.  Starting from the validated builder and
+    changing exactly one thing -- the page table -- is what works.
     """
-    import json as _json
-    import subprocess
-    import textwrap
+    group = model.num_qo_heads // model.num_kv_heads
+    if PAGE_FOR_FAST_DECODE % block_size and block_size % PAGE_FOR_FAST_DECODE:
+        return None, None, f"page_size ({block_size}) must equal n_block_size (128)"
+    if head_mode not in ("sum", "max"):
+        return None, None, f"head_mode {head_mode!r} selects per KV head; the page table is shared"
+    if 128 % group:
+        return None, None, f"qhead_per_kv ({group}) must divide the 128-row packed-q tile"
 
-    src = textwrap.dedent(f"""
-        import json, sys, torch
-        sys.path.insert(0, {str(REPO_ROOT / "python")!r})
-        sys.path.insert(0, {str(REPO_ROOT / "python" / "fmha_sm100" / "cute")!r})
-        from fmha_sm100.msa_config import MsaSparseConfig
-        from fmha_sm100.msa_pipeline import MsaSparseAttention
-        B, S = {batch}, {seqlen_k}
-        HQ, HKV, D = {model.num_qo_heads}, {model.num_kv_heads}, {model.bench_head_dim()}
-        PAGE, TOPK = {block_size}, {topk}
-        npp = S // PAGE
-        cfg = MsaSparseConfig(block_size=PAGE, topk=TOPK, force_init_tokens=128,
-                              force_end_tokens=128, head_mode={head_mode!r})
-        msa = MsaSparseAttention(cfg, num_qo_heads=HQ, num_kv_heads=HKV,
-                                 head_dim=D, causal=True)
-        g = torch.Generator(device="cuda").manual_seed({seed})
-        dt = torch.float8_e4m3fn
-        q = torch.randn((B, HQ, D), generator=g, device="cuda").to(dt)
-        k = torch.randn((B*npp, HKV, PAGE, D), generator=g, device="cuda").to(dt)
-        v = torch.randn((B*npp, HKV, PAGE, D), generator=g, device="cuda").to(dt)
-        pt = torch.arange(B*npp, dtype=torch.int32, device="cuda").view(B, npp)
-        cg = torch.Generator().manual_seed({seed})
-        sel = torch.stack([torch.sort(torch.randperm(npp, generator=cg)[:TOPK]).values
-                           for _ in range(B)]).cuda()
-        run = lambda: msa.decode_attend(q, k, v, pt, sel, page_size=PAGE)
-        out = run(); torch.cuda.synchronize()
-        # fp32 over exactly the selected blocks, for one request
-        b = 0
-        idx = sel[b].long()
-        kk = k[b*npp:(b+1)*npp][idx].reshape(-1, HKV, D).float().repeat_interleave(HQ//HKV, 1)
-        vv = v[b*npp:(b+1)*npp][idx].reshape(-1, HKV, D).float().repeat_interleave(HQ//HKV, 1)
-        sc = torch.einsum("hd,thd->ht", q[b].float(), kk) * D ** -0.5
-        ref = torch.einsum("ht,thd->hd", torch.softmax(sc, -1), vv)
-        cos = torch.nn.functional.cosine_similarity(out[b].float(), ref, dim=-1)
-        flush = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
-        a, e = torch.cuda.Event(True), torch.cuda.Event(True)
-        flush.zero_(); a.record(); run(); e.record(); torch.cuda.synchronize()
-        one = max(a.elapsed_time(e), 1e-3)
-        for _ in range(max(1, int({dry_ms}/one))): flush.zero_(); run()
-        torch.cuda.synchronize()
-        t = []
-        for _ in range(max(3, int({rep_ms}/one))):
-            flush.zero_(); a.record(); run(); e.record()
-            torch.cuda.synchronize(); t.append(a.elapsed_time(e))
-        t.sort()
-        print("RESULT " + json.dumps({{"ms": t[len(t)//2], "cos": float(cos.min())}}))
-    """)
+    cfg = json.dumps(dict(batch=batch, seqlen_k=seqlen_k, topk=topk, seed=seed,
+                          group=group, head_kv=model.num_kv_heads,
+                          dim=model.bench_head_dim(), dry=dry_ms, rep=rep_ms))
+    body = r"""
+import sys, json, types, torch
+CFG = json.loads(sys.argv[1])
+sys.path.insert(0, "python"); sys.path.insert(0, "python/fmha_sm100/cute")
+
+# test_sparse_atten imports pytest at module scope purely for its decorators.
+_p = types.ModuleType("pytest"); _p.skip = lambda *a, **k: None
+class _M:
+    def __getattr__(self, n):
+        return lambda *a, **k: (a[0] if a and callable(a[0]) else (lambda f: f))
+_p.mark = _M(); _p.approx = lambda x, **k: x; sys.modules["pytest"] = _p
+import test_sparse_atten as T
+
+# The builder binds its defaults from the module constants at def time, so
+# assigning T.DECODE_* here would be silently ignored -- every geometry has to
+# be passed as a keyword.  Getting this wrong is not loud: the builder just
+# hands back the default qhead_per_kv=16 shape and the kernel then rejects the
+# seqlen_q that was correct for the geometry actually asked for.
+# The packed-q tile is 128 rows: seqlen_q * qhead_per_kv must fill it exactly.
+PAGE = T.BLK_KV; B = CFG["batch"]; TOPK = CFG["topk"]
+SQ = 128 // CFG["group"]
+
+inp = T._build_decode_paged_dense_inputs(
+    kv_tokens=CFG["seqlen_k"], batch=B, seqlen_q=SQ, head_kv=CFG["head_kv"],
+    qhead_per_kv=CFG["group"], dim=CFG["dim"])
+HQ = inp["q"].shape[1]; HKV = inp["k_paged"].shape[1]; D = inp["q"].shape[2]
+npage = CFG["seqlen_k"] // PAGE
+if TOPK >= npage:
+    print("RESULT " + json.dumps({"skip": "topk covers every page; not sparse"})); raise SystemExit
+
+g = torch.Generator().manual_seed(CFG["seed"])
+sel = torch.stack([torch.sort(torch.randperm(npage, generator=g)[:TOPK]).values
+                   for _ in range(B)]).cuda()
+
+# The one and only change from the validated inputs: keep just the selected
+# pages.  gather maps selection -> physical page id; computing that id by hand
+# is what broke this path once already.
+sp = dict(inp)
+sp["page_table"] = torch.gather(inp["page_table"], 1, sel).contiguous().to(torch.int32)
+sp["kv_tokens"] = TOPK * PAGE; sp["max_seqlen_k"] = TOPK * PAGE
+sp["seqused_k"] = torch.full((B,), TOPK * PAGE, dtype=torch.int32, device="cuda")
+
+fn = T._get_sparse_decode_atten_func_for_benchmark()
+fn.plan(page_table=sp["page_table"], seqused_k=sp["seqused_k"], seqlen_q=SQ,
+        max_seqlen_k=sp["max_seqlen_k"], num_qo_heads=HQ, num_kv_heads=HKV, head_dim=D)
+run = lambda: fn.run(sp["q"], sp["k_paged"], sp["v_paged"],
+                     softmax_scale=sp["softmax_scale"])
+
+out = run(); torch.cuda.synchronize()
+out = out[0] if isinstance(out, (tuple, list)) else out
+ref, _ = T._decode_paged_dense_reference(sp)
+cos = float(torch.nn.functional.cosine_similarity(out.float(), ref.float(), dim=-1).min())
+
+flush = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
+for _ in range(max(1, CFG["dry"])): flush.zero_(); run()
+torch.cuda.synchronize(); ts = []
+for _ in range(max(1, CFG["rep"])):
+    flush.zero_()
+    s, e = torch.cuda.Event(True), torch.cuda.Event(True)
+    s.record(); run(); e.record(); torch.cuda.synchronize()
+    ts.append(s.elapsed_time(e))
+ts.sort()
+print("RESULT " + json.dumps({"ms": ts[len(ts)//2], "cos": cos}))
+"""
+    import subprocess
     try:
-        r = subprocess.run([python, "-c", src], capture_output=True, text=True,
-                           timeout=timeout)
+        r = subprocess.run([python, "-c", body, cfg], capture_output=True, text=True,
+                           timeout=timeout, cwd=str(REPO_ROOT))
     except subprocess.TimeoutExpired:
         return None, None, "timed out"
-    for line in r.stdout.splitlines():
-        if line.startswith("RESULT "):
-            d = _json.loads(line[7:])
-            return d["ms"], d["cos"], None
-    tail = (r.stderr or r.stdout).strip().splitlines()
-    return None, None, (tail[-1][:110] if tail else f"exit {r.returncode}")
+    line = next((l for l in r.stdout.splitlines() if l.startswith("RESULT ")), None)
+    if line is None:
+        return None, None, _fmt_exc(r.stderr or r.stdout or "no output")
+    d = json.loads(line[len("RESULT "):])
+    if "skip" in d:
+        return None, None, d["skip"]
+    return d["ms"], d["cos"], None
 
 
 def _fa4_subprocess(python, fa4_path, *, model, batch, seqlen_q, seqlen_k,
