@@ -777,55 +777,46 @@ indexer 的 Int32 分数张量（§2）与 blk=32/topk=32 的内存墙（§20）
 ---
 ---
 
-## 23. 🔴 decode 快不起来：paged decode 内核在本环境编译不出来
+## 23. ✅ decode 内核是好的：卡住它的是 cutlass-dsl 4.6.0 的回归
 
-decode 的 0.39× 此前被归因为「模型 `qhead_per_kv=8`，而 sparse paged decode 要求 16」。
-**这个归因从头到尾是错的。** 逐层追下去共六层：
+decode 的 0.39× 曾被归因为「模型 `qhead_per_kv=8`，而 sparse paged decode 要求 16」，
+随后又被归因为「前向内核没实现」。**两个都是错的。**
 
-| # | 位置 | 性质 | 结果 |
-|---|---|---|---|
-| 1 | `sparse_decode_schedule_ext` 编译失败（`cusparse.h`） | 构建缺陷 | ✅ 已修 |
-| 2 | `decode_schedule.py` `!= 16` | 守卫 | 放开可继续 |
-| 3 | `build_decode_schedule.cu` `TORCH_CHECK(==16)` | 守卫 | 放开可继续 |
-| 4 | `interface.py` run 路径 `!= 16` | 守卫 | 放开可继续 |
-| 5 | `if q2k_indices is not None: raise` — 稀疏 gather 未实现 | 真缺失 | **可绕过**，见下 |
-| 6 | `atten_fwd.py:2574` 要求满 packed-q tile（`seqlen_q == 128/qhead_per_kv`） | 真限制 | **可绕过**，见下 |
-| 7 | **`DSLOperationBuildError`（CuTe 编译失败）** | **内核构建不出来** | 🔴 **到底** |
+用仓库自带测试的原始配方（`SQ=8`、`qhead_per_kv=16`、fp8 分页 KV）直接跑：
 
-### 第 5、6 层其实都有解
+| CuTe-DSL 版本 | 结果 |
+|---|---|
+| 4.6.0（容器默认） | `DSLOperationBuildError` — MLIR 验证失败于 `cute.arch.clc_response`（Cluster Launch Control），位置 `fwd_decode/tile_scheduler.py` |
+| **4.5.1** | **`run OK  out (256, 64, 128) finite True`** |
 
-**第 5 层**：报错条件是 `q2k_indices is not None`，也就是说
-**dense paged decode 是实现了的**，缺的只是按 q2k gather。但这层可以绕过：
-**把 page table 只填 top-k 选中的块**，dense 内核就只读那些页——这就是稀疏 decode，
-不需要 gather 路径。仓库里 `sparse_fmha_adapter._build_page_table` 做的正是这件事。
-前提是选择跨 head 共享，而 `head_mode=max/sum` 产出的正好是 1 份共享选择（cfg10/cfg12 都是 `max`）。
+**内核本身完全正常。** `clc_response` 的签名在两个版本里都是 4 个返回值、代码也正好解包 4 个，
+所以不是 arity 不匹配，而是 MLIR 层的验证在 4.6.0 上失败——和先前
+`cute.core.ThrMma` / `cute.make_fragment` 被移除是同一类版本漂移，只是这次表现为验证错误而非
+AttributeError，更难认。
 
-**第 6 层**：内核把 `seqlen_q × qhead_per_kv` 打包进 128 行 tile 且假设 tile 是满的
-（它是为投机解码/MTP 设计的，不是单 token decode）。可以把 query 复制填满 tile、
-取因果上看得最全的那一行——Q 侧多算 16 倍，而 decode 是 KV 主导的，这点浪费可忽略。
+### 因此前面几层的定性要全部修正
 
-### 但第 7 层挡死了
+| # | 先前结论 | 实际 |
+|---|---|---|
+| 1 | `sparse_decode_schedule_ext` 编译失败 | 真缺陷，✅ 已修（缺 `extra_include_paths`、`-arch` 写死） |
+| 2–4 | `qhead_per_kv != 16` 三处守卫 | 守卫；但**不是**它们挡住了 decode |
+| 5 | 「稀疏 gather 未实现」 | 真缺失，但**可用 page-table 绕过**（只填选中块，dense 内核就只读那些页；需 `head_mode=max/sum` 的共享选择） |
+| 6 | 「必须填满 packed-q tile」 | 真限制（为投机解码设计），**可用 query 复制填满、取因果最全那行绕过** |
+| 7 | 「内核没实现 / 构建不出来」 | ❌ **错**。内核在 4.5.1 下正常运行 |
 
-放开 2/3/4、用 page-table 绕过 5、用 padding 绕过 6 之后，内核在 CuTe 编译阶段失败：
+### 拿到快速 decode 的路径
 
-```
-DSLOperationBuildError
-```
+1. **解决版本问题**：要么把 decode 路径跑在 cutlass-dsl 4.5.1 上（仓库已有可用 venv 的做法，
+   见 §16），要么修 `fwd_decode/tile_scheduler.py` 让 CLC 路径通过 4.6.0 的 MLIR 验证。
+2. **稀疏走 page table**（第 5 层的绕法），**query 补齐到满 tile**（第 6 层的绕法）。
+3. 用 `benchmarks/probe_decode_kernel.py` 验正确性与带宽——它已经把 2 的两个绕法都实现好了。
 
-**而且在官方支持的 `qhead_per_kv=16` 下同样失败**（Hq=64/Hkv=4 实测）。
-所以这与 head 数无关——**这条 paged fp8 decode 内核在本环境根本构建不出来**，
-`qhead_per_kv` 在任何一层都不是真正的原因。
+空间见 §17：128K decode 只需读 0.78% 的 KV，带宽下界约 **0.008 ms**，
+当前经 prefill 内核的路径是 **3.1 ms**。
 
-第 2/3/4 层的放宽已撤回：它们解锁不了任何东西，留着只会让人以为 16 可用。
-
-### 下一步
-
-诊断 `DSLOperationBuildError` 需要拿到 CuTe 的完整报错（当前异常体是空的），
-路径是 `python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py`。
-在它能构建之前，decode 的 380× 空间（§17：0.008 ms 带宽下界 vs 3.1 ms 实测）拿不到。
-
-`benchmarks/probe_decode_kernel.py` 保留了完整的绕行链路（page-table 稀疏 + query padding），
-内核一通就能直接验正确性与带宽。
+> 这是本轮第四次「文档/报错说不支持，实际支持」。前三次分别是 causal 的串行扫描、
+> top-k 的 12288 上限、以及本节。**代价是我一度写下了「内核没实现」这个错误结论**——
+> 而正确做法本应是先跑仓库自带的测试，那是最便宜的判据。
 
 
 ## 配置选择结论
