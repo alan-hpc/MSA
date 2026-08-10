@@ -1478,9 +1478,18 @@ def main(argv=None) -> int:
                             "seqlen_k": seqlen_k, "head_q": model.num_qo_heads,
                             "head_kv": model.num_kv_heads,
                             "head_dim": model.bench_head_dim(),
-                            "stages": {"attn": {"ms": ms}}, "pipeline_ms": ms,
-                            "pipeline_gpu_ms": ms, "attn_ms_only": ms,
                             "cos_min": cos, "supported": True, "errors": {}}
+                    # Carry the parent's selection stages and swap only attn.
+                    # fastdec replaces one stage of four; reporting its kernel
+                    # time as the row total would compare a single kernel
+                    # against other rows' end-to-end cost in the same column.
+                    parent = row.get("stages", {}) if row.get("supported") else {}
+                    fast["stages"] = {k: dict(v) for k, v in parent.items()
+                                      if k != "attn"}
+                    fast["stages"]["attn"] = {"ms": ms}
+                    total = sum(st["ms"] for st in fast["stages"].values())
+                    fast["pipeline_ms"] = fast["pipeline_gpu_ms"] = total
+                    fast["attn_ms_only"] = ms
                     rows.append(fast)
                     print_row(fast, dense_ms)
                     extra = (f"; per-KV-head selection run as {model.num_kv_heads}x "
