@@ -1503,9 +1503,17 @@ def main(argv=None) -> int:
                     # fastdec replaces one stage of four; reporting its kernel
                     # time as the row total would compare a single kernel
                     # against other rows' end-to-end cost in the same column.
+                    # Drop CSR as well as attn.  The k2q CSR exists so a
+                    # prefill-shaped sparse kernel can walk K blocks and find
+                    # the queries that selected them; the paged decode kernel
+                    # takes a page table instead and never reads it.  The
+                    # verified fast measurement builds no CSR at all and still
+                    # returns cosine 0.998, so charging this row for one would
+                    # bill work the path does not do.
+                    _unused_by_fastdec = ("attn", "csr")
                     parent = row.get("stages", {}) if row.get("supported") else {}
                     fast["stages"] = {k: dict(v) for k, v in parent.items()
-                                      if k != "attn"}
+                                      if k not in _unused_by_fastdec}
                     fast["stages"]["attn"] = {"ms": ms}
                     total = sum(st["ms"] for st in fast["stages"].values())
                     fast["pipeline_ms"] = fast["pipeline_gpu_ms"] = total
