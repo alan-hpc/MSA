@@ -1035,8 +1035,8 @@ def _build_decode_paged_dense_inputs(
         raise ValueError("decode fp8 page test requires page_size == blk_kv")
     if dtype != torch.float8_e4m3fn:
         raise ValueError("decode fp8 page test requires torch.float8_e4m3fn")
-    if qhead_per_kv != DECODE_QHEAD_PER_KV:
-        raise ValueError("decode target only supports qhead_per_kv=16")
+    if qhead_per_kv not in (16, 8, 4, 2, 1):
+        raise ValueError(f"decode target supports qhead_per_kv in (16, 8, 4, 2, 1), got {qhead_per_kv}")
     if batch < 1:
         raise ValueError("batch must be >= 1")
     if seqlen_q < 1:

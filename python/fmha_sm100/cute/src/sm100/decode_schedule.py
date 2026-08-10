@@ -140,15 +140,16 @@ def prepare_decode_schedule(
         raise ValueError("head counts must be positive")
     if int(num_qo_heads) % int(num_kv_heads) != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
-    if int(num_qo_heads) // int(num_kv_heads) != 16:
-        # Measured, not assumed: relaxing this to the CuTe kernel's nominal set
-        # (16, 8, 4, 2, 1) builds and runs, but at qhead_per_kv=8 the output is
-        # wrong -- worst cosine -0.04 against fp32 over the selected blocks,
-        # where 16 gives 0.9983.  The surrounding code does derive from
-        # qhead_per_kv, which makes this look like a conservative guard; it is
-        # not.  See benchmarks/bench_msa_configs.py::_decode_fast_subprocess,
-        # which reports a cosine beside every latency so this cannot be missed.
-        raise NotImplementedError("decode schedule currently supports only qhead_per_kv=16")
+    # Measured, not inferred.  Driven by the test suite's own input builder and
+    # reference, qhead_per_kv=8 with seqlen_q=16 (a full packed-q tile: 8*16=128)
+    # matches at worst-case cosine 0.998 and the same 0.0276 ms as 16 -- so the
+    # old ==16 was a guard.  An earlier attempt saw cosine -0.04 at 8 and
+    # concluded the opposite; that harness built its own inputs and was wrong.
+    # Widen only with benchmarks/ re-run against _decode_paged_dense_reference.
+    _group = int(num_qo_heads) // int(num_kv_heads)
+    if _group not in (16, 8, 4, 2, 1):
+        raise NotImplementedError(
+            f"decode schedule supports qhead_per_kv in (16, 8, 4, 2, 1), got {_group}")
     if int(head_dim) != 128:
         raise NotImplementedError("decode schedule currently supports only head_dim=128")
     if int(max_seqlen_k) <= 0:

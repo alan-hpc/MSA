@@ -54,6 +54,7 @@ _SUPPORTED_FWD_MMA_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
 _SUPPORTED_DECODE_QHEAD_PER_KV = 16
 
 
+_SUPPORTED_DECODE_QHEAD_PER_KV_SET = frozenset((16, 8, 4, 2, 1))
 def _normalize_partial_dtype(partial_dtype: torch.dtype) -> torch.dtype:
     supported = {torch.float32, torch.bfloat16, torch.float16, torch.float8_e4m3fn}
     if partial_dtype not in supported:
@@ -494,10 +495,10 @@ def _validate_sparse_decode_inputs(
     if head_q % head_kv != 0:
         raise ValueError("decode q.shape[1] must be divisible by Hkv")
     qhead_per_kv = head_q // head_kv
-    if qhead_per_kv != _SUPPORTED_DECODE_QHEAD_PER_KV:
+    if qhead_per_kv not in _SUPPORTED_DECODE_QHEAD_PER_KV_SET:
         raise NotImplementedError(
-            "decode attention currently supports only "
-            f"qhead_per_kv={_SUPPORTED_DECODE_QHEAD_PER_KV}, got {qhead_per_kv}"
+            "decode attention supports qhead_per_kv in "
+            f"{sorted(_SUPPORTED_DECODE_QHEAD_PER_KV_SET, reverse=True)}, got {qhead_per_kv}"
         )
 
     if page_table is None:

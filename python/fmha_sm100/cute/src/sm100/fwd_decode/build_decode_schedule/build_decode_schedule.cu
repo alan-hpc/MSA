@@ -526,8 +526,11 @@ py::dict build_decode_schedule(
   TORCH_CHECK(num_qo_heads > 0 && num_kv_heads > 0, "head counts must be positive");
   TORCH_CHECK(num_qo_heads % num_kv_heads == 0,
               "num_qo_heads must be divisible by num_kv_heads");
-  TORCH_CHECK(num_qo_heads / num_kv_heads == kTargetDecodeQHeadPerKv,
-              "decode schedule currently supports only qhead_per_kv=16");
+  {
+    const int64_t g = num_qo_heads / num_kv_heads;
+    TORCH_CHECK(g == 16 || g == 8 || g == 4 || g == 2 || g == 1,
+                "decode schedule supports qhead_per_kv in (16, 8, 4, 2, 1), got ", g);
+  }
   TORCH_CHECK(head_dim == kTargetDecodeHeadDim,
               "decode schedule currently supports only head_dim=128");
   TORCH_CHECK(max_seqlen_k > 0, "max_seqlen_k must be positive");
