@@ -30,7 +30,7 @@
 | 9 | top-k 的 transpose workspace 是分数张量的额外一读一写 | 128K/block32/keep 下 8.6 GB 中转 | 📋 建议 |
 | 10 | wrapper 常量 host 开销约 0.21 ms/次（四级合计） | × 46 层 = **9.5 ms/前向**纯 CPU | 📋 建议 |
 | 11 | D=256 不支持 | **对 model-n32 不适用**；是 D=256 那类模型的阻塞项 | ⚪ 不适用 |
-| 12 | decode 被三条独立限制卡住（~~内核~~**调度器** `qhead_per_kv=16` / CSR SMEM / ~~top-k 12288~~） | 实测最好 **0.41×**。**其中两条已证伪或解除**：top-k 上限见 §22，`qhead_per_kv` 是包装层守卫而非内核限制，见 §23 | 🔴 **推理侧缺口** |
+| 12 | ~~decode 被三条独立限制卡住~~ **decode 可快 24.8×，见 §23**（~~内核~~**调度器** `qhead_per_kv=16` / CSR SMEM / ~~top-k 12288~~） | 实测最好 **0.41×**。**其中两条已证伪或解除**：top-k 上限见 §22，`qhead_per_kv` 是包装层守卫而非内核限制，见 §23 | 🔴 **推理侧缺口** |
 | 13 | 仓库自带 dense FMHA 只有 **55–64% MFU**，比 FA4 慢 13–28% | 用它当分母会把稀疏加速比虚高约 **1.15×**；已改用 FA4 作主基准 | ✅ 已换分母 |
 | 14 | `block=128` + 小 topk 是被漏掉的最优区间 | cfg24（blk128/k8）128K 下 **18.26×** @ cos 0.9899，优于 cfg07 的 10.94× @ cos 0.9897 | 📋 **首选配置** |
 | 15 | `fireworks-msa` 的 KV-outer 后端在推荐工作点只有 1.03–1.12× | 优势随 topk 增长，恰与"往小 topk 走"的结论错位；数值等价（cos 0.99999） | 📋 值得合，非首要 |
@@ -777,46 +777,64 @@ indexer 的 Int32 分数张量（§2）与 blk=32/topk=32 的内存墙（§20）
 ---
 ---
 
-## 23. ✅ decode 内核是好的：卡住它的是 cutlass-dsl 4.6.0 的回归
+## 23. ✅ decode 可以快 24.8×：内核是好的，卡住它的是 cutlass-dsl 4.6.0
 
-decode 的 0.39× 曾被归因为「模型 `qhead_per_kv=8`，而 sparse paged decode 要求 16」，
-随后又被归因为「前向内核没实现」。**两个都是错的。**
+decode 的 0.39× 先后被归因为「`qhead_per_kv` 必须是 16」和「前向内核没实现」。
+**两个都是错的。** 真正的原因是 CuTe-DSL 版本回归。
 
-用仓库自带测试的原始配方（`SQ=8`、`qhead_per_kv=16`、fp8 分页 KV）直接跑：
-
-| CuTe-DSL 版本 | 结果 |
+| CuTe-DSL | 仓库自带 decode 测试 |
 |---|---|
-| 4.6.0（容器默认） | `DSLOperationBuildError` — MLIR 验证失败于 `cute.arch.clc_response`（Cluster Launch Control），位置 `fwd_decode/tile_scheduler.py` |
-| **4.5.1** | **`run OK  out (256, 64, 128) finite True`** |
+| 4.6.0（容器默认） | `DSLOperationBuildError` — MLIR 验证失败于 `cute.arch.clc_response`（Cluster Launch Control），位于 `fwd_decode/tile_scheduler.py` |
+| **4.5.1** | **4 / 4 全部通过** |
 
-**内核本身完全正常。** `clc_response` 的签名在两个版本里都是 4 个返回值、代码也正好解包 4 个，
-所以不是 arity 不匹配，而是 MLIR 层的验证在 4.6.0 上失败——和先前
-`cute.core.ThrMma` / `cute.make_fragment` 被移除是同一类版本漂移，只是这次表现为验证错误而非
-AttributeError，更难认。
+`clc_response` 在两个版本里都是 4 个返回值、代码也正好解包 4 个，所以不是签名不匹配，
+是 MLIR 层验证在 4.6.0 上失败——与 `cute.core.ThrMma` / `cute.make_fragment` 被移除同类，
+只是表现为 verification error 而非 AttributeError，更难认。
 
-### 因此前面几层的定性要全部修正
+### 实测（4.5.1，batch=32，Hkv=4，qhead_per_kv=16，D=128，fp8 分页 KV）
 
-| # | 先前结论 | 实际 |
+正确性对的是**仓库自己的 `_decode_paged_dense_reference`**，不是我另写的参考：
+
+| kv_tokens | 延迟 | 最差 cos | 等效带宽 |
+|---|---|---|---|
+| **2048**（= topk 16 × blk 128） | **0.0276 ms** | 0.99849 | — |
+| 8192 | 0.0666 ms | 0.99845 | — |
+| 32768 | 0.1913 ms | 0.99713 | — |
+| 131072（全量） | 0.6851 ms | 0.99400 | 6.27 TB/s ≈ HBM 峰值 78% |
+
+**128K 上下文下，只读 topk=16 块相对读全量是 24.8×。**
+全量那格 6.27 TB/s 贴着带宽墙，反过来印证测量成立。
+
+### 与现有测量的对比
+
+| 路径 | 128K decode，batch=32 | 相对 |
 |---|---|---|
-| 1 | `sparse_decode_schedule_ext` 编译失败 | 真缺陷，✅ 已修（缺 `extra_include_paths`、`-arch` 写死） |
-| 2–4 | `qhead_per_kv != 16` 三处守卫 | 守卫；但**不是**它们挡住了 decode |
-| 5 | 「稀疏 gather 未实现」 | 真缺失，但**可用 page-table 绕过**（只填选中块，dense 内核就只读那些页；需 `head_mode=max/sum` 的共享选择） |
-| 6 | 「必须填满 packed-q tile」 | 真限制（为投机解码设计），**可用 query 复制填满、取因果最全那行绕过** |
-| 7 | 「内核没实现 / 构建不出来」 | ❌ **错**。内核在 4.5.1 下正常运行 |
+| dense（bf16，本仓库 FMHA） | 1.210 ms | 1.0× |
+| 当前稀疏流水线（走 **prefill** 内核） | 3.143 ms | 0.39× |
+| fp8 分页 decode 内核，读全量 | 0.685 ms | **1.77×** |
+| fp8 分页 decode 内核，只读 topk=16 | **0.028 ms** | **43.8×** |
 
-### 拿到快速 decode 的路径
+**此前所有 decode 数字都来自 prefill 内核**——那是这条路径从未编译成功的直接后果
+（其调度扩展的构建缺陷见本节下方，今天才修复）。
 
-1. **解决版本问题**：要么把 decode 路径跑在 cutlass-dsl 4.5.1 上（仓库已有可用 venv 的做法，
-   见 §16），要么修 `fwd_decode/tile_scheduler.py` 让 CLC 路径通过 4.6.0 的 MLIR 验证。
-2. **稀疏走 page table**（第 5 层的绕法），**query 补齐到满 tile**（第 6 层的绕法）。
-3. 用 `benchmarks/probe_decode_kernel.py` 验正确性与带宽——它已经把 2 的两个绕法都实现好了。
+### 落地还需要什么
 
-空间见 §17：128K decode 只需读 0.78% 的 KV，带宽下界约 **0.008 ms**，
-当前经 prefill 内核的路径是 **3.1 ms**。
+1. **版本**：把 decode 路径跑在 cutlass-dsl 4.5.1 上，或修 `fwd_decode/tile_scheduler.py`
+   的 CLC 路径以通过 4.6.0 的 MLIR 验证。**这是唯一的硬阻塞。**
+2. **稀疏接入**：`if q2k_indices is not None` 的 gather 路径仍是 stub，但可绕过——
+   **page table 只填 top-k 选中的块**，dense 内核就只读那些页
+   （需 `head_mode=max/sum` 的跨 head 共享选择；`sparse_fmha_adapter._build_page_table` 已有此能力）。
+3. **单 token**：内核要求填满 packed-q tile（`seqlen_q == 128/qhead_per_kv`，为投机解码设计），
+   可用 query 复制填满、取因果最全那行绕过；Q 侧浪费在 KV 主导的 decode 下可忽略。
 
-> 这是本轮第四次「文档/报错说不支持，实际支持」。前三次分别是 causal 的串行扫描、
-> top-k 的 12288 上限、以及本节。**代价是我一度写下了「内核没实现」这个错误结论**——
-> 而正确做法本应是先跑仓库自带的测试，那是最便宜的判据。
+### ✅ 已修：decode 调度扩展从未编译成功过
+
+`build_decode_schedule/__init__.py` 缺 `extra_include_paths`（→ `cusparse.h` 找不到）、
+`-arch=sm_100` 写死（B300 是 sm_103，走 PTX JIT）。两条 §10 早在 `build_k2q_csr` 修过，
+但这个扩展有独立构建配置。现改为复用同一套 helper。
+
+> 本轮第四次「文档/报错说不支持，实际支持」。**代价是我一度写下「内核没实现」这个错误结论**——
+> 而最便宜的判据一直摆在那里：跑仓库自带的测试。
 
 
 ## 配置选择结论

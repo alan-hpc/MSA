@@ -56,7 +56,8 @@ def timed_ms(fn, iters=20, warmup=5):
 def reference(q_b, k_pages, v_pages, sel_b, page_size, scale, group):
     """fp32 attention over exactly the selected blocks, for one request."""
     hq, d = q_b.shape
-    hkv = sel_b.shape[0]
+    hkv = k_pages.shape[1]
+    # sel_b is the single shared selection the page table was built from.
     blocks = sorted({int(x) for x in sel_b.reshape(-1).tolist() if x >= 0})
     if not blocks:
         return torch.zeros((hq, d), device=q_b.device)
@@ -162,7 +163,7 @@ def main() -> int:
     for b in (0, B // 2, B - 1):
         ref = reference(q[b], k[b * npage_per_seq:(b + 1) * npage_per_seq],
                         v[b * npage_per_seq:(b + 1) * npage_per_seq],
-                        sel[:, b] % npage_per_seq, page, scale, group)
+                        shared[b].unsqueeze(0), page, scale, group)
         c = torch.nn.functional.cosine_similarity(out[b].to(torch.float32), ref, dim=-1)
         worst = min(worst, float(c.min()))
         print(f"   请求 {b:>3}: cos 均值={float(c.mean()):.6f} 最差={float(c.min()):.6f}")
