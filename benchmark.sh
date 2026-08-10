@@ -46,6 +46,7 @@
 #   COS         set empty to skip the cosine table      (default 1)
 #   FA4_PATH    flash-attention checkout (FA4 reference)  (default ../flash-attention)
 #   NO_FA4      set to 1 to skip the FA4 reference row
+#   FA4_PYTHON  interpreter to measure FA4 in; auto-detected, "" = in-process
 #   PREFILL_CHUNK    prefill query chunk in tokens; -1 (default) picks the
 #                    largest the indexer's Int32 score tensor allows, 0 disables.
 #                    Needed above 256K, where one unchunked score tensor exceeds
@@ -87,6 +88,11 @@ DECODE="${DECODE-1}"    # likewise -- see COS above
 DECODE_SEQLENS="${DECODE_SEQLENS:-8192,16384,32768,65536,131072,262144,524288,1048576}"
 DECODE_BATCH="${DECODE_BATCH:-32}"
 FA4_PATH="${FA4_PATH:-../flash-attention}"
+# FA4 is only the denominator, and it is 3.3x slower on the cutlass-dsl version
+# the decode kernels need.  Measuring it in its own interpreter stops the two
+# from fighting over one environment.  Auto-detected below; set explicitly to
+# override, or to "" to force in-process measurement.
+FA4_PYTHON="${FA4_PYTHON-__auto__}"
 PREFILL_CHUNK="${PREFILL_CHUNK:--1}"
 KVOUTER_PATH="${KVOUTER_PATH:-}"
 KVOUTER_PYTHON="${KVOUTER_PYTHON:-}"
@@ -190,9 +196,22 @@ PYEOF
 # FA4 is the strongest dense attention available here, so it is what the
 # speedup tables divide by.  It ships as CuTe-DSL inside the flash-attention
 # repo and needs no build, only a checkout.
+# Pick the interpreter FA4 is measured in.  A sibling venv is used when present
+# because FA4 and the decode kernels want different cutlass-dsl versions; with
+# none, in-process is correct and is what a single-version machine wants.
+if [[ "$FA4_PYTHON" == "__auto__" ]]; then
+    FA4_PYTHON=""
+    for _cand in "$REPO_ROOT/../fa4env/bin/python" "$FA4_PATH/../fa4env/bin/python"; do
+        if [[ -x "$_cand" ]]; then FA4_PYTHON="$_cand"; break; fi
+    done
+fi
+
 if [[ -z "$NO_FA4" ]]; then
     if [[ -d "$FA4_PATH/flash_attn/cute" ]]; then
         echo "FA4 reference : $FA4_PATH"
+        if [[ -n "$FA4_PYTHON" ]]; then
+            echo "                measured in $FA4_PYTHON"
+        fi
     else
         echo "FA4 reference : not found at $FA4_PATH, cloning..."
         git clone --depth 1 https://github.com/Dao-AILab/flash-attention.git "$FA4_PATH" \
@@ -260,7 +279,7 @@ echo
     --indexer-mode "$INDEXER" \
     --timing "$TIMING" \
     --qk-source "$QK_SOURCE" --qk-model "$QK_MODEL" --qk-layer "$QK_LAYER" \
-    --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} \
+    --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} ${FA4_PYTHON:+--fa4-python "$FA4_PYTHON"} \
     --chunk-q "$PREFILL_CHUNK" \
     --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
     --gpu 0 \
@@ -279,7 +298,7 @@ section "3. Configuration sweep"
     --indexer-mode "$INDEXER" \
     --timing "$TIMING" \
     --qk-source "$QK_SOURCE" --qk-model "$QK_MODEL" --qk-layer "$QK_LAYER" \
-    --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} \
+    --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} ${FA4_PYTHON:+--fa4-python "$FA4_PYTHON"} \
     ${COS:+--cos} --cos-max-seqlen "$COS_MAX_SEQLEN" \
     --chunk-q "$PREFILL_CHUNK" \
     --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
@@ -307,7 +326,7 @@ else
         --indexer-mode "$INDEXER" \
         --timing "$TIMING" \
         --qk-source "$QK_SOURCE" --qk-model "$QK_MODEL" --qk-layer "$QK_LAYER" \
-        --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} \
+        --fa4-path "$FA4_PATH" ${NO_FA4:+--no-fa4} ${FA4_PYTHON:+--fa4-python "$FA4_PYTHON"} \
         --dry-ms "$DRY_MS" --rep-ms "$REP_MS" \
         --gpu 0 \
         --csv "$OUT_DIR/decode.csv" \

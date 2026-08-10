@@ -660,6 +660,60 @@ def _ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def _fa4_subprocess(python, fa4_path, *, model, batch, seqlen_q, seqlen_k,
+                    dry_ms, rep_ms, seed, timeout=1800):
+    """Measure FA4 in another interpreter, so its cutlass version is its own.
+
+    The MSA decode kernels need cutlass-dsl 4.5.x and FA4 is 3.3x slower there;
+    4.6+ reverses it.  One process cannot hold both, and FA4 is only the
+    reference denominator -- so run it where it is fastest and let the sweep run
+    where it must.  Returns the median latency in ms, or None with a reason.
+    """
+    import json as _json
+    import subprocess
+    import textwrap
+
+    src = textwrap.dedent(f"""
+        import json, sys, types, torch
+        sys.path.insert(0, {fa4_path!r})
+        sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
+        from flash_attn.cute.interface import flash_attn_varlen_func as fa4
+        B, SQ, SK = {batch}, {seqlen_q}, {seqlen_k}
+        HQ, HKV, D = {model.num_qo_heads}, {model.num_kv_heads}, {model.bench_head_dim()}
+        g = torch.Generator(device="cuda").manual_seed({seed})
+        q = torch.randn((B*SQ, HQ, D), generator=g, device="cuda").to(torch.bfloat16)
+        k = torch.randn((B*SK, HKV, D), generator=g, device="cuda").to(torch.bfloat16)
+        v = torch.randn((B*SK, HKV, D), generator=g, device="cuda").to(torch.bfloat16)
+        cq = torch.arange(0, (B+1)*SQ, SQ, dtype=torch.int32, device="cuda")
+        ck = torch.arange(0, (B+1)*SK, SK, dtype=torch.int32, device="cuda")
+        run = lambda: fa4(q, k, v, cu_seqlens_q=cq, cu_seqlens_k=ck,
+                          max_seqlen_q=SQ, max_seqlen_k=SK, causal=True)
+        flush = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
+        run(); torch.cuda.synchronize()
+        a, b = torch.cuda.Event(True), torch.cuda.Event(True)
+        flush.zero_(); a.record(); run(); b.record(); torch.cuda.synchronize()
+        one = max(a.elapsed_time(b), 1e-3)
+        for _ in range(max(1, int({dry_ms}/one))): flush.zero_(); run()
+        torch.cuda.synchronize()
+        s = []
+        for _ in range(max(3, int({rep_ms}/one))):
+            flush.zero_(); a.record(); run(); b.record()
+            torch.cuda.synchronize(); s.append(a.elapsed_time(b))
+        s.sort()
+        print("RESULT " + json.dumps({{"ms": s[len(s)//2]}}))
+    """)
+    try:
+        r = subprocess.run([python, "-c", src], capture_output=True, text=True,
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, "timed out"
+    for line in r.stdout.splitlines():
+        if line.startswith("RESULT "):
+            return _json.loads(line[7:])["ms"], None
+    tail = (r.stderr or r.stdout).strip().splitlines()
+    return None, (tail[-1][:120] if tail else f"exit {r.returncode}")
+
+
 def _fa4_pick_num_splits(fa4_fn, run, *, batch, seqlen_q, seqlen_k, head_kv,
                          dry_ms, rep_ms):
     """Choose FA4's KV-split factor, or ``None`` when it is not a knob.
@@ -950,6 +1004,11 @@ def parse_args(argv=None):
                    help="only compute the cosine column at or below this KV length; the exact "
                         "block scores it needs cost a dense attention's worth of FLOPs per "
                         "configuration (default 32768)")
+    p.add_argument("--fa4-python", default="",
+                   help="interpreter to measure FA4 in.  Use when the sweep's "
+                        "cutlass-dsl version differs from the one FA4 is fastest "
+                        "on -- FA4 is only the denominator, so it should run "
+                        "where it performs, not where the kernels must.")
     p.add_argument("--chunk-q", type=int, default=0,
                    help="split prefill queries into chunks of this many tokens. "
                         "0 disables; -1 picks the largest chunk the indexer's Int32 "
@@ -1109,7 +1168,29 @@ def main(argv=None) -> int:
             # FA4 is a separate kernel with no such limit, so it must not be
             # gated on the repo dense being reachable -- it is precisely at the
             # lengths the repo kernel cannot reach that its reference matters.
-            if fa4_fn is not None:
+            if args.fa4_python:
+                ms, why = _fa4_subprocess(
+                    args.fa4_python, args.fa4_path, model=model, batch=args.batch,
+                    seqlen_q=seqlen_q, seqlen_k=seqlen_k, dry_ms=args.dry_ms,
+                    rep_ms=args.rep_ms, seed=args.seed)
+                if ms is None:
+                    print(f"      !! FA4 (external interpreter) failed: {why}")
+                else:
+                    row = {"name": "dense-fa4",
+                           "label": f"FlashAttention-4 causal ({args.fa4_python})",
+                           "batch": args.batch, "seqlen_q": seqlen_q,
+                           "seqlen_k": seqlen_k, "head_q": model.num_qo_heads,
+                           "head_kv": model.num_kv_heads,
+                           "head_dim": model.bench_head_dim(),
+                           "stages": {"attn": {"ms": ms}}, "pipeline_ms": ms,
+                           "pipeline_gpu_ms": ms, "attn_ms_only": ms,
+                           "supported": True, "errors": {}}
+                    rows.append(row)
+                    print_row(row, dense_ms)
+                    if dense_ms is None:
+                        dense_ms = ms
+                        print("      -- vs_dense below is against FA4")
+            elif fa4_fn is not None:
                 try:
                     fa4_row, _ = bench_fa4(
                         fa4_fn, model=model, batch=args.batch, seqlen_q=seqlen_q,
