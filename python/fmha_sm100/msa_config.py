@@ -153,11 +153,13 @@ class MsaSparseConfig:
     def num_scorer_heads(self, num_qo_heads: int, num_kv_heads: int) -> int:
         """Score rows the block scorer must emit.
 
-        MSA's indexer scores with a proxy query **per KV head**, so every mode
-        starts from the same ``num_kv_heads`` rows — ``head_mode`` only decides
-        what happens to them afterwards.  ``shared_index`` is the one knob that
-        changes the scorer itself, collapsing it to a single row (the DSA-style
-        "one index for the whole layer").
+        The paper fixes this: the Index Branch carries "one index query head for
+        each GQA group and a single" index key head, emitting ``(N, Hkv, B)``.
+        So every mode starts from the same ``num_kv_heads`` score rows produced
+        against **one** index key head — ``head_mode`` only decides what happens
+        to those rows afterwards.  ``shared_index`` collapses the scorer to a
+        single row (the DSA-style "one index for the whole layer"), which is a
+        departure from MSA's design, not a cheaper way to compute it.
 
         ``num_qo_heads`` is accepted for signature stability and validation; the
         scorer cost does not depend on it.

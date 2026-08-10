@@ -525,8 +525,14 @@ def bench_config(
             _idx_cu_q = (cu_seqlens_q if _idx_q_len == seqlen_q else
                          torch.arange(0, (batch + 1) * _idx_q_len, _idx_q_len,
                                       dtype=torch.int32, device=device))
+            # The Index Branch geometry is fixed by the architecture, not by
+            # head_mode: "one index query head for each GQA group and a single"
+            # index key head, emitting (N, H_kv, B) scores.  So head_q tracks
+            # the GQA group count and head_kv is always 1.  Tying head_kv to
+            # the selection count made `keep` score against four index key
+            # heads and read four times the K it should.
             idx_in = make_fp4_indexer_inputs(
-                total_q=_idx_total_q, head_q=row["scorer_heads"], head_kv=sel_heads,
+                total_q=_idx_total_q, head_q=row["scorer_heads"], head_kv=1,
                 k_lengths=k_lengths, device=device, seed=seed + 7,
             )
             row["indexer_q_pad"] = _idx_q_len if _idx_q_len != seqlen_q else None
