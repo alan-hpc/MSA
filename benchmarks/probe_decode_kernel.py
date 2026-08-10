@@ -117,18 +117,41 @@ def main() -> int:
                 args.seed + b * 17 + h))[: args.topk - 2].add(1).tolist() + [npage_per_seq - 1]
             sel[h, b] = torch.tensor(sorted(picks[: args.topk]), dtype=torch.int32, device=dev)
 
+    # The sparse path (q2k_indices != None) is a stub, but the *dense* paged
+    # decode kernel is implemented -- and a dense kernel handed a page table that
+    # lists only the selected blocks reads exactly those blocks.  That is sparse
+    # decode, built from what exists.  It needs the selection to be shared across
+    # KV heads, since a page table is per request, not per head; head_mode
+    # max/sum produce exactly one shared selection, which is what cfg10/cfg12 use.
+    shared = sel[0]                                     # [B, topk], head 0
+    sel_pt = torch.empty((B, args.topk), dtype=torch.int32, device=dev)
+    for b in range(B):
+        sel_pt[b] = shared[b] + b * npage_per_seq       # logical -> physical
+    sel_seqused = torch.full((B,), args.topk * page, dtype=torch.int32, device=dev)
+
+    # The fp8 decode kernel packs seqlen_q * qhead_per_kv into a 128-row tile and
+    # assumes the tile is full, so it wants seqlen_q = 128 / qhead_per_kv = 16.
+    # It is built for speculative decode, not single-token decode.  Pad instead of
+    # giving up: broadcast the one query across the tile and read the last row,
+    # which under causal masking is the row that sees the whole KV run.  The waste
+    # is Q-side only, and decode is overwhelmingly KV-bound -- 16 query rows
+    # against topk*page*Hkv*D bytes of KV is nothing.
+    qtok = 128 // group
+    q_pad = q.unsqueeze(1).expand(B, qtok, HQ, D).reshape(B * qtok, HQ, D).contiguous()
+
     wrapper = SparseDecodePagedAttentionWrapper(blk_kv=page, causal=True)
     try:
-        wrapper.plan(page_table=page_table, seqused_k=seqused, seqlen_q=1,
-                     max_seqlen_k=S, q2k_indices=sel,
+        wrapper.plan(page_table=sel_pt, seqused_k=sel_seqused, seqlen_q=qtok,
+                     max_seqlen_k=args.topk * page, q2k_indices=None,
                      num_qo_heads=HQ, num_kv_heads=HKV, head_dim=D)
     except Exception as exc:  # noqa: BLE001
         print(f"plan 失败: {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
         return 1
 
     try:
-        out = wrapper.run(q.reshape(B, HQ, D), k, v, softmax_scale=scale)
-        out = (out[0] if isinstance(out, (tuple, list)) else out).reshape(B, HQ, D)
+        out = wrapper.run(q_pad, k, v, softmax_scale=scale)
+        out = (out[0] if isinstance(out, (tuple, list)) else out)
+        out = out.reshape(B, qtok, HQ, D)[:, -1]     # last row sees the full run
         torch.cuda.synchronize()
     except Exception as exc:  # noqa: BLE001
         print(f"run 失败: {type(exc).__name__}: {str(exc).splitlines()[0][:120]}")
@@ -144,7 +167,7 @@ def main() -> int:
         worst = min(worst, float(c.min()))
         print(f"   请求 {b:>3}: cos 均值={float(c.mean()):.6f} 最差={float(c.min()):.6f}")
 
-    ms = timed_ms(lambda: wrapper.run(q.reshape(B, HQ, D), k, v, softmax_scale=scale))
+    ms = timed_ms(lambda: wrapper.run(q_pad, k, v, softmax_scale=scale))
     sel_bytes = B * args.topk * page * HKV * D * 2 * 2
     all_bytes = B * S * HKV * D * 2 * 2
     print(f"\n延迟: {ms:.4f} ms")

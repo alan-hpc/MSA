@@ -777,52 +777,55 @@ indexer 的 Int32 分数张量（§2）与 blk=32/topk=32 的内存墙（§20）
 ---
 ---
 
-## 23. 🔴 decode 快不起来的真正原因：前向内核本身没有实现
+## 23. 🔴 decode 快不起来：paged decode 内核在本环境编译不出来
 
-本报告此前把 decode 的 0.39× 归因于「模型 `qhead_per_kv=8`，而 sparse paged decode
-要求 16」。**这个归因是错的**，来源是一句 docstring。逐层追下去，一共有四层：
+decode 的 0.39× 此前被归因为「模型 `qhead_per_kv=8`，而 sparse paged decode 要求 16」。
+**这个归因从头到尾是错的。** 逐层追下去共六层：
 
 | # | 位置 | 性质 | 结果 |
 |---|---|---|---|
-| 1 | `sparse_decode_schedule_ext` 编译失败（`cusparse.h` 找不到） | **构建缺陷** | ✅ 已修，见下 |
-| 2 | `decode_schedule.py:144` `!= 16` | 守卫 | 放开后可继续 |
-| 3 | `build_decode_schedule.cu:529` `TORCH_CHECK(... == 16)` | 守卫 | 放开后可继续 |
-| 4 | `interface.py` run 路径 `!= _SUPPORTED_DECODE_QHEAD_PER_KV` | 守卫 | 放开后可继续 |
-| 5 | **`SM100 paged fp8 sparse decode forward is not implemented yet`** | **真的没实现** | 🔴 **到底了** |
+| 1 | `sparse_decode_schedule_ext` 编译失败（`cusparse.h`） | 构建缺陷 | ✅ 已修 |
+| 2 | `decode_schedule.py` `!= 16` | 守卫 | 放开可继续 |
+| 3 | `build_decode_schedule.cu` `TORCH_CHECK(==16)` | 守卫 | 放开可继续 |
+| 4 | `interface.py` run 路径 `!= 16` | 守卫 | 放开可继续 |
+| 5 | `if q2k_indices is not None: raise` — 稀疏 gather 未实现 | 真缺失 | **可绕过**，见下 |
+| 6 | `atten_fwd.py:2574` 要求满 packed-q tile（`seqlen_q == 128/qhead_per_kv`） | 真限制 | **可绕过**，见下 |
+| 7 | **`DSLOperationBuildError`（CuTe 编译失败）** | **内核构建不出来** | 🔴 **到底** |
 
-**结论：快速 decode 路径在本仓库里不存在。** 包装器、调度器、三层参数校验都在，
-CuTe 内核也接受 `qhead_per_kv in (16, 8, 4, 2, 1)`，**但前向内核是个占位**。
-`qhead_per_kv=16` 从来不是原因——把它改成 16 也一样跑不起来。
+### 第 5、6 层其实都有解
 
-前三层守卫我放开验证过、随后**撤回了**：它们只是把报错从"不支持 8"推到
-"没实现"，留着反而让人以为 16 就能用。修法应当是把第 2/3/4 层的报错文案
-改成指向第 5 层，而不是放宽它们。
+**第 5 层**：报错条件是 `q2k_indices is not None`，也就是说
+**dense paged decode 是实现了的**，缺的只是按 q2k gather。但这层可以绕过：
+**把 page table 只填 top-k 选中的块**，dense 内核就只读那些页——这就是稀疏 decode，
+不需要 gather 路径。仓库里 `sparse_fmha_adapter._build_page_table` 做的正是这件事。
+前提是选择跨 head 共享，而 `head_mode=max/sum` 产出的正好是 1 份共享选择（cfg10/cfg12 都是 `max`）。
 
-### ✅ 已修：decode 调度扩展从未编译成功过
+**第 6 层**：内核把 `seqlen_q × qhead_per_kv` 打包进 128 行 tile 且假设 tile 是满的
+（它是为投机解码/MTP 设计的，不是单 token decode）。可以把 query 复制填满 tile、
+取因果上看得最全的那一行——Q 侧多算 16 倍，而 decode 是 KV 主导的，这点浪费可忽略。
 
-`build_decode_schedule/__init__.py` 缺两样，都是 §10 已在 `build_k2q_csr` 修过的：
+### 但第 7 层挡死了
 
-- 没有 `extra_include_paths` → `cusparse.h: No such file`
-  （torch 的 `CUDAContextLight.h` 引它，而 pip 版 CUDA 只把它放在 wheel 里）
-- `-arch=sm_100` 写死 → B300 是 sm_103，会走 PTX JIT
+放开 2/3/4、用 page-table 绕过 5、用 padding 绕过 6 之后，内核在 CuTe 编译阶段失败：
 
-现在改为复用 `build_k2q_csr` 的 `_nvidia_wheel_include_dirs()` /
-`_cuda_arch_flag()` / `_template_stub_flags()`，而不是各写一份。
-**这解释了为什么这条路径从未被真正跑到过**：它连编译都没成功。
+```
+DSLOperationBuildError
+```
 
-### decode 要变快，需要什么
+**而且在官方支持的 `qhead_per_kv=16` 下同样失败**（Hq=64/Hkv=4 实测）。
+所以这与 head 数无关——**这条 paged fp8 decode 内核在本环境根本构建不出来**，
+`qhead_per_kv` 在任何一层都不是真正的原因。
 
-按 §17 的带宽账：128K decode 只需读 0.78% 的 KV，带宽下界约 **0.008 ms**，
-而当前经 prefill 内核的路径是 **3.1 ms**——空间是 380×，但要拿到它必须
-**实现 SM100 paged fp8 sparse decode forward**。这是一个真实的内核工作项，
-不是放开某个开关。
+第 2/3/4 层的放宽已撤回：它们解锁不了任何东西，留着只会让人以为 16 可用。
 
-`benchmarks/probe_decode_kernel.py` 已备好：内核一旦存在，它在
-`qhead_per_kv=8` 下对 fp32 参考验正确性，并按"只读选中块"的口径报带宽。
+### 下一步
 
-> 同一模式第三次出现（§21、§22、本节），但这次结论相反：
-> **前两次"文档写的限制"是假的，这次是真的——只是写错了地方。**
-> 真正的限制比文档说的更靠后、也更根本。
+诊断 `DSLOperationBuildError` 需要拿到 CuTe 的完整报错（当前异常体是空的），
+路径是 `python/fmha_sm100/cute/src/sm100/fwd_decode/atten_fwd.py`。
+在它能构建之前，decode 的 380× 空间（§17：0.008 ms 带宽下界 vs 3.1 ms 实测）拿不到。
+
+`benchmarks/probe_decode_kernel.py` 保留了完整的绕行链路（page-table 稀疏 + query padding），
+内核一通就能直接验正确性与带宽。
 
 
 ## 配置选择结论
