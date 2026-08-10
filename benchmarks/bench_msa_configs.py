@@ -683,14 +683,21 @@ def _decode_fast_subprocess(python, *, model, batch, seqlen_k, block_size, topk,
     group = model.num_qo_heads // model.num_kv_heads
     if PAGE_FOR_FAST_DECODE % block_size and block_size % PAGE_FOR_FAST_DECODE:
         return None, None, f"page_size ({block_size}) must equal n_block_size (128)"
-    if head_mode not in ("sum", "max"):
-        return None, None, f"head_mode {head_mode!r} selects per KV head; the page table is shared"
+    # head_mode=keep gives every KV head its own selection, and a page table is
+    # per request, not per head.  Rather than skip the config, make each (request,
+    # KV head) pair its own request: batch becomes batch*head_kv with head_kv=1,
+    # which is exactly the shape a per-head selection describes.  It reads up to
+    # head_kv times more KV than a shared selection does -- that is what keep
+    # costs, not an artifact of the mapping.
+    heads_as_batch = head_mode == "keep"
     if 128 % group:
         return None, None, f"qhead_per_kv ({group}) must divide the 128-row packed-q tile"
 
-    cfg = json.dumps(dict(batch=batch, seqlen_k=seqlen_k, topk=topk, seed=seed,
-                          group=group, head_kv=model.num_kv_heads,
-                          dim=model.bench_head_dim(), dry=dry_ms, rep=rep_ms))
+    cfg = json.dumps(dict(
+        batch=batch * model.num_kv_heads if heads_as_batch else batch,
+        head_kv=1 if heads_as_batch else model.num_kv_heads,
+        heads_as_batch=heads_as_batch, seqlen_k=seqlen_k, topk=topk, seed=seed,
+        group=group, dim=model.bench_head_dim(), dry=dry_ms, rep=rep_ms))
     body = r"""
 import sys, json, types, torch
 CFG = json.loads(sys.argv[1])
@@ -771,46 +778,84 @@ print("RESULT " + json.dumps({"ms": ts[len(ts)//2], "cos": cos}))
 
 
 def _fa4_subprocess(python, fa4_path, *, model, batch, seqlen_q, seqlen_k,
-                    dry_ms, rep_ms, seed, timeout=1800):
+                    dry_ms, rep_ms, seed, timeout=1800, force_batch_chunk=None):
     """Measure FA4 in another interpreter, so its cutlass version is its own.
 
     The MSA decode kernels need cutlass-dsl 4.5.x and FA4 is 3.3x slower there;
     4.6+ reverses it.  One process cannot hold both, and FA4 is only the
     reference denominator -- so run it where it is fastest and let the sweep run
     where it must.  Returns the median latency in ms, or None with a reason.
+
+    Decode also has to split the batch.  FA4 takes a flat unpaged KV, so it
+    materialises ``2 * batch * seqlen_k * head_kv * dim`` elements -- 69 GB at
+    batch 32 and 1M, which OOMs on any single device.  Requests in a batch are
+    independent and the device runs the groups one after another either way, so
+    timing each group and adding the results is what the unsplit call would have
+    cost, the same argument that makes _merge_batch exact.  Groups are sized
+    from free memory at run time, and a shape that already fits still takes the
+    single-allocation path unchanged.
     """
     import json as _json
     import subprocess
     import textwrap
 
     src = textwrap.dedent(f"""
-        import json, sys, types, torch
+        import inspect, json, sys, types, torch
         sys.path.insert(0, {fa4_path!r})
         sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
         from flash_attn.cute.interface import flash_attn_varlen_func as fa4
         B, SQ, SK = {batch}, {seqlen_q}, {seqlen_k}
         HQ, HKV, D = {model.num_qo_heads}, {model.num_kv_heads}, {model.bench_head_dim()}
         g = torch.Generator(device="cuda").manual_seed({seed})
-        q = torch.randn((B*SQ, HQ, D), generator=g, device="cuda").to(torch.bfloat16)
-        k = torch.randn((B*SK, HKV, D), generator=g, device="cuda").to(torch.bfloat16)
-        v = torch.randn((B*SK, HKV, D), generator=g, device="cuda").to(torch.bfloat16)
-        cq = torch.arange(0, (B+1)*SQ, SQ, dtype=torch.int32, device="cuda")
-        ck = torch.arange(0, (B+1)*SK, SK, dtype=torch.int32, device="cuda")
-        run = lambda: fa4(q, k, v, cu_seqlens_q=cq, cu_seqlens_k=ck,
-                          max_seqlen_q=SQ, max_seqlen_k=SK, causal=True)
         flush = torch.empty(int(256e6), dtype=torch.int8, device="cuda")
-        run(); torch.cuda.synchronize()
+
+        # k and v together, per request in the group.  Leave the rest of free
+        # memory to the output, FA4's workspace and the flush buffer.
+        per_req = 2 * SK * HKV * D * 2
+        free = torch.cuda.mem_get_info()[0]
+        bc = max(1, min(B, int(free * 0.35) // max(1, per_req)))
+        _forced = {force_batch_chunk!r}
+        if _forced: bc = max(1, min(B, int(_forced)))
+        groups = ([bc] * (B // bc)) + ([B % bc] if B % bc else [])
+
         a, b = torch.cuda.Event(True), torch.cuda.Event(True)
-        flush.zero_(); a.record(); run(); b.record(); torch.cuda.synchronize()
-        one = max(a.elapsed_time(b), 1e-3)
-        for _ in range(max(1, int({dry_ms}/one))): flush.zero_(); run()
-        torch.cuda.synchronize()
-        s = []
-        for _ in range(max(3, int({rep_ms}/one))):
-            flush.zero_(); a.record(); run(); b.record()
-            torch.cuda.synchronize(); s.append(a.elapsed_time(b))
-        s.sort()
-        print("RESULT " + json.dumps({{"ms": s[len(s)//2]}}))
+
+        def time_group(n):
+            q = torch.randn((n*SQ, HQ, D), generator=g, device="cuda").to(torch.bfloat16)
+            k = torch.randn((n*SK, HKV, D), generator=g, device="cuda").to(torch.bfloat16)
+            v = torch.randn((n*SK, HKV, D), generator=g, device="cuda").to(torch.bfloat16)
+            cq = torch.arange(0, (n+1)*SQ, SQ, dtype=torch.int32, device="cuda")
+            ck = torch.arange(0, (n+1)*SK, SK, dtype=torch.int32, device="cuda")
+            # num_splits would be the knob that restores occupancy for a small
+            # group, but passing it makes FA4 fail to compile on this cutlass
+            # version ("make every assignment to nheads_in_l2 produce the same
+            # type"), and it takes the unsplit path down with it.  So a split
+            # measurement here runs at whatever occupancy the group gives.
+            run = lambda: fa4(q, k, v, cu_seqlens_q=cq, cu_seqlens_k=ck,
+                              max_seqlen_q=SQ, max_seqlen_k=SK, causal=True)
+            run(); torch.cuda.synchronize()
+            flush.zero_(); a.record(); run(); b.record(); torch.cuda.synchronize()
+            one = max(a.elapsed_time(b), 1e-3)
+            for _ in range(max(1, int({dry_ms}/one))): flush.zero_(); run()
+            torch.cuda.synchronize()
+            s = []
+            for _ in range(max(3, int({rep_ms}/one))):
+                flush.zero_(); a.record(); run(); b.record()
+                torch.cuda.synchronize(); s.append(a.elapsed_time(b))
+            s.sort()
+            del q, k, v, cq, ck
+            torch.cuda.empty_cache()
+            return s[len(s)//2]
+
+        # One timing per distinct group size, not per group: equal groups cost
+        # the same and re-timing them would only add noise.
+        seen = {{}}
+        total = 0.0
+        for n in groups:
+            if n not in seen: seen[n] = time_group(n)
+            total += seen[n]
+        print("RESULT " + json.dumps({{"ms": total, "batch_chunk": bc,
+                                     "num_batch_chunks": len(groups)}}))
     """)
     try:
         r = subprocess.run([python, "-c", src], capture_output=True, text=True,
@@ -819,9 +864,28 @@ def _fa4_subprocess(python, fa4_path, *, model, batch, seqlen_q, seqlen_k,
         return None, "timed out"
     for line in r.stdout.splitlines():
         if line.startswith("RESULT "):
-            return _json.loads(line[7:])["ms"], None
-    tail = (r.stderr or r.stdout).strip().splitlines()
-    return None, (tail[-1][:120] if tail else f"exit {r.returncode}")
+            d = _json.loads(line[7:])
+            if d.get("num_batch_chunks", 1) > 1:
+                # Splitting keeps the shape runnable but not measurable.  A
+                # decode group of a few requests leaves the device mostly idle,
+                # so the groups add up to far more than the same work unsplit:
+                # measured 4.11x at 256K and 4.01x at 512K against their own
+                # unsplit runs.  num_splits would be the fix but it fails to
+                # compile on this cutlass version.  Reporting the sum would
+                # inflate every ratio built on this denominator, so decline it
+                # -- the in-repo dense row is a valid denominator at this shape.
+                return None, (f"needs {d['num_batch_chunks']} batch groups to fit memory; "
+                              f"a split decode measures ~4x its unsplit cost, so the "
+                              f"number would not be comparable")
+            return d["ms"], None
+    # Keep enough of the traceback to identify the failure.  A single trailing
+    # line routinely cuts the message mid-sentence and sends the reader after
+    # the wrong cause.
+    tail = [l for l in (r.stderr or r.stdout).strip().splitlines() if l.strip()]
+    if not tail:
+        return None, f"exit {r.returncode}"
+    err = [l for l in tail if l.startswith(("Traceback", "  File")) is False]
+    return None, " | ".join(err[-3:])[:400]
 
 
 def _fa4_pick_num_splits(fa4_fn, run, *, batch, seqlen_q, seqlen_k, head_kv,
@@ -1400,7 +1464,7 @@ def main(argv=None) -> int:
             # lives in another environment, so measure it there and print it
             # next to its in-process counterpart rather than leaving the table
             # to imply the slow path is all there is.
-            if args.mode == "decode" and args.decode_python and cfg.head_mode != "keep":
+            if args.mode == "decode" and args.decode_python:
                 ms, cos, why = _decode_fast_subprocess(
                     args.decode_python, model=model, batch=args.batch,
                     seqlen_k=seqlen_k, block_size=cfg.block_size, topk=cfg.topk,
@@ -1419,7 +1483,9 @@ def main(argv=None) -> int:
                             "cos_min": cos, "supported": True, "errors": {}}
                     rows.append(fast)
                     print_row(fast, dense_ms)
-                    print(f"      -- paged decode kernel, only the selected blocks; "
+                    extra = (f"; per-KV-head selection run as {model.num_kv_heads}x "
+                             f"the requests" if cfg.head_mode == "keep" else "")
+                    print(f"      -- paged decode kernel, only the selected blocks{extra}; "
                           f"worst cos {cos:.5f} vs fp32")
             flush()
             try:
