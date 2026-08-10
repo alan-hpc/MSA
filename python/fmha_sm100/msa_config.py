@@ -521,14 +521,21 @@ def model_by_name(name: str) -> MsaModelShape:
     raise KeyError(f"unknown model {name!r}; known: {known}")
 
 
-#: The shipped MSA production point: 128-token blocks, top-16, no forced
-#: windows, per-KV-head (proxy-Q) scoring.  Used as the reference row that every
-#: swept configuration is compared against.
+#: The shipped MSA production point: 128-token blocks, top-16, per-KV-head
+#: (proxy-Q) scoring, with the 128-token sink and local windows forced.  Used as
+#: the reference row every swept configuration is compared against.
+#:
+#: The windows are charged against the budget rather than added to it: at
+#: block_size 128 each is ceil(128/128) = 1 block, so 2 of the 16 are pinned and
+#: 14 are chosen by score.  Leaving them off would make the baseline the one
+#: configuration in the sweep without a guaranteed sink or local window, which
+#: is not the shipped behaviour and made its quality numbers incomparable with
+#: the rest of the grid.
 BASELINE_CONFIG = MsaSparseConfig(
     block_size=128,
     topk=16,
-    force_init_tokens=0,
-    force_end_tokens=0,
+    force_init_tokens=128,
+    force_end_tokens=128,
     head_mode="keep",
     name="baseline",
 ).validate()
