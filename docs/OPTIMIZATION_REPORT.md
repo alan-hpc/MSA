@@ -817,15 +817,33 @@ decode 的 0.39× 先后被归因为「`qhead_per_kv` 必须是 16」和「前�
 **此前所有 decode 数字都来自 prefill 内核**——那是这条路径从未编译成功的直接后果
 （其调度扩展的构建缺陷见本节下方，今天才修复）。
 
-### 落地还需要什么
+### ✅ 版本阻塞已解除
 
-1. **版本**：把 decode 路径跑在 cutlass-dsl 4.5.1 上，或修 `fwd_decode/tile_scheduler.py`
-   的 CLC 路径以通过 4.6.0 的 MLIR 验证。**这是唯一的硬阻塞。**
-2. **稀疏接入**：`if q2k_indices is not None` 的 gather 路径仍是 stub，但可绕过——
+容器已切到 **cutlass-dsl 4.5.1 + quack-kernels 0.4.1**。两个包必须**配套**降级：
+`quack 0.6.1` 用了 4.6.0 才有的 `cpasync.ReductionKind`，只降 cutlass 会让 prefill 路径
+直接崩在 import 上。切换后两侧都验过：
+
+```
+decode 正确性：4 / 4 PASS（仓库自带测试）
+prefill 切块：32K/128K 逐位精确，最大差 0.000e+00
+正确性门：All forced-block tests PASSED
+```
+
+> 注意 `vllm` 声明依赖 4.6.0，切换后会有版本警告。同容器要跑 vllm 需给它独立环境。
+
+### 落地还需要什么
+1. **稀疏接入（未验证）**：`if q2k_indices is not None` 的 gather 路径仍是 stub。
+   设想的绕法是——
    **page table 只填 top-k 选中的块**，dense 内核就只读那些页
    （需 `head_mode=max/sum` 的跨 head 共享选择；`sparse_fmha_adapter._build_page_table` 已有此能力）。
-3. **单 token**：内核要求填满 packed-q tile（`seqlen_q == 128/qhead_per_kv`，为投机解码设计），
-   可用 query 复制填满、取因果最全那行绕过；Q 侧浪费在 KV 主导的 decode 下可忽略。
+2. **单 token（未验证）**：内核要求填满 packed-q tile（`seqlen_q == 128/qhead_per_kv`，
+   为投机解码设计），设想用 query 复制填满、取因果最全那行绕过。
+
+> **这两条我实现并测过一版，输出不正确**（对选中块 cos 0.23，对前 topk 块 cos 0.04，
+> 两个参考都不匹配），代码已撤回。仓库自带的 decode 测试是通过的，所以问题在这套
+> page-table + query padding 的布线上，不在内核。**下次从仓库测试的
+> `_build_decode_paged_dense_inputs` 出发逐步改造**，而不是另起一套输入构造——
+> 这次两次绕远都是因为自己写参考和输入。
 
 ### ✅ 已修：decode 调度扩展从未编译成功过
 
