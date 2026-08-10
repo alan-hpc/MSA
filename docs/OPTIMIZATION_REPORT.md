@@ -831,7 +831,41 @@ prefill 切块：32K/128K 逐位精确，最大差 0.000e+00
 
 > 注意 `vllm` 声明依赖 4.6.0，切换后会有版本警告。同容器要跑 vllm 需给它独立环境。
 
-### 落地还需要什么
+### ✅ 已接入：`MsaSparseAttention.decode_attend`
+
+正确性对的是仓库自己的 `_decode_paged_dense_reference`：
+
+| ctx | 读全量 | `decode_attend` | 加速 | 最差 cos |
+|---|---|---|---|---|
+| 32K | 0.191 ms | 0.214 ms | 0.9× | 0.9986 |
+| 128K | 0.687 ms | **0.207 ms** | **3.3×** | 0.9986 |
+| 512K | 2.670 ms | **0.211 ms** | **12.6×** | 0.9983 |
+
+对照 128K decode（batch=32）的既有测量：
+
+| 路径 | 128K | 相对 dense |
+|---|---|---|
+| dense（bf16） | 1.210 ms | 1.0× |
+| 当前稀疏流水线（走 prefill 内核） | 3.143 ms | 0.39× |
+| **`decode_attend`** | **0.207 ms** | **5.8×** |
+
+**这是 decode 第一次赢过 dense。** 相对当前稀疏路径是 15.2×。
+
+**两个此前以为的阻塞都不需要新内核：**
+- 稀疏用 page table 承载（只填选中块，dense 内核就只读那些页），
+  需 `head_mode=sum/max` 的共享选择
+- 单 token 用 query 复制填满 packed-q tile、取因果最全那行
+
+**一个关键实现细节**：物理页号必须 `torch.gather(page_table, 1, selection)` 取，
+不能自己按 `sel + b*num_pages` 推——调用方的 page table 未必是连续布局。
+我第一版就错在这里，输出 cos 只有 0.23。
+
+**剩余开销**：0.207 ms 里内核本身只占 0.027 ms，其余是每步的 `plan()`
+（调度构建 + 一次 D2H）。因为 page table 每个 token 都变，当前 API 下 plan 必须重跑。
+要进一步逼近 0.027 ms，需要把调度构建与 page table 解耦——调度只依赖形状和
+`seqused_k`，两者在 decode 循环里都是常量。
+
+### 早先版本阻塞的处理
 1. **稀疏接入（未验证）**：`if q2k_indices is not None` 的 gather 路径仍是 stub。
    设想的绕法是——
    **page table 只填 top-k 选中的块**，dense 内核就只读那些页
