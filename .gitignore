@@ -30,3 +30,13 @@ profiles/
 *.swp
 .DS_Store
 tests/logs/
+results/
+# written by init.sh / benchmark.sh
+.msa_env
+.msa_venv/
+.aot_done
+.tmp/
+
+# internal handoff doc -- do not publish
+MSA_复测交接.md
+docs/indexer-optimization.html
