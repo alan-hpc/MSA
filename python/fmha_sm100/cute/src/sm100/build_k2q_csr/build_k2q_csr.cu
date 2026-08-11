@@ -22,7 +22,11 @@
 // global q-sorted output.
 
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
+#ifndef AT_CUDA_CHECK
+#define AT_CUDA_CHECK C10_CUDA_CHECK
+#endif
 #include <cuda.h>
 #include <cuda_runtime.h>
 
@@ -544,7 +548,7 @@ static void launch_pipeline(
     TORCH_CHECK(topK == kTopK, "topK runtime != template kTopK");
     int B = (int)cu_q.size(0) - 1;
     auto device = q2k.device();
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
     AT_CUDA_CHECK(cudaMemsetAsync(
         row_ptr.data_ptr<int>(), 0,
@@ -708,7 +712,7 @@ void run_build_k2q_csr(
     TORCH_CHECK(q_idx.size(0) == H && q_idx.size(1) == (int64_t)S_Q * (int)topk,
                 "q_idx shape mismatch");
     if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
         AT_CUDA_CHECK(cudaMemsetAsync(
             row_ptr.data_ptr<int>(), 0,
             (size_t)H * (tr + 1) * sizeof(int), stream));
@@ -780,7 +784,7 @@ void run_build_k2q_csr_with_schedule(
                 && split_counts.size(1) == H,
                 "split_counts shape mismatch");
     if (S_Q == 0 || tr == 0 || H == 0 || mkv == 0) {
-        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+        cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
         AT_CUDA_CHECK(cudaMemsetAsync(
             row_ptr.data_ptr<int>(), 0,
             (size_t)H * (tr + 1) * sizeof(int), stream));

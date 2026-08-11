@@ -3,8 +3,11 @@
 
 #include <torch/extension.h>
 
-#include <ATen/cuda/CUDAContext.h>
-#include <ATen/cuda/Exceptions.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAException.h>
+#ifndef AT_CUDA_CHECK
+#define AT_CUDA_CHECK C10_CUDA_CHECK
+#endif
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
@@ -526,8 +529,11 @@ py::dict build_decode_schedule(
   TORCH_CHECK(num_qo_heads > 0 && num_kv_heads > 0, "head counts must be positive");
   TORCH_CHECK(num_qo_heads % num_kv_heads == 0,
               "num_qo_heads must be divisible by num_kv_heads");
-  TORCH_CHECK(num_qo_heads / num_kv_heads == kTargetDecodeQHeadPerKv,
-              "decode schedule currently supports only qhead_per_kv=16");
+  {
+    const int64_t g = num_qo_heads / num_kv_heads;
+    TORCH_CHECK(g == 16 || g == 8 || g == 4 || g == 2 || g == 1,
+                "decode schedule supports qhead_per_kv in (16, 8, 4, 2, 1), got ", g);
+  }
   TORCH_CHECK(head_dim == kTargetDecodeHeadDim,
               "decode schedule currently supports only head_dim=128");
   TORCH_CHECK(max_seqlen_k > 0, "max_seqlen_k must be positive");
@@ -587,7 +593,7 @@ py::dict build_decode_schedule(
   auto o_indptr_tensor = torch::empty({batch + 1}, i32_options);
   auto info_tensor = torch::empty({5}, i32_options);
 
-  cudaStream_t stream = at::cuda::getCurrentCUDAStream(seqused_k.get_device());
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream(seqused_k.get_device());
 
   // tpb: threads per CTA.  Use 128 (4 warps) so we have plenty of warps
   // for the per-CTA setup phase and for scatter work.  CTA 0's warp 0

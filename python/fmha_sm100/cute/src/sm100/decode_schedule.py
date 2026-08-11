@@ -140,8 +140,10 @@ def prepare_decode_schedule(
         raise ValueError("head counts must be positive")
     if int(num_qo_heads) % int(num_kv_heads) != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
-    if int(num_qo_heads) // int(num_kv_heads) != 16:
-        raise NotImplementedError("decode schedule currently supports only qhead_per_kv=16")
+    _group = int(num_qo_heads) // int(num_kv_heads)
+    if _group not in (16, 8, 4, 2, 1):
+        raise NotImplementedError(
+            f"decode schedule supports qhead_per_kv in (16, 8, 4, 2, 1), got {_group}")
     if int(head_dim) != 128:
         raise NotImplementedError("decode schedule currently supports only head_dim=128")
     if int(max_seqlen_k) <= 0:
