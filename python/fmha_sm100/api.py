@@ -23,7 +23,12 @@ from .jit import _dlpack_dtype_code, _PACK_FACTORS, get_fmha_variant, get_reduct
 from .sparse_fmha_adapter import sparse_fmha, sparse_fmha_plan
 
 
-_np_staging = np.empty(4096 * 1024, dtype=np.int32)
+# Pinned, not plain numpy: the host-to-device copy below is illegal inside a
+# CUDA graph capture unless its source is pinned, which is what stopped vLLM
+# from capturing a model that plans through here. A view of pinned storage
+# stays pinned, so the numpy alias is only for the assignment syntax.
+_pin_staging = torch.empty(4096 * 1024, dtype=torch.int32, pin_memory=True)
+_np_staging = _pin_staging.numpy()
 _np_staging_offset = 0
 
 def _reset_np_staging():
@@ -31,16 +36,19 @@ def _reset_np_staging():
     _np_staging_offset = 0
 
 def _plan_buf_from_list(data, device):
-    global _np_staging, _np_staging_offset
+    global _np_staging, _np_staging_offset, _pin_staging
     n = len(data)
     end = _np_staging_offset + n
     if end > _np_staging.shape[0]:
-        _np_staging = np.empty(max(end, _np_staging.shape[0] * 2), dtype=np.int32)
+        _pin_staging = torch.empty(
+            max(end, _np_staging.shape[0] * 2), dtype=torch.int32, pin_memory=True
+        )
+        _np_staging = _pin_staging.numpy()
         _np_staging_offset = 0
         end = n
     _np_staging[_np_staging_offset:end] = data
     buf = torch.empty(n, dtype=torch.int32, device=device)
-    buf.copy_(torch.from_numpy(_np_staging[_np_staging_offset:end]), non_blocking=True)
+    buf.copy_(_pin_staging[_np_staging_offset:end], non_blocking=True)
     _np_staging_offset = end
     return buf
 
