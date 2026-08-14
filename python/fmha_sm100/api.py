@@ -1022,6 +1022,24 @@ def fmha_sm100_plan(
         decode = _fmha_sm100_plan(decode_qo_segment_lens, decode_kv_segment_lens, *args,
                                     qo_offset=decode_qo_offset, **kwargs)
         decode = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in decode.items()}
+        # fmha_sm100() re-derives these three scalars from plan tensors via
+        # .item() on every call, but this plan is built once per step and
+        # shared by every layer (see compass_msa_indexer.build_plan). Each
+        # .item() is a host sync, so paying it once here instead of once per
+        # layer turns 45 syncs a step into 1 -- and since CUDA execution is
+        # queued, a sync anywhere blocks on the whole backlog ahead of it, not
+        # just the small compute needed for the scalar itself.
+        decode_pack = decode.get("pack_factor", 1)
+        decode["_decode_nnz"] = decode["qo_segment_offsets"][-1].item() // decode_pack
+        # The plan dict carries both the paged and dense keys unconditionally,
+        # with whichever mode was not used set to None -- "in decode" is true
+        # either way, so the presence check has to be on the value.
+        if decode.get("kv_page_indptr") is not None:
+            decode["_kv_page_split"] = decode["kv_page_indptr"][-1].item()
+        elif decode.get("kv_segment_offsets") is not None:
+            decode["_decode_kv_nnz"] = decode["kv_segment_offsets"][-1].item()
+        elif decode.get("cu_seqlens_k") is not None:
+            decode["_decode_kv_nnz"] = decode["cu_seqlens_k"][-1].item()
         prefill_qo_segment_lens = qo_segment_lens[split:]
         prefill_kv_segment_lens = kv_segment_lens[split:]
         prefill_qo_offset = qo_offset[split:]
@@ -1097,8 +1115,11 @@ def fmha_sm100(
         return _fmha_sm100(q, k, v, decode, out=out, max_score=max_score, kv_indices=kv_indices,kv_block_indexes=kv_block_indexes, q_offset_override=q_offset_override, **kwargs)
     else:
 
-        decode_pack = decode.get("pack_factor", 1)
-        decode_nnz = decode["qo_segment_offsets"][-1].item() // decode_pack
+        if "_decode_nnz" in decode:
+            decode_nnz = decode["_decode_nnz"]
+        else:
+            decode_pack = decode.get("pack_factor", 1)
+            decode_nnz = decode["qo_segment_offsets"][-1].item() // decode_pack
         is_paged = kv_indices is not None
         nnz_qo = q.shape[0]
         num_qo_heads = q.shape[1]
@@ -1109,14 +1130,18 @@ def fmha_sm100(
         if is_paged:
             k_decode, v_decode = k, v
             k_prefill, v_prefill = k, v
-            if "kv_page_indptr" in decode:
+            if "_kv_page_split" in decode:
+                kv_page_split = decode["_kv_page_split"]
+            elif decode.get("kv_page_indptr") is not None:
                 kv_page_split = decode["kv_page_indptr"][-1].item()
             else:
                 kv_page_split = decode["total_rows"]
             decode_kv_indices = kv_indices[:kv_page_split]
             prefill_kv_indices = kv_indices[kv_page_split:]
         else:
-            if "kv_segment_offsets" in decode:
+            if "_decode_kv_nnz" in decode:
+                decode_kv_nnz = decode["_decode_kv_nnz"]
+            elif decode.get("kv_segment_offsets") is not None:
                 decode_kv_nnz = decode["kv_segment_offsets"][-1].item()
             else:
                 decode_kv_nnz = decode["cu_seqlens_k"][-1].item()
