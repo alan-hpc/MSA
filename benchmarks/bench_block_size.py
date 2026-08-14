@@ -27,6 +27,7 @@ _spec.loader.exec_module(bm)
 H_Q = int(os.environ.get("H_Q", "32"))
 H_K = int(os.environ.get("H_K", "4"))
 D = int(os.environ.get("D", "128"))
+DTYPE = os.environ.get("DTYPE", "bf16")   # bf16 | fp8
 CONFIGS = [c.strip() for c in os.environ.get("CONFIGS", "128x16,128x8").split(",")]
 SEQS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "32768").split(",")]
 
@@ -36,7 +37,7 @@ for c in CONFIGS:
     cfgs.append((blk, topk))
 
 hdr = f"{'seq':>9} | " + " | ".join(f"{f'{b}x{t}(ms)':>12}" for b, t in cfgs) + " | budget"
-print(f"# sparse attn only | B300 | bf16 | h_q={H_Q}/h_kv={H_K} d={D} | B=1 causal", flush=True)
+print(f"# sparse attn only | B300 | {DTYPE} | h_q={H_Q}/h_kv={H_K} d={D} | B=1 causal", flush=True)
 print(hdr, flush=True)
 print("-" * len(hdr), flush=True)
 
@@ -44,7 +45,7 @@ for S in SEQS:
     cells, budgets = [], []
     for blk, topk in cfgs:
         try:
-            ms = bm.bench_sparse(1, H_Q, H_K, S, S, D, "o", True, "bf16",
+            ms = bm.bench_sparse(1, H_Q, H_K, S, S, D, "o", True, DTYPE,
                                  page_size=blk, topk=topk)[0]
             cells.append(f"{ms:>12.4f}")
         except Exception as e:
