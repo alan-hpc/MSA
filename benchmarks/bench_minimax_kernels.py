@@ -22,15 +22,17 @@ H_Q = int(os.environ.get("H_Q", "32"))
 H_K = int(os.environ.get("H_K", "4"))
 D, BLOCK, TOPK, DEV = 128, 128, 16, "cuda"
 PAGE = int(os.environ.get("PAGE", "128"))
-DT = torch.bfloat16
+DTYPE = os.environ.get("DTYPE", "bf16")
+DT = torch.float8_e4m3fn if DTYPE == "fp8" else torch.bfloat16
 SEQS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "32768").split(",")]
 
 
 def run_mk(S):
     pages = (S + PAGE - 1) // PAGE
-    q = torch.randn(S, H_Q, D, device=DEV, dtype=DT)
-    k = torch.randn(pages, H_K, PAGE, D, device=DEV, dtype=DT)
-    v = torch.randn(pages, H_K, PAGE, D, device=DEV, dtype=DT)
+    init = torch.half if DT.itemsize == 1 else DT
+    q = torch.randn(S, H_Q, D, device=DEV, dtype=init).to(DT)
+    k = torch.randn(pages, H_K, PAGE, D, device=DEV, dtype=init).to(DT)
+    v = torch.randn(pages, H_K, PAGE, D, device=DEV, dtype=init).to(DT)
     nblk = min(TOPK, (S + BLOCK - 1) // BLOCK)
     sel = torch.full((S, H_K, TOPK), -1, device=DEV, dtype=torch.int32)
     sel[:, :, :nblk] = torch.arange(nblk, device=DEV, dtype=torch.int32).view(1, 1, -1)
@@ -42,7 +44,7 @@ def run_mk(S):
         return kvouter_attention(q, k, v, sel, bt, cu_seqlens_q=cu_q,
                                  causal=True, used_kv_lens=used,
                                  block_size=BLOCK, page_size=PAGE,
-                                 out_dtype=DT, return_lse=False)
+                                 out_dtype=torch.bfloat16, return_lse=False)
 
     o, _ = fn(); torch.cuda.synchronize()
     ms = float(np.median(bench_gpu_time(fn, dry_run_time_ms=100, repeat_time_ms=400)))
@@ -50,14 +52,14 @@ def run_mk(S):
 
 
 def run_msa(S):
-    ms = bm.bench_sparse(1, H_Q, H_K, S, S, D, "o", True, "bf16",
+    ms = bm.bench_sparse(1, H_Q, H_K, S, S, D, "o", True, DTYPE,
                          page_size=PAGE, topk=TOPK)[0]
     return ms
 
 
 backend = os.environ.get("MINIMAX_KERNELS_KVOUTER_CPP", "auto")
 print(f"# attn h_q={H_Q}/h_kv={H_K} d={D} | topk={TOPK} block={BLOCK} page={PAGE} | "
-      f"bf16 causal | mk backend={backend}", flush=True)
+      f"{DTYPE} causal | mk backend={backend}", flush=True)
 print(f"{'seq':>8} | {'MSA attn(ms)':>12} | {'minimax-kernels(ms)':>19} | {'mk/MSA':>7}")
 print("-" * 60)
 for S in SEQS:
