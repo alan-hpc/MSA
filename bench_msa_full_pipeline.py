@@ -58,7 +58,7 @@ TOPK = int(os.environ.get("TOPK", "16"))
 # Default 0 = pure top-k by score, which is what the published table measured.
 FORCE_BEGIN = int(os.environ.get("FORCE_BEGIN", "0"))
 FORCE_END = int(os.environ.get("FORCE_END", "0"))
-DTYPE = "bf16"
+DTYPE = os.environ.get("DTYPE", "bf16")   # attn/dense precision: bf16 | fp8
 IDX_DTYPE = os.environ.get("IDX_DTYPE", "bf16")   # fp8 -> falls back to bf16 if maxscore unsupported
 DEV = "cuda"
 
