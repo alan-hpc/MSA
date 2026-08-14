@@ -165,7 +165,7 @@ def run_build_k2q_csr(
       q_idx:         int32 [H, total_q * topK] CUDA, written in place
                      (trailing slots set to -1).
       topk:          must be in {4, 8, 16, 32}.
-      blk_kv:        must equal 128.
+      blk_kv:        must be one of {32, 64, 128}.
       total_rows:    sum over batches of ceil(seqlen_k / blk_kv).
       max_kv_blocks: max over batches of ceil(seqlen_k / blk_kv); upper bound
                      used to size the row_map workspace and clamp valid kv ids.
@@ -223,7 +223,7 @@ def run_build_k2q_csr_with_schedule(
 
 
 def is_supported(topk: int, blk_kv: int) -> bool:
-    return int(topk) in (4, 8, 16, 32) and int(blk_kv) == 128
+    return int(topk) in (4, 8, 16, 32) and int(blk_kv) in (32, 64, 128)
 
 
 __all__ = ["run_build_k2q_csr", "run_build_k2q_csr_with_schedule", "is_supported"]

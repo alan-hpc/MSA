@@ -41,7 +41,11 @@ D = int(os.environ.get("D", "128"))
 # index (proxy indexer) shape: default = MQA proxy with h_q=H_K, h_kv=1
 IDX_HQ = int(os.environ.get("IDX_HQ", str(H_K)))
 IDX_HKV = int(os.environ.get("IDX_HKV", "1"))
-PAGE, TOPK = 128, 16
+# KV block size and top-k budget. Upstream MSA is built for page=128/topk=16;
+# smaller blocks need the CSR builder and topk kernel that the
+# msa-configurable-sparse-attention branch carries.
+PAGE = int(os.environ.get("PAGE", "128"))
+TOPK = int(os.environ.get("TOPK", "16"))
 # Always-selected blocks inside the top-k budget: FORCE_BEGIN pins the sink
 # blocks at the head of the sequence, FORCE_END pins the local window nearest
 # the query. They occupy slots *within* topk (the result is always topk wide),

@@ -5,7 +5,7 @@
 
 Thin dispatcher that calls the CUDA C++ kernel pipeline in
 ``src.sm100.build_k2q_csr``. Supports ``topK in {4, 8, 16, 32}`` and
-``blk_kv == 128`` only — other shapes raise ``ValueError`` rather than
+``blk_kv in {32, 64, 128}`` — other shapes raise ``ValueError`` rather than
 silently falling back to a torch-reference path.
 """
 
@@ -19,7 +19,30 @@ from src.sm100.prepare_scheduler import SparseAttentionSchedule, SPARSE_SCHEDULE
 
 
 _SUPPORTED_TOPK = (4, 8, 16, 32)
-_SUPPORTED_BLK_KV = 128
+# v3.0_msa_config: the CUDA pipeline templates on blk_kv and only uses it for
+# per-batch row-count arithmetic, so 32/64 are exact -- not an approximation.
+_SUPPORTED_BLK_KV = (32, 64, 128)
+#: The histogram stage keeps one packed int16 counter per CSR row per warp in
+#: shared memory (2 bytes per row). Halving blk_kv doubles the row count, so a
+#: config that fits at 128 can fail at 64 -- and it fails as a bare
+#: cudaErrorInvalidValue. Catch it here, where the numbers can be explained.
+_CSR_SMEM_BYTES_PER_ROW = 2
+
+
+def _check_csr_smem_budget(total_rows: int, device) -> None:
+    if total_rows <= 0:
+        return
+    try:
+        limit = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+    except (AttributeError, RuntimeError):
+        limit = 227 * 1024
+    needed = total_rows * _CSR_SMEM_BYTES_PER_ROW
+    if needed <= limit:
+        return
+    raise ValueError(
+        f"build_k2q_csr needs {needed / 1024:.0f} KB of shared memory for its row "
+        f"histogram ({total_rows} CSR rows x {_CSR_SMEM_BYTES_PER_ROW} B), above this "
+        f"device's {limit / 1024:.0f} KB per-CTA limit. Use a larger blk_kv.")
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -66,9 +89,9 @@ class SparseK2qCsrBuilderSm100:
         return_schedule: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, SparseAttentionSchedule]:
         # ---- Validation ----------------------------------------------------
-        if blk_kv != _SUPPORTED_BLK_KV:
+        if blk_kv not in _SUPPORTED_BLK_KV:
             raise ValueError(
-                f"SparseK2qCsrBuilderSm100 only supports blk_kv == "
+                f"SparseK2qCsrBuilderSm100 supports blk_kv in "
                 f"{_SUPPORTED_BLK_KV}, got {blk_kv}"
             )
         if q2k_indices.dtype != torch.int32:
@@ -127,6 +150,7 @@ class SparseK2qCsrBuilderSm100:
         if total_rows < 0:
             raise ValueError(f"total_rows must be non-negative, got {total_rows}")
         total_rows = max(total_rows, 0)
+        _check_csr_smem_budget(total_rows, q2k_indices.device)
         nnz_upper_bound = total_q * topk
         qhead_per_kv = int(qhead_per_kv)
         if qhead_per_kv <= 0:
