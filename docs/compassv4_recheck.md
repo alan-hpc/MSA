@@ -351,6 +351,63 @@ host 侧开销 = 实测 wall − nsys 的 kernel 时间合计：
 （CuTe-DSL runtime 在调用里做了 host 侧工作，非 capture-safe）。
 这本身也是一条限制——想靠 CUDA graph 消除 decode 的发射开销，先得让这条路径可捕获。
 
+## 4d. 复现 Fireworks 的 1.6×：找到了，是 chunked-prefill + wall-clock
+
+用**他们自己的 benchmark**（`fw-ai/minimax-kernels` 的
+`benchmarks/m3_sparse_attention/bench_e2e.py`）在我们 B300 上跑，
+`PYTHONPATH` 指向 `/sparse/msa/python` 让 MSA 基线就是本分支，
+`MINIMAX_KERNELS_KVOUTER_CPP=1` 强制 C++ AOT。
+
+他们的 MSA 基线走的是**另一条调用路径**，和我之前手写的 bench 不同：
+
+```python
+from fmha_sm100 import build_k2q_csr, sparse_atten_func
+row_ptr, q_idx, schedule = build_k2q_csr(..., return_schedule=True)   # CSR 构建在计时区内
+sparse_atten_func(..., schedule=schedule,
+                  qk_dtype=torch.float8_e4m3fn, pv_dtype=torch.bfloat16)
+```
+
+即：直接调 `sparse_atten_func`（不是 `fmha_sm100()`）、带负载均衡 `schedule`、
+qk=fp8 / pv=bf16 混合精度，而且**把 CSR 构建计进去**（他们自己的表头写明
+"timed MSA includes CSR build"）。
+
+### 结果
+
+| 形状 | wall KVo/MSA | device-kernel KVo/MSA |
+|---|---:|---:|
+| smoke: Tq=128, kv=1024, GQA16, topk=4 | **1.66–1.95×** | 1.23–1.32× |
+| 他们的默认: Tq=4096, kv=65536, GQA16, topk=16 | **1.37–1.43×** | 1.16–1.19× |
+| 我们的口径: Tq=32768, kv=32768, GQA8, topk=16 | **0.94×** | 0.94× |
+
+**1.6× 复现了**——落在他们的 smoke 与默认配置之间。
+
+### 决定它的两个变量
+
+**一、Tq（query chunk 大小）**。固定 kv=65536 / GQA16 / topk=16 扫 Tq，wall：
+
+| Tq | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| KVo/MSA | 1.41× | 1.99× | 2.14× | 1.19× | 1.43× | 1.11× | **1.03×** |
+
+优势随 Tq 衰减，到 Tq=16384 基本归零。（1024/2048 那对是亚毫秒 wall 的抖动，
+单次测量，包络仍然清楚。）**1.6× 住在 Tq≈256–4096 这个 chunked-prefill 区间**，
+不是我们测的 full-prefill Tq=32768。
+
+**二、wall vs device-kernel**。同一次运行两张表：默认配置 wall 1.43× 但
+device 只有 1.16×。差额就是 MSA 每次调用的 Python dispatch + CSR 构建——
+Tq 越小，这块固定开销占比越大。这也正是博客自己写的适用范围：
+Python launch overhead dominates "on **small** GPU workloads"。
+
+### 所以结论是
+
+他们的 1.6× **没有夸大**，但它描述的是
+「**chunked prefill 的小 query chunk、按 wall-clock 计、GQA 16**」这个场景。
+换到 Compass-V4 的口径（GQA 8、full prefill Tq=32k）就翻转成 0.94×——
+用他们自己的 harness 也是 0.94×，与我们独立测的 mk/MSA=0.957 一致。
+
+对我们的实际意义：**如果线上走 chunked prefill（4k chunk 对长上下文），
+这条路值 1.4×左右；如果是一次性 full prefill，不值。**
+
 ## 5. 限制（为什么只有 128×16 有全流水数）
 
 | 段 | block=64 | topk=8 |
