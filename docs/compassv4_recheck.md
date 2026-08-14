@@ -249,25 +249,41 @@ KV 预算 = block × topk。**只有 128×16 能跑通整条流水**，其余配
 - 同为 1024 token 预算：128×8 比 64×16 快 **1.42–1.79×**
 - fp8 vs bf16 → **0.92–0.97×**（几乎无效）
 
-## 4. 实现对比 · attn 段（block=128 / topk=16, 32k）
+## 4. 实现对比 · attn 段（block=128 / topk=16）
 
-| 实现 | 形状 | dtype | attn(ms) | vs 当前分支 |
-|---|---|---|---:|---:|
-| **当前分支**（KV-outer, CuTe CSR） | h_q=32 | bf16 | **2.4402** | — |
-| fireworks-msa `e688998` | h_q=32 | bf16 | 3.2573 | 1.33× 慢 |
-| **当前分支** | h_q=32 | fp8 | **2.3685** | — |
-| fireworks-msa | h_q=32 | fp8 | 2.7812 | 1.17× 慢 |
-| **当前分支** | h_q=64 | bf16 | **4.6264** | — |
-| fireworks-msa | h_q=64 | bf16 | 5.2356 | 1.13× 慢 |
-| **当前分支** | h_q=64 | fp8 | **4.3725** | — |
-| fireworks-msa | h_q=64 | fp8 | 4.8067 | 1.10× 慢 |
-| Q-outer（CUTLASS `SparseAttnMode::Sparse`，2048-token 分块） | h_q=32 | bf16 | 113.542 | **46.5× 慢** |
+⚠️ fireworks-msa 必须**编译 C++ 扩展**才是它的真实性能。它的 `interface.py` 是
+`backend = "cpp" if cpp_backend_available() else "python"`——**静默回退**。而
+`setup.py` 把扩展构建包在 `try/except: ext_modules = []` 里，装的时候少任何一个
+build 依赖就悄悄跳过。博客原话："AOT-exported per config and driven from a C++ op,
+removing Python launch overhead that dominates end-to-end latency"。
 
-64k 上 fireworks 同样慢：bf16 4.5639 vs 5.4922（1.20×）、fp8 4.1841 vs 4.9665（1.19×）。
+| 实现 | dtype | 32k | 64k | vs 当前分支 |
+|---|---|---:|---:|---:|
+| **当前分支**（KV-outer, CuTe CSR） | bf16 | **2.4402** | **4.5639** | — |
+| fireworks-msa（C++ AOT 后端） | bf16 | 2.5497 | 5.0186 | 1.045× / 1.100× 慢 |
+| fireworks-msa（Python 回退） | bf16 | 3.2573 | 5.4922 | 1.33× / 1.20× 慢 |
+| **当前分支** | fp8 | **2.3685** | **4.1841** | — |
+| fireworks-msa（C++ AOT 后端） | fp8 | 2.4433 | 4.6275 | 1.032× / 1.106× 慢 |
+| fireworks-msa（Python 回退） | fp8 | 2.7812 | 4.9665 | 1.17× / 1.19× 慢 |
 
-**没有复现 Fireworks 博客宣称的 ~1.6× 优势**——四种口径下他们都更慢，最接近也只是 1.10×。
-最可能的差异是硬件：他们测 B200 (sm_100)，我们是 B300 (sm_103)；分支停在 `e688998`
-也未必对应博客版本。手上没有 B200，无法证伪。
+编译 C++ 扩展后差距从 1.17–1.33× 收窄到 **1.03–1.11×**，与 nsys 测到的
+**GPU kernel 时间只差 4.6%** 吻合（32k bf16，每次迭代）：
+
+| | 主 attn kernel | combine | 索引构建 | GPU 合计 |
+|---|---:|---:|---:|---:|
+| 当前分支 | 1.338 | 0.739 | 0.051 | 2.13 |
+| fireworks | 1.419 | 0.708 | 0.091 | 2.22 |
+
+fireworks 的 combine 反而比我们**快 4%**；主 kernel 慢 6%。
+
+**仍未复现博客宣称的 ~1.6×**，但剩下的 1.03–1.11× 已经落在"硬件与调优差异"的量级：
+他们测 B200 (sm_100)，我们是 B300 (sm_103)；分支停在 `e688998` 也未必对应博客版本。
+
+另一个未验证的口径差异：我们的 benchmark **每次迭代都重建索引**（两边都是）。
+KV-outer 的元数据在真实推理里可跨层复用（M3 有 46 层），他们报的端到端
+1.18–1.43× 很可能是摊销过的。要公平比这一项，得改成"建一次索引跑 N 次 attn"。
+
+| Q-outer（CUTLASS `SparseAttnMode::Sparse`，2048-token 分块） | bf16 | 113.542 | — | 46.5× 慢 |
 
 Q-outer 一行是上界不是判决：它走 decode 取向的 dispatch、每 2048 token 一次 launch，
 正是"M 维塌缩成 GQA factor"的病症。两者输出等价（cos = 1.0000）。
@@ -291,7 +307,7 @@ Q-outer 一行是上界不是判决：它走 decode 取向的 dispatch、每 204
 | 用途 | 位置 | 关键版本 |
 |---|---|---|
 | MSA 主口径 | `.5` `dsa_stage2_meng2` + `/sparse/msa_venv` | cutlass-dsl **4.4.1** / quack **0.2.10** |
-| fireworks-msa | `.5` `/sparse/msa_fw` + `/sparse/fw_venv` | cutlass-dsl 4.5.2 / quack 0.4.1 / flash-attn-4 4.0.0b15 |
+| fireworks-msa | `.5` `/sparse/msa_fw` + `/sparse/fw_venv` | cutlass-dsl 4.5.2 / quack 0.4.1 / flash-attn-4 4.0.0b15；**必须 `pip install -e . --no-build-isolation` 在依赖装齐之后重装**，否则 C++ 扩展静默跳过 |
 | FA4 基线 | `.3` `sparse_atten_meng` + `fa4_venv` | 只能在 `.3` 测 |
 | FlashInfer `msa_ops` | `.5` `/sparse/fi_venv` | 0.6.17，**B300 跑不了**（要 SM120/121） |
 
