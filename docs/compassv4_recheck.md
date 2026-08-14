@@ -322,6 +322,35 @@ GPU 分段合计（2217 / 4374 µs）与实测 wall（2549.7 / 5018.6 µs）的�
 **他们宣称的 attention kernel ~1.6× vs 开源 MSA，在 B300 + Compass-V4 下没有复现**：
 按他们自己的分段口径，我们在 attn kernel 上反而快 2.5–6.5%。
 
+## 4c. 当前分支走 C++ AOT 值不值
+
+host 侧开销 = 实测 wall − nsys 的 kernel 时间合计：
+
+| | GPU 合计(µs) | wall(µs) | host gap | 占比 |
+|---|---:|---:|---:|---:|
+| 当前分支 32k | 2140.7 | 2440.2 | 299.5 | 12.3% |
+| fireworks(C++ AOT) 32k | 2217.0 | 2549.7 | 332.7 | 13.0% |
+| 当前分支 64k | 4044.0 | 4563.9 | 519.9 | 11.4% |
+| fireworks(C++ AOT) 64k | 4374.1 | 5018.6 | 644.5 | 12.8% |
+
+**fireworks 已经在跑 C++ AOT，相对 host gap 反而比我们略大**（13.0% vs 12.3%）。
+所以 C++ op 并不能消掉这一段——它消掉的是**它自己 Python 路径里那 1119 行
+索引构建**（Python 后端 gap 1030µs → C++ 后端 333µs）。我们这条路径的 Python 侧
+本来就很薄（CSR 构建是 5 个 CUDA kernel，从一个很薄的 adapter 发出去），
+没有等价的肥肉可以砍。
+
+结论：**当前分支改 C++ AOT，在 prefill 32k/64k 上天花板约 11–13%，实际会更少。**
+博客那条优化的适用范围它自己写清楚了——Python 开销 dominates
+"on **small** GPU workloads"，而 32k prefill 的单个 kernel 就有 1.3–2.5 ms，不算小。
+
+真正会疼的是 decode（attn 仅 0.040 ms/次）和多层累积（M3 有 46 层 × 3 段 × 每 step）。
+那个口径我们这套单算子 benchmark 量不出来。
+
+**CUDA graph 抓不了**：想用 graph replay 量"发射开销为零"的下界，
+`torch.cuda.CUDAGraph` 捕获当前分支的 sparse attn 调用会失败
+（CuTe-DSL runtime 在调用里做了 host 侧工作，非 capture-safe）。
+这本身也是一条限制——想靠 CUDA graph 消除 decode 的发射开销，先得让这条路径可捕获。
+
 ## 5. 限制（为什么只有 128×16 有全流水数）
 
 | 段 | block=64 | topk=8 |
