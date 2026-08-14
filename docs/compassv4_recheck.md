@@ -288,6 +288,40 @@ KV-outer 的元数据在真实推理里可跨层复用（M3 有 46 层），他�
 Q-outer 一行是上界不是判决：它走 decode 取向的 dispatch、每 2048 token 一次 launch，
 正是"M 维塌缩成 GQA factor"的病症。两者输出等价（cos = 1.0000）。
 
+## 4b. 按 Fireworks 的测法：module-latency 分段
+
+他们博客不是给一个总数，而是把 index mapping / scheduling / combine / attention
+拆成独立的条。按同样口径 nsys 拆开（bf16, Compass-V4, block=128/topk=16,
+**每次迭代的 GPU 时间**, fireworks 走 C++ AOT 后端）:
+
+| seq | 分段 | 当前分支(µs) | fireworks(µs) | fw/ours |
+|---:|---|---:|---:|---:|
+| 32k | attention kernel | 1338.1 | 1418.8 | 1.060× |
+| 32k | combine | 738.3 | **709.2** | **0.961×** |
+| 32k | index mapping + sched | 64.3 | 89.0 | 1.384× |
+| 32k | **attn kernel 合计** | **2076.4** | **2128.0** | **1.025×** |
+| 32k | module (GPU 合计) | 2140.7 | 2217.0 | 1.036× |
+| 64k | attention kernel | 2469.4 | 2787.4 | 1.129× |
+| 64k | combine | 1485.0 | **1424.0** | **0.959×** |
+| 64k | index mapping + sched | 89.6 | 162.7 | 1.816× |
+| 64k | **attn kernel 合计** | **3954.4** | **4211.4** | **1.065×** |
+| 64k | module (GPU 合计) | 4044.0 | 4374.1 | 1.082× |
+
+**他们的 combine 优化是真的有效**：两个长度上都比我们快 **4%**。这正对应博客里
+"store partial-O in contiguous blocks instead of scattered writes; the combine
+kernel does gathered loads" —— 把 scatter 推迟到带宽受限的 combine 阶段。
+
+但在 B300 上他们的**主 attention kernel 更慢**（32k +6%、64k +13%），
+**index mapping 更贵**（1.38× / 1.82×），净结果是 attn kernel 合计
+**1.025× / 1.065×**，我们略优。
+
+GPU 分段合计（2217 / 4374 µs）与实测 wall（2549.7 / 5018.6 µs）的比值一致，
+说明编上 C++ 扩展之后 host 侧开销已经基本消失——这条也反过来印证了
+「之前那 33% 是 Python 回退」的结论。
+
+**他们宣称的 attention kernel ~1.6× vs 开源 MSA，在 B300 + Compass-V4 下没有复现**：
+按他们自己的分段口径，我们在 attn kernel 上反而快 2.5–6.5%。
+
 ## 5. 限制（为什么只有 128×16 有全流水数）
 
 | 段 | block=64 | topk=8 |
