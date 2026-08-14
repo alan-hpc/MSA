@@ -736,10 +736,20 @@ def sparse_atten_func(
     max_seqlen_q = int(max_seqlen_q)
     max_seqlen_k = int(max_seqlen_k)
 
+    # Paged KV: _prepare_paged_kv_for_tma() passes k/v straight through to the
+    # CuTe tensor wrapper untouched (no contiguity requirement -- CuTe's TMA
+    # descriptors carry arbitrary strides natively), so materializing them
+    # here just copies the entire per-layer KV cache pool for nothing. A
+    # caller's paged view is typically a permuted/split slice of that pool
+    # (e.g. K/V packed in one cache tensor, sliced by half), never actually
+    # contiguous, so this was a full-pool copy on every call.
+    k_in = k if page_table is not None else k.contiguous()
+    v_in = v if page_table is not None else v.contiguous()
+
     return _sparse_atten_csr_varlen_forward(
         q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
+        k_in,
+        v_in,
         k2q_row_ptr.contiguous(),
         k2q_q_indices.contiguous(),
         int(topK),
