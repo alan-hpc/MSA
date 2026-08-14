@@ -1,11 +1,14 @@
 """Sparse-attn kernel across (block, topk) configs, Compass-V4 shape.
 
-The KV budget per query is block x topk, so configs are only comparable when
-that product matches. The default grid holds it at 2048 (the shipped config)
-and at 1024 two different ways, which is the question worth asking: for a given
-budget, does granularity cost anything?
+The KV budget per query is block x topk. The default grid is the shipped
+config (128x16 = 2048 tokens) against half the budget at the same granularity
+(128x8 = 1024), which isolates what topk costs.
 
-  CONFIGS="128x16,128x8,64x16" python benchmarks/bench_block_size.py 8192,32768
+  CONFIGS="128x16,128x8" python benchmarks/bench_block_size.py 32768,65536
+
+Other block sizes are available via CONFIGS -- 64x16 also reads 1024 tokens and
+measured 1.4-1.8x slower than 128x8, i.e. cost tracks blocks visited, not tokens
+read -- but they are not in the default grid.
 
 Only the attention stage is measured. On this branch the selection stage cannot
 follow: sparse_topk_select asserts topk == 16, and the indexer's max_score tile
@@ -24,7 +27,7 @@ _spec.loader.exec_module(bm)
 H_Q = int(os.environ.get("H_Q", "32"))
 H_K = int(os.environ.get("H_K", "4"))
 D = int(os.environ.get("D", "128"))
-CONFIGS = [c.strip() for c in os.environ.get("CONFIGS", "128x16,128x8,64x16").split(",")]
+CONFIGS = [c.strip() for c in os.environ.get("CONFIGS", "128x16,128x8").split(",")]
 SEQS = [int(x) for x in (sys.argv[1] if len(sys.argv) > 1 else "32768").split(",")]
 
 cfgs = []
