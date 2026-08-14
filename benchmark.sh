@@ -32,11 +32,17 @@
 # -----------------------------------------------------------------------------
 #   MODEL       compassv4 (default) | m3        geometry preset
 #   GPU         CUDA device index               (default 0)
-#   MODE        all (default) | prefill | decode | fa4
+#   MODE        all (default) | prefill | decode | fa4 | flashinfer
+#               flashinfer A/Bs FlashInfer's msa_ops sparse-attn kernel against
+#               ours. ⚠️ REQUIRES SM120/SM121 -- FlashInfer gates every msa_op on
+#               compute-capability major == 12 (consumer Blackwell / Thor), so it
+#               cannot run on B200/B300 (SM100/SM103) at all. Untested here for
+#               that reason.
 #               fa4 runs the FA4 dense baseline instead of the MSA pipeline.
 #               ONLY valid on node .3 -- FA4 mis-dispatches on .5 (19.1ms vs
 #               5.8ms for the same 32K shape), so never publish .5 FA4 numbers.
 #   FA4_PYTHON  interpreter with the FA4 cute checkout (auto-detected)
+#   FI_PYTHON   interpreter with flashinfer >= 0.6.17 (auto-detected)
 #   FA4_WARMUP / FA4_REP   FA4 iteration counts (default 10 / 30 prefill).
 #                          1M costs ~6s per call, so 40 calls is ~4 min a point.
 #   SEQLENS     prefill seq lengths, comma/space separated
@@ -102,7 +108,7 @@ SEQLENS="${SEQLENS//,/ }"
 # different box, where fmha_sm100 is neither present nor wanted. Bootstrapping
 # the MSA env there would build a venv nobody asked for.
 [ -f "$REPO_ROOT/.msa_env" ] && . "$REPO_ROOT/.msa_env"
-if [ "$MODE" != "fa4" ]; then
+if [ "$MODE" != "fa4" ] && [ "$MODE" != "flashinfer" ]; then
   if [ -z "${PYTHON:-}" ] || ! "$PYTHON" -c "import fmha_sm100" >/dev/null 2>&1; then
     echo "[env] not ready -- running ./init.sh (SKIP_AOT=1)"
     SKIP_AOT=1 GPU="$GPU" bash "$REPO_ROOT/init.sh" || {
@@ -319,6 +325,53 @@ MSG
   fi
 }
 
+# -----------------------------------------------------------------------------
+# FlashInfer msa_ops A/B. Needs its own interpreter for the same reason FA4 does:
+# flashinfer wants a newer cutlass-dsl than MSA's 4.4.1 pin and will not even
+# import inside the MSA venv (AttributeError on cute.nvgpu.OperandMajorMode).
+#
+# ⚠️ Every msa_op -- proxy_score, topk_select, sparse_attention, sparse_decode --
+# is gated on `is_sm12x_supported`, i.e. compute-capability major == 12. B300 is
+# (10, 3), so all of them raise on this fleet. This path is here so the A/B is
+# one command away on SM120/121 hardware; it has never produced a number here.
+# -----------------------------------------------------------------------------
+find_fi_python() {
+  [ -n "${FI_PYTHON:-}" ] && { echo "$FI_PYTHON"; return; }
+  for c in /sparse/fi_venv/bin/python "$REPO_ROOT/.fi_venv/bin/python"; do
+    [ -x "$c" ] && { echo "$c"; return; }
+  done
+  echo ""
+}
+
+run_flashinfer() {
+  local py; py="$(find_fi_python)"
+  if [ -z "$py" ]; then
+    echo "[fi] no flashinfer interpreter. Build one (it cannot share the MSA venv):" >&2
+    echo "     python3 -m venv --system-site-packages .fi_venv" >&2
+    echo "     .fi_venv/bin/pip install 'flashinfer-python>=0.6.17'" >&2
+    return 1
+  fi
+  local cc; cc="$("$py" -c "import torch;print('%d%d'%torch.cuda.get_device_capability())" 2>/dev/null)"
+  case "$cc" in
+    12*) : ;;
+    *) cat >&2 <<MSG
+[fi] this GPU reports compute capability $cc. FlashInfer gates every msa_op on
+     major == 12 (SM120/SM121: consumer Blackwell, Thor), so msa_sparse_attention,
+     msa_topk_select and msa_proxy_score all raise here. B200/B300 (SM100/SM103)
+     are not supported by these kernels -- there is no flag that changes this.
+     Run this mode on SM12x hardware to get the comparison.
+MSG
+       return 1 ;;
+  esac
+  local log="$OUT_DIR/flashinfer_attn.log"
+  local csv; csv="$(echo $SEQLENS | tr ' ' ',')"
+  H_Q=$H_Q H_K=$H_K D=$D TOPK=16 FI_MODE=prefill CUDA_VISIBLE_DEVICES=$GPU \
+    "$py" -u bench_flashinfer_msa.py "$csv" 2>&1 | tee "$log"
+  H_Q=$H_Q H_K=$H_K D=$D TOPK=16 FI_MODE=decode BATCH=$BATCH QLEN=$QLEN \
+    CUDA_VISIBLE_DEVICES=$GPU \
+    "$py" -u bench_flashinfer_msa.py "$DECODE_KVS" 2>&1 | tee -a "$log"
+}
+
 # ---- decode needs the AOT kernels, or its first JIT compile deadlocks --------
 aot_warmup() {
   [ -f "$REPO_ROOT/.aot_done" ] && { echo "[aot] cached, skip"; return 0; }
@@ -331,8 +384,9 @@ case "$MODE" in
   prefill) run_prefill ;;
   decode)  aot_warmup && run_decode ;;
   fa4)     run_fa4 ;;
+  flashinfer) run_flashinfer ;;
   all)     run_prefill; aot_warmup && run_decode ;;
-  *) echo "MODE must be all | prefill | decode | fa4" >&2; exit 1 ;;
+  *) echo "MODE must be all | prefill | decode | fa4 | flashinfer" >&2; exit 1 ;;
 esac
 
 echo "ALL_DONE  results -> $OUT_DIR"
