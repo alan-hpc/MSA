@@ -1,8 +1,8 @@
-"""Sweep sparse-attention schedule granularity for chunked prefill.
+"""Sweep scheduler and paged-KV layout choices for chunked prefill.
 
 The selected ``(query, page)`` pairs stay identical.  Only
-``target_q_per_cta`` changes, isolating whether short prefill chunks lose time
-because the automatic scheduler creates too many work items.
+``target_q_per_cta`` or an explicitly requested cache/schedule layout changes.
+This isolates scheduler overhead from the TMA descriptor's physical-page span.
 """
 
 import os
@@ -15,8 +15,13 @@ HQ, HKV, D, PAGE, TOPK = 32, 4, 128, 128, 16
 LENGTH = int(os.environ.get("KLEN", "32768"))
 CHUNK = int(os.environ.get("CHUNK", "8192"))
 POOL = int(os.environ.get("POOL", "1"))
+RUN_PAGES = int(os.environ.get("RUN_PAGES", "1"))
+BASE_PAGE = int(os.environ.get("BASE_PAGE", "0"))
+NARROW_CACHE = os.environ.get("NARROW_CACHE", "0") == "1"
 ITERS = int(os.environ.get("ITERS", "30"))
 SAMPLES = int(os.environ.get("SAMPLES", "5"))
+EXACT_CAPACITY = os.environ.get("EXACT_CAPACITY", "0") == "1"
+SCHEDULE_ORDER = os.environ.get("SCHEDULE_ORDER", "native")
 TARGETS = [
     None if value == "auto" else int(value)
     for value in os.environ.get(
@@ -48,30 +53,41 @@ def main() -> None:
     from src.sm100.prepare_scheduler import SPARSE_SCHEDULE_MODEL
 
     automatic_target = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta
-    generator = torch.Generator(device="cuda").manual_seed(0)
+    kv_generator = torch.Generator(device="cuda").manual_seed(0)
+    input_generator = torch.Generator(device="cuda").manual_seed(1)
     pages = -(-LENGTH // PAGE)
     kv = torch.randn(
-        (pages * POOL, HKV, PAGE, 2 * D),
-        generator=generator,
+        (pages * POOL + BASE_PAGE, HKV, PAGE, 2 * D),
+        generator=kv_generator,
         device="cuda",
         dtype=torch.bfloat16,
     )
-    view = kv.transpose(1, 2)
+    logical_pages = torch.arange(pages, device="cuda", dtype=torch.int32)
+    physical_pages = (
+        BASE_PAGE
+        + logical_pages // RUN_PAGES * (RUN_PAGES * POOL)
+        + logical_pages % RUN_PAGES
+    )
+    cache_base = int(physical_pages[0])
+    cache_limit = int(physical_pages[-1]) + 1
+    view = (
+        kv[cache_base:cache_limit].transpose(1, 2)
+        if NARROW_CACHE
+        else kv.transpose(1, 2)
+    )
     key_cache = msa_paged_kv_view(view[..., :D])
     value_cache = msa_paged_kv_view(view[..., D:])
-    page_table = (
-        torch.arange(pages, device="cuda", dtype=torch.int32) * POOL
-    ).view(1, -1)
+    page_table = (physical_pages - (cache_base if NARROW_CACHE else 0)).view(1, -1)
     q = torch.randn(
         (LENGTH, HQ, D),
-        generator=generator,
+        generator=input_generator,
         device="cuda",
         dtype=torch.bfloat16,
     )
     own_page = torch.arange(LENGTH, device="cuda") // PAGE
     offsets = torch.arange(TOPK, device="cuda")
     random_values = torch.rand(
-        (LENGTH, TOPK), generator=generator, device="cuda"
+        (LENGTH, TOPK), generator=input_generator, device="cuda"
     )
     selected = (
         random_values * (own_page + 1).view(-1, 1).float()
@@ -93,6 +109,7 @@ def main() -> None:
         pieces = []
         targets_used = []
         work_counts = []
+        work_capacities = []
         for lo in range(0, LENGTH, CHUNK):
             hi = min(lo + CHUNK, LENGTH)
             query = q[lo:hi].contiguous()
@@ -112,8 +129,30 @@ def main() -> None:
                 qhead_per_kv=HQ // HKV,
                 return_schedule=True,
             )
+            exact_work_count = int(schedule.work_count.item())
+            if SCHEDULE_ORDER != "native":
+                metadata = schedule.scheduler_metadata[:exact_work_count]
+                if SCHEDULE_ORDER == "page":
+                    order_key = metadata[:, 5] * HKV + metadata[:, 0]
+                elif SCHEDULE_ORDER == "head":
+                    order_key = metadata[:, 0] * pages + metadata[:, 5]
+                else:
+                    raise ValueError(
+                        f"unsupported SCHEDULE_ORDER={SCHEDULE_ORDER!r}"
+                    )
+                order_key = order_key * LENGTH + metadata[:, 2]
+                reordered = schedule.scheduler_metadata.clone()
+                reordered[:exact_work_count] = metadata[
+                    torch.argsort(order_key, stable=True)
+                ]
+                schedule.scheduler_metadata = reordered
+            if EXACT_CAPACITY:
+                schedule.scheduler_metadata = schedule.scheduler_metadata[
+                    :exact_work_count
+                ]
             targets_used.append(schedule.target_q_per_cta)
             work_counts.append(int(schedule.work_count.item()))
+            work_capacities.append(schedule.work_capacity)
             pieces.append(
                 (
                     query,
@@ -127,7 +166,7 @@ def main() -> None:
                     hi - lo,
                 )
             )
-        return pieces, targets_used, work_counts
+        return pieces, targets_used, work_counts, work_capacities
 
     def run(pieces, *, concatenate: bool = True):
         outputs = []
@@ -157,7 +196,7 @@ def main() -> None:
     results = []
     reference = None
     for target in TARGETS:
-        pieces, targets_used, work_counts = build(target)
+        pieces, targets_used, work_counts, work_capacities = build(target)
         output = run(pieces)
         torch.cuda.synchronize()
         if reference is None:
@@ -177,6 +216,7 @@ def main() -> None:
                 "auto" if target is None else str(target),
                 targets_used,
                 work_counts,
+                work_capacities,
                 statistics.median(samples),
                 cosine,
                 max_abs,
@@ -186,13 +226,28 @@ def main() -> None:
     SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta = automatic_target
     print(
         f"device={torch.cuda.get_device_name(0)} length={LENGTH} chunk={CHUNK} "
-        f"pool={POOL} pairs={int((selected[0] >= 0).sum())}"
+        f"pool={POOL} run_pages={RUN_PAGES} base={BASE_PAGE} "
+        f"narrow={NARROW_CACHE} "
+        f"pairs={int((selected[0] >= 0).sum())}"
     )
-    print("target | targets/chunk | work/chunk | median_ms | cosine | max_abs")
-    for label, targets_used, work_counts, elapsed, cosine, max_abs in results:
+    print(
+        "target | targets/chunk | work/chunk | capacity/chunk | "
+        "median_ms | cosine | max_abs"
+    )
+    for result in results:
+        (
+            label,
+            targets_used,
+            work_counts,
+            work_capacities,
+            elapsed,
+            cosine,
+            max_abs,
+        ) = result
         print(
             f"{label:>6} | {targets_used!s:<25} | {work_counts!s:<24} | "
-            f"{elapsed:>9.4f} | {cosine:.8f} | {max_abs:.6f}"
+            f"{work_capacities!s:<24} | {elapsed:>9.4f} | "
+            f"{cosine:.8f} | {max_abs:.6f}"
         )
 
 
