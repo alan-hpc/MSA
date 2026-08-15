@@ -1,0 +1,89 @@
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp b/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp
+index 39cee30..d2238ae 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp
++++ b/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp
+@@ -155,6 +155,8 @@ struct CollectiveMainloopFwd {
+     int const* ptr_q2k_block_nums =
+         nullptr;  // variable: [batch * heads, num_q_blocks], per-tile sparse block count
+     int raw_block_sparse_num = 0;  // original unpadded block_sparse_num (for phantom clamping)
++    int num_heads_kv = 0;          // 0 => dense/legacy: KV is indexed per query head
++    int num_pages = 0;             // physical pages in the KV cache (paged mode)
+   };
+ 
+   // ---- Params (device-side) ----
+@@ -169,6 +171,8 @@ struct CollectiveMainloopFwd {
+     int const* ptr_block_indices = nullptr;
+     int block_indices_stride = 0;
+     int kv_tma_per_head = 0;
++    int num_heads_kv = 0;    // 0 => legacy dense path (num_heads_kv == num_heads)
++    int qhead_per_kv = 1;    // num_heads / num_heads_kv
+     int const* ptr_block_sizes = nullptr;
+     int num_heads = 1;
+     int num_row_tiles = 1;
+@@ -193,15 +197,16 @@ struct CollectiveMainloopFwd {
+         SmemLayoutQ{});
+ 
+     int const total_sparse_blocks = seq_kv / kSparseBlockSize;
+-    auto shape_k =
+-        make_shape(kSparseBlockSize, kDimHalf, batch * heads * total_sparse_blocks * kDimHalves);
++    int const kv_planes = (args.num_heads_kv > 0)
++                              ? args.num_pages * args.num_heads_kv * kDimHalves
++                              : batch * heads * total_sparse_blocks * kDimHalves;
++    auto shape_k = make_shape(kSparseBlockSize, kDimHalf, kv_planes);
+     auto stride_k = make_stride(Int<kDimHalf>{}, _1{}, kSparseBlockSize * kDimHalf);
+     auto tma_k = make_tma_copy(
+         SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(args.ptr_K), make_layout(shape_k, stride_k)),
+         SmemLayoutSubTile{});
+ 
+-    auto shape_v =
+-        make_shape(kDimHalf, kSparseBlockSize, batch * heads * total_sparse_blocks * kDimHalves);
++    auto shape_v = make_shape(kDimHalf, kSparseBlockSize, kv_planes);
+     auto stride_v = make_stride(Int<kSparseBlockSize>{}, _1{}, kDimHalf * kSparseBlockSize);
+     auto tma_v = make_tma_copy(
+         SM90_TMA_LOAD{}, make_tensor(make_gmem_ptr(args.ptr_V), make_layout(shape_v, stride_v)),
+@@ -219,6 +224,8 @@ struct CollectiveMainloopFwd {
+             args.ptr_block_indices,
+             args.block_indices_stride,
+             kv_tma_per_head,
++            args.num_heads_kv,
++            (args.num_heads_kv > 0 ? heads / args.num_heads_kv : 1),
+             args.ptr_block_sizes,
+             heads,
+             num_row_tiles,
+@@ -294,7 +301,13 @@ struct CollectiveMainloopFwd {
+ 
+       // Batch-aware TMA indices: batch folds into outermost dimension
+       int q_tile_idx = (batch * params.num_heads + head) * num_row_tiles + row_tile;
+-      int kv_tma_base = (batch * params.num_heads + head) * params.kv_tma_per_head;
++      // Paged + GQA: K/V live in a global page pool indexed by physical page and
++      // KV head, so there is no batch term and no per-query-head replication.
++      // Legacy (num_heads_kv == 0) keeps the dense per-(batch, head) layout.
++      bool const kv_paged = params.num_heads_kv > 0;
++      int const kv_head = kv_paged ? (head / params.qhead_per_kv) : head;
++      int kv_tma_base = kv_paged ? 0
++                                 : (batch * params.num_heads + head) * params.kv_tma_per_head;
+ 
+       // Block indices for this (batch, head, row_tile)
+       int const* tile_block_indices = nullptr;
+@@ -349,7 +362,9 @@ struct CollectiveMainloopFwd {
+             int smem_offset = stage_base + slot * kKSubStride + h * kKHalfStride;
+             auto sK_sub =
+                 make_tensor(make_smem_ptr(ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
+-            int tma_idx = kv_tma_base + sparse_idx * kDimHalves + h;
++            int tma_idx = kv_paged
++                              ? (sparse_idx * params.num_heads_kv + kv_head) * kDimHalves + h
++                              : kv_tma_base + sparse_idx * kDimHalves + h;
+             cute::copy(params.tma_load_K.with(*tma_bar),
+                        thr_tma_k.partition_S(gK_full(_, _, tma_idx)),
+                        thr_tma_k.partition_D(sK_sub));
+@@ -372,7 +387,9 @@ struct CollectiveMainloopFwd {
+             int smem_offset = stage_base + slot * kVSubStride + h * kVHalfStride;
+             auto sV_sub =
+                 make_tensor(make_smem_ptr(ml.smem_kv.begin() + smem_offset), SmemLayoutSubTile{});
+-            int tma_idx = kv_tma_base + sparse_idx * kDimHalves + h;
++            int tma_idx = kv_paged
++                              ? (sparse_idx * params.num_heads_kv + kv_head) * kDimHalves + h
++                              : kv_tma_base + sparse_idx * kDimHalves + h;
+             cute::copy(params.tma_load_V.with(*tma_bar),
+                        thr_tma_v.partition_S(gV_full(_, _, tma_idx)),
+                        thr_tma_v.partition_D(sV_sub));
