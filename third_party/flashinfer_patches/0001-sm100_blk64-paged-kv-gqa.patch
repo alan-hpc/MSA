@@ -17,10 +17,10 @@ index 0be76fb..fdc7d13 100644
 +        py::arg("q2k_block_nums") = torch::Tensor(), py::arg("num_heads_kv") = 0);
  }
 diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.cu b/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.cu
-index fd8a341..bdd7da6 100644
+index fd8a341..0be4209 100644
 --- a/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.cu
 +++ b/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.cu
-@@ -17,13 +17,13 @@ template <bool HasVarBlockNums, bool HasBlockSizes>
+@@ -17,15 +17,21 @@ template <bool HasVarBlockNums, bool HasBlockSizes>
  std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
      torch::Tensor q, torch::Tensor k, torch::Tensor v, torch::Tensor q2k_block_index,
      int block_sparse_num, torch::Tensor block_sizes, float softmax_scale,
@@ -34,9 +34,18 @@ index fd8a341..bdd7da6 100644
 -    torch::Tensor q2k_block_nums) {
 +    torch::Tensor q2k_block_nums, int num_heads_kv) {
    TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda(), "q/k/v must be CUDA");
-   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be 4D");
+-  TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4, "q/k/v must be 4D");
++  // Paged mode hands K/V as a 3D page pool [num_pages*H_kv*2, 64, 64].
++  TORCH_CHECK(q.dim() == 4, "q must be 4D");
++  if (num_heads_kv > 0) {
++    TORCH_CHECK(k.dim() == 3 && v.dim() == 3, "paged k/v must be 3D page pools");
++  } else {
++    TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "dense k/v must be 4D");
++  }
    TORCH_CHECK(q.size(3) == 128, "requires D=128");
-@@ -33,7 +33,7 @@ inline std::vector<torch::Tensor> bsa_fused_fwd_blk64_impl(
+ 
+   bool has_variable_block_nums = q2k_block_nums.defined() && q2k_block_nums.numel() > 0;
+@@ -33,7 +39,7 @@ inline std::vector<torch::Tensor> bsa_fused_fwd_blk64_impl(
    return BOOL_SWITCH(has_variable_block_nums, HasVarBlockNums, [&] {
      return BOOL_SWITCH(has_block_sizes, HasBlockSizes, [&] {
        return bsa_fused_fwd_blk64_launch<HasVarBlockNums, HasBlockSizes>(
@@ -45,7 +54,7 @@ index fd8a341..bdd7da6 100644
      });
    });
  }
-@@ -44,7 +44,7 @@ inline std::vector<torch::Tensor> bsa_fused_fwd_blk64_impl(
+@@ -44,7 +50,7 @@ inline std::vector<torch::Tensor> bsa_fused_fwd_blk64_impl(
  std::vector<torch::Tensor> bsa_fused_fwd_blk64(torch::Tensor q, torch::Tensor k, torch::Tensor v,
                                                 torch::Tensor q2k_block_index, int block_sparse_num,
                                                 torch::Tensor block_sizes, float softmax_scale,
@@ -56,7 +65,7 @@ index fd8a341..bdd7da6 100644
 +                                         softmax_scale, q2k_block_nums, num_heads_kv);
  }
 diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.h b/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.h
-index 2a194a8..90e937c 100644
+index 2a194a8..398262e 100644
 --- a/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.h
 +++ b/flashinfer/cute_dsl/sparse/sm100_blk64/flash_fwd_launch_template.h
 @@ -26,7 +26,7 @@ template <bool HasVarBlockNums, bool HasBlockSizes>
@@ -68,11 +77,28 @@ index 2a194a8..90e937c 100644
    using namespace cute;
  
    using Kernel = FusedAttnKernel<HasVarBlockNums, HasBlockSizes>;
-@@ -80,13 +80,26 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
+@@ -43,7 +43,12 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
+   const int batch = static_cast<int>(q.size(0));
+   const int seq_q = static_cast<int>(q.size(1));
+   const int heads = static_cast<int>(q.size(2));
+-  const int seq_k = static_cast<int>(k.size(1));
++  // In paged mode k is [num_pages*H_kv*2, 64, 64]; the context length is implied by
++  // the pages the index selects, so derive a seq_k that keeps the legacy sizing math
++  // well-formed without pretending it is the real context.
++  const int seq_k = (num_heads_kv > 0)
++                        ? static_cast<int>(k.size(0)) / (num_heads_kv * 2) * kSparseBlockSize
++                        : static_cast<int>(k.size(1));
+ 
+   // Phantom block padding: round up to multiple of 8 (kSparseBlocksPerKV*2) for even kv_iters.
+   constexpr int kAlign = kSparseBlocksPerKV * 2;  // 8
+@@ -80,13 +85,26 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
    q_padded.narrow(2, 0, seq_q).copy_(q_bhsd);
    auto q_tiled = q_padded.view({batch * heads * num_row_tiles, kRows, kQkK}).contiguous();
  
 -  // ======== Prepare K ========
+-  auto k_bhsd = k.permute({0, 2, 1, 3}).contiguous();
+   int const total_k_padded = ((seq_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
+   int const total_sparse_blocks = total_k_padded / kSparseBlockSize;
 +  // ======== Prepare K/V ========
 +  // Paged mode: k and v are already the page pool the kernel indexes, so none of
 +  // the permute/pad/contiguous work below runs. It is the dominant host cost at
@@ -87,9 +113,7 @@ index 2a194a8..90e937c 100644
 +    k_blocks = k.contiguous();
 +    v_blocks = v.contiguous();
 +  } else {
-   auto k_bhsd = k.permute({0, 2, 1, 3}).contiguous();
-   int const total_k_padded = ((seq_k + kSparseBlockSize - 1) / kSparseBlockSize) * kSparseBlockSize;
-   int const total_sparse_blocks = total_k_padded / kSparseBlockSize;
++  auto k_bhsd = k.permute({0, 2, 1, 3}).contiguous();
    auto k_padded = torch::zeros({batch, heads, total_k_padded, kQkK}, k.options());
    k_padded.narrow(2, 0, seq_k).copy_(k_bhsd);
 -  auto k_blocks =
@@ -97,7 +121,7 @@ index 2a194a8..90e937c 100644
        k_padded.view({batch, heads, total_sparse_blocks, kSparseBlockSize, 2, kDimHalf})
            .permute({0, 1, 2, 4, 3, 5})
            .reshape({batch * heads * total_sparse_blocks * 2, kSparseBlockSize, kDimHalf})
-@@ -96,11 +109,12 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
+@@ -96,11 +114,12 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
    auto v_bhds = v.permute({0, 2, 3, 1}).contiguous();
    auto v_padded = torch::zeros({batch, heads, kOutputCols, total_k_padded}, v.options());
    v_padded.narrow(3, 0, seq_k).copy_(v_bhds);
@@ -111,7 +135,7 @@ index 2a194a8..90e937c 100644
  
    auto out_flat = torch::zeros({batch * heads * num_row_tiles, kRows, kOutputCols}, q.options());
    auto lse_flat =
-@@ -133,6 +147,8 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
+@@ -133,6 +152,8 @@ std::vector<torch::Tensor> bsa_fused_fwd_blk64_launch(
            block_sizes.defined() && block_sizes.numel() > 0 ? block_sizes.data_ptr<int>() : nullptr,
            ptr_q2k_block_nums,
            raw_block_sparse_num,
@@ -120,6 +144,46 @@ index 2a194a8..90e937c 100644
        },
        // epilogue
        {reinterpret_cast<bf16*>(out_flat.data_ptr<at::BFloat16>()), lse_flat.data_ptr<float>()},
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs0.cu b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs0.cu
+index 3b0de7b..9c9705c 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs0.cu
++++ b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs0.cu
+@@ -3,4 +3,4 @@
+ 
+ template std::vector<torch::Tensor> flash::bsa_fused_fwd_blk64_launch<false, false>(
+     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, torch::Tensor, float,
+-    torch::Tensor);
++    torch::Tensor, int);
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs1.cu b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs1.cu
+index de2e9dc..2d4b7e4 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs1.cu
++++ b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk0_bs1.cu
+@@ -3,4 +3,4 @@
+ 
+ template std::vector<torch::Tensor> flash::bsa_fused_fwd_blk64_launch<false, true>(
+     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, torch::Tensor, float,
+-    torch::Tensor);
++    torch::Tensor, int);
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs0.cu b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs0.cu
+index b46c10e..bb7c982 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs0.cu
++++ b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs0.cu
+@@ -3,4 +3,4 @@
+ 
+ template std::vector<torch::Tensor> flash::bsa_fused_fwd_blk64_launch<true, false>(
+     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, torch::Tensor, float,
+-    torch::Tensor);
++    torch::Tensor, int);
+diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs1.cu b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs1.cu
+index 334f95f..77fd8cf 100644
+--- a/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs1.cu
++++ b/flashinfer/cute_dsl/sparse/sm100_blk64/instantiations/flash_fwd_varblk1_bs1.cu
+@@ -3,4 +3,4 @@
+ 
+ template std::vector<torch::Tensor> flash::bsa_fused_fwd_blk64_launch<true, true>(
+     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, torch::Tensor, float,
+-    torch::Tensor);
++    torch::Tensor, int);
 diff --git a/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp b/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp
 index 39cee30..d2238ae 100644
 --- a/flashinfer/cute_dsl/sparse/sm100_blk64/mainloop_fwd_sm100.hpp
