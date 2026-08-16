@@ -583,7 +583,16 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
     // and sorted to the tail.  Pass num_valid_pages = max_k_tiles to disable
     // (the comparison `idx >= num_valid_pages` will then never trigger because
     // every valid idx is in [0, max_k_tiles)).
-    uint32_t num_valid_pages) {
+    uint32_t num_valid_pages,
+    // v2.6_per_row_causal_bound: optional per-query page count.  Causal
+    // prefill fills each row's tail past the query's own position with -inf;
+    // scanning it buys nothing and the massed -inf ties drive the histogram
+    // into its slow refinement stages.  When non-null, row t's scan stops at
+    // per_row_valid[t] pages: on a 64K causal prefill that halves the scanned
+    // area on average and routes queries with <= topk visible pages onto the
+    // trivial fill path.  Selections are unchanged -- the skipped tail is all
+    // -inf and can never win a top-k slot over an in-range page.
+    const int32_t* __restrict__ per_row_valid) {
   static_assert(MAX_TOPK <= kSparseTopkMaxK, "MAX_TOPK exceeds supported max");
 
   constexpr int kNumThreadsPerBlock = kIndexerNumThreadsPerBlock;
@@ -629,7 +638,14 @@ __global__ void __launch_bounds__(kIndexerNumThreadsPerBlock) IndexerTopKWithSor
   // Per-row input pointer (transposed layout: row stride = max_k_tiles).
   const float* logits = in + static_cast<size_t>(bid) * max_k_tiles;
   const int rowStart = 0;
-  const int rowEnd = static_cast<int>(max_k_tiles);
+  // v2.6: bound the scan to this query's visible pages when provided.  The
+  // bound is clamped into [1, max_k_tiles]; candidates then sit below
+  // num_valid_pages by construction, so the OOB clamp semantics are unchanged.
+  int rowEnd = static_cast<int>(max_k_tiles);
+  if (per_row_valid != nullptr) {
+    const int32_t v = per_row_valid[t];
+    if (v > 0 && v < rowEnd) rowEnd = v;
+  }
   const int rowLen = rowEnd - rowStart;
   const int topK = static_cast<int>(topk);
 
@@ -777,6 +793,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
                                           uint32_t max_k_tiles, uint32_t topk,
                                           uint32_t num_valid_pages,
                                           uint32_t force_begin, uint32_t force_end_start,
+                                          const int32_t* per_row_valid,
                                           cudaStream_t stream) {
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
@@ -821,7 +838,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
     if (err != cudaSuccess) return err;
     void* args[] = {(void*)&transposed, (void*)&out, (void*)&total_qo_len,
                     (void*)&num_qo_heads, (void*)&max_k_tiles, (void*)&topk,
-                    (void*)&num_valid_pages};
+                    (void*)&num_valid_pages, (void*)&per_row_valid};
     dim3 grid(num_rows);
     dim3 block(kIndexerNumThreadsPerBlock);
     return cudaLaunchKernel((const void*)kernel, grid, block, args, dyn_smem_bytes, stream);
@@ -853,7 +870,8 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
                                     uint32_t total_qo_len, uint32_t num_qo_heads,
                                     uint32_t max_k_tiles, uint32_t num_valid_pages,
                                     uint32_t force_begin, uint32_t force_end,
-                                    cudaStream_t stream) {
+                                    cudaStream_t stream,
+                                    const int32_t* per_row_valid = nullptr) {
   constexpr uint32_t topk = 16;
   const uint32_t num_rows = total_qo_len * num_qo_heads;
   if (num_rows == 0) return cudaSuccess;
@@ -877,7 +895,7 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   float* transpose_buf = reinterpret_cast<float*>(workspace);
   return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, total_qo_len, num_qo_heads,
                                        max_k_tiles, topk, num_valid_pages,
-                                       force_begin, force_end_start, stream);
+                                       force_begin, force_end_start, per_row_valid, stream);
 }
 
 }  // namespace sparse_topk

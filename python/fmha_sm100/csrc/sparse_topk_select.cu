@@ -65,4 +65,68 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
 }
 
+// v2.6_per_row_causal_bound: same contract plus a per-query visible-page
+// count.  Row t's scan stops at per_row_valid[t] pages, which skips the
+// causal -inf tail (and its histogram-hostile ties) entirely.  Selections
+// are identical to the unbounded call: the skipped tail is all -inf.
+void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
+                               TensorView workspace_buffer,
+                               TensorView per_row_valid, int64_t topk,
+                               int64_t num_valid_pages,
+                               int64_t force_begin_blocks,
+                               int64_t force_end_blocks, int64_t stream_ptr) {
+  CHECK_INPUT(max_score);
+  CHECK_INPUT(output_indices);
+  CHECK_INPUT(workspace_buffer);
+  CHECK_INPUT(per_row_valid);
+  CHECK_DIM(3, max_score);
+  CHECK_DIM(3, output_indices);
+  CHECK_DIM(1, workspace_buffer);
+  CHECK_DIM(1, per_row_valid);
+
+  TVM_FFI_ICHECK(encode_dlpack_dtype(max_score.dtype()) == float32_code)
+      << "max_score must be float32";
+  TVM_FFI_ICHECK(encode_dlpack_dtype(output_indices.dtype()) == int32_code)
+      << "output_indices must be int32";
+  TVM_FFI_ICHECK(encode_dlpack_dtype(workspace_buffer.dtype()) == int32_code)
+      << "workspace_buffer must be int32";
+  TVM_FFI_ICHECK(encode_dlpack_dtype(per_row_valid.dtype()) == int32_code)
+      << "per_row_valid must be int32";
+
+  const int64_t num_qo_heads = max_score.size(0);
+  const int64_t max_k_tiles = max_score.size(1);
+  const int64_t total_qo_len = max_score.size(2);
+
+  TVM_FFI_ICHECK(output_indices.size(0) == total_qo_len);
+  TVM_FFI_ICHECK(output_indices.size(1) == num_qo_heads);
+  TVM_FFI_ICHECK(output_indices.size(2) == topk);
+  TVM_FFI_ICHECK(per_row_valid.size(0) == total_qo_len)
+      << "per_row_valid must have one entry per query token";
+  TVM_FFI_ICHECK(topk == 16) << "this kernel only supports topk == 16, got " << topk;
+  TVM_FFI_ICHECK(num_valid_pages > 0)
+      << "num_valid_pages must be > 0, got " << num_valid_pages;
+
+  const size_t needed_workspace = sparse_topk::SparseTopKWorkspaceSize(
+      static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
+      static_cast<uint32_t>(max_k_tiles));
+  TVM_FFI_ICHECK(static_cast<size_t>(workspace_buffer.size(0)) >= needed_workspace)
+      << "workspace_buffer too small: need " << needed_workspace << " int32 elements";
+
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+
+  cudaError_t status = sparse_topk::SparseTopKSelect(
+      static_cast<const float*>(max_score.data_ptr()),
+      static_cast<int32_t*>(output_indices.data_ptr()),
+      static_cast<int32_t*>(workspace_buffer.data_ptr()),
+      static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
+      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
+      static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
+      stream,
+      static_cast<const int32_t*>(per_row_valid.data_ptr()));
+
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sparse_topk_select_causal failed: " << cudaGetErrorString(status);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select, sparse_topk_select);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sparse_topk_select_causal, sparse_topk_select_causal);

@@ -1216,6 +1216,7 @@ def sparse_topk_select(
     output: Optional[torch.Tensor] = None,
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
+    per_query_valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1311,13 +1312,33 @@ def sparse_topk_select(
     # v2.5_oob_clamp_in_kernel: OOB clamp is folded into the kernel — the prior
     # post-process torch.where + sort + torch.where chain (~84-101 us / call)
     # is replaced by passing num_valid_pages directly to the kernel.
-    module.sparse_topk_select(
-        max_score, output_indices, workspace_buffer,
-        topk,
-        nvp_arg,
-        int(force_begin_blocks),
-        int(force_end_blocks),
-        torch.cuda.current_stream().cuda_stream,
-    )
+    #
+    # v2.6_per_row_causal_bound: per_query_valid ([total_qo_len] int32, visible
+    # pages per query) bounds each row's scan, skipping the causal -inf tail
+    # whose ties otherwise drive the histogram into its refinement stages.
+    # Selections are identical either way; only the scanned area shrinks.
+    if per_query_valid is not None:
+        assert per_query_valid.dtype == torch.int32, "per_query_valid must be int32"
+        assert per_query_valid.shape == (total_qo_len,), (
+            f"per_query_valid must be [{total_qo_len}], got {tuple(per_query_valid.shape)}"
+        )
+        module.sparse_topk_select_causal(
+            max_score, output_indices, workspace_buffer,
+            per_query_valid.contiguous(),
+            topk,
+            nvp_arg,
+            int(force_begin_blocks),
+            int(force_end_blocks),
+            torch.cuda.current_stream().cuda_stream,
+        )
+    else:
+        module.sparse_topk_select(
+            max_score, output_indices, workspace_buffer,
+            topk,
+            nvp_arg,
+            int(force_begin_blocks),
+            int(force_end_blocks),
+            torch.cuda.current_stream().cuda_stream,
+        )
 
     return output_indices
