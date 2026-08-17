@@ -1217,6 +1217,7 @@ def sparse_topk_select(
     force_begin_blocks: int = 0,
     force_end_blocks: int = 0,
     per_query_valid: Optional[torch.Tensor] = None,
+    prescale: float = 1.0,
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1330,6 +1331,7 @@ def sparse_topk_select(
             int(force_begin_blocks),
             int(force_end_blocks),
             torch.cuda.current_stream().cuda_stream,
+            float(prescale),
         )
     else:
         module.sparse_topk_select(
@@ -1339,6 +1341,7 @@ def sparse_topk_select(
             int(force_begin_blocks),
             int(force_end_blocks),
             torch.cuda.current_stream().cuda_stream,
+            float(prescale),
         )
 
     return output_indices

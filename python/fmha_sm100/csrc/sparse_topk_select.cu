@@ -18,7 +18,7 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
                         TensorView workspace_buffer, int64_t topk,
                         int64_t num_valid_pages,
                         int64_t force_begin_blocks, int64_t force_end_blocks,
-                        int64_t stream_ptr) {
+                        int64_t stream_ptr, double prescale) {
   CHECK_INPUT(max_score);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(workspace_buffer);
@@ -59,7 +59,7 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
-      stream);
+      stream, nullptr, static_cast<float>(prescale));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
@@ -74,7 +74,8 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
                                TensorView per_row_valid, int64_t topk,
                                int64_t num_valid_pages,
                                int64_t force_begin_blocks,
-                               int64_t force_end_blocks, int64_t stream_ptr) {
+                               int64_t force_end_blocks, int64_t stream_ptr,
+                               double prescale) {
   CHECK_INPUT(max_score);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(workspace_buffer);
@@ -122,7 +123,8 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
       stream,
-      static_cast<const int32_t*>(per_row_valid.data_ptr()));
+      static_cast<const int32_t*>(per_row_valid.data_ptr()),
+      static_cast<float>(prescale));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select_causal failed: " << cudaGetErrorString(status);
