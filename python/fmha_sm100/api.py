@@ -1218,6 +1218,7 @@ def sparse_topk_select(
     force_end_blocks: int = 0,
     per_query_valid: Optional[torch.Tensor] = None,
     prescale: float = 1.0,
+    group_size: int = 1,
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1292,8 +1293,17 @@ def sparse_topk_select(
         f"= {force_begin_blocks + force_end_blocks} exceeds topk={topk}"
     )
 
-    # Workspace = transpose_buf only: (num_qo_heads, max_k_tiles, total_qo_len) fp32.
-    workspace_size = num_qo_heads * max_k_tiles * total_qo_len  # int32 elements
+    # v2.8_group_max_in_transpose: group_size consecutive score rows are reduced
+    # with a max inside the transpose, so the selector -- and every buffer past
+    # it -- works on num_qo_heads // group_size rows. Folding it here instead of
+    # in the caller saves a full read+write pass over the score tensor.
+    assert group_size >= 1 and num_qo_heads % group_size == 0, (
+        f"num_qo_heads={num_qo_heads} must be a multiple of group_size={group_size}"
+    )
+    out_heads = num_qo_heads // group_size
+
+    # Workspace = transpose_buf only: (out_heads, max_k_tiles, total_qo_len) fp32.
+    workspace_size = out_heads * max_k_tiles * total_qo_len  # int32 elements
 
     workspace_buffer = _alloc_workspace_buf(_BuffTag.sparse_topk_workspace, workspace_size, max_score.device, torch.int32)
     
@@ -1301,7 +1311,7 @@ def sparse_topk_select(
         output_indices = output
     else:
         output_indices = torch.empty(
-            total_qo_len, num_qo_heads, topk,
+            total_qo_len, out_heads, topk,
             dtype=torch.int32, device=max_score.device,
         )
 
@@ -1332,6 +1342,7 @@ def sparse_topk_select(
             int(force_end_blocks),
             torch.cuda.current_stream().cuda_stream,
             float(prescale),
+            int(group_size),
         )
     else:
         module.sparse_topk_select(
@@ -1342,6 +1353,7 @@ def sparse_topk_select(
             int(force_end_blocks),
             torch.cuda.current_stream().cuda_stream,
             float(prescale),
+            int(group_size),
         )
 
     return output_indices

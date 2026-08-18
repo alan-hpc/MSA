@@ -18,7 +18,8 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
                         TensorView workspace_buffer, int64_t topk,
                         int64_t num_valid_pages,
                         int64_t force_begin_blocks, int64_t force_end_blocks,
-                        int64_t stream_ptr, double prescale) {
+                        int64_t stream_ptr, double prescale,
+                        int64_t group_size) {
   CHECK_INPUT(max_score);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(workspace_buffer);
@@ -38,7 +39,10 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
   const int64_t total_qo_len = max_score.size(2);
 
   TVM_FFI_ICHECK(output_indices.size(0) == total_qo_len);
-  TVM_FFI_ICHECK(output_indices.size(1) == num_qo_heads);
+  TVM_FFI_ICHECK(group_size > 0 && num_qo_heads % group_size == 0)
+      << "num_qo_heads (" << num_qo_heads << ") must be a multiple of group_size ("
+      << group_size << ")";
+  TVM_FFI_ICHECK(output_indices.size(1) == num_qo_heads / group_size);
   TVM_FFI_ICHECK(output_indices.size(2) == topk);
   TVM_FFI_ICHECK(topk == 16) << "this kernel only supports topk == 16, got " << topk;
   TVM_FFI_ICHECK(num_valid_pages > 0)
@@ -46,7 +50,7 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
 
   const size_t needed_workspace = sparse_topk::SparseTopKWorkspaceSize(
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
-      static_cast<uint32_t>(max_k_tiles));
+      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(group_size));
   TVM_FFI_ICHECK(static_cast<size_t>(workspace_buffer.size(0)) >= needed_workspace)
       << "workspace_buffer too small: need " << needed_workspace << " int32 elements";
 
@@ -59,7 +63,8 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
       static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
-      stream, nullptr, static_cast<float>(prescale));
+      stream, nullptr, static_cast<float>(prescale),
+      static_cast<uint32_t>(group_size));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select failed: " << cudaGetErrorString(status);
@@ -75,7 +80,7 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
                                int64_t num_valid_pages,
                                int64_t force_begin_blocks,
                                int64_t force_end_blocks, int64_t stream_ptr,
-                               double prescale) {
+                               double prescale, int64_t group_size) {
   CHECK_INPUT(max_score);
   CHECK_INPUT(output_indices);
   CHECK_INPUT(workspace_buffer);
@@ -99,7 +104,10 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
   const int64_t total_qo_len = max_score.size(2);
 
   TVM_FFI_ICHECK(output_indices.size(0) == total_qo_len);
-  TVM_FFI_ICHECK(output_indices.size(1) == num_qo_heads);
+  TVM_FFI_ICHECK(group_size > 0 && num_qo_heads % group_size == 0)
+      << "num_qo_heads (" << num_qo_heads << ") must be a multiple of group_size ("
+      << group_size << ")";
+  TVM_FFI_ICHECK(output_indices.size(1) == num_qo_heads / group_size);
   TVM_FFI_ICHECK(output_indices.size(2) == topk);
   TVM_FFI_ICHECK(per_row_valid.size(0) == total_qo_len)
       << "per_row_valid must have one entry per query token";
@@ -109,7 +117,7 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
 
   const size_t needed_workspace = sparse_topk::SparseTopKWorkspaceSize(
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
-      static_cast<uint32_t>(max_k_tiles));
+      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(group_size));
   TVM_FFI_ICHECK(static_cast<size_t>(workspace_buffer.size(0)) >= needed_workspace)
       << "workspace_buffer too small: need " << needed_workspace << " int32 elements";
 
@@ -124,7 +132,7 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
       stream,
       static_cast<const int32_t*>(per_row_valid.data_ptr()),
-      static_cast<float>(prescale));
+      static_cast<float>(prescale), static_cast<uint32_t>(group_size));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "sparse_topk_select_causal failed: " << cudaGetErrorString(status);
