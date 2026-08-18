@@ -622,6 +622,7 @@ def sparse_atten_func(
     usable_SM_count: int = -1,
     qk_dtype: Optional[torch.dtype] = None,
     pv_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
 
@@ -772,6 +773,7 @@ def sparse_atten_func(
         int(max_seqlen_k),
         qk_dtype,
         pv_dtype,
+        out,
     )
 
 
@@ -1459,6 +1461,7 @@ def _sparse_atten_csr_varlen_forward(
     max_seqlen_k: int,
     qk_dtype: torch.dtype,
     pv_dtype: torch.dtype,
+    out: Optional[torch.Tensor] = None,
 ):
     total_q, head_q, dim = q.shape
     if head_q % head_kv != 0:
@@ -1488,7 +1491,20 @@ def _sparse_atten_csr_varlen_forward(
         if kernel_return_temperature_lse
         else None
     )
-    O_out = torch.empty(total_q, head_q, dim, dtype=torch.bfloat16, device=q.device)
+    if out is not None:
+        expected = (total_q, head_q, dim)
+        if tuple(out.shape) != expected:
+            raise ValueError(f"out must be {expected}, got {tuple(out.shape)}")
+        if out.dtype != torch.bfloat16 or not out.is_contiguous():
+            raise ValueError(
+                f"out must be contiguous bfloat16, got {out.dtype} "
+                f"contiguous={out.is_contiguous()}"
+            )
+        O_out = out
+    else:
+        O_out = torch.empty(
+            total_q, head_q, dim, dtype=torch.bfloat16, device=q.device
+        )
     LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
     LSE_temperature_out = (
         torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
