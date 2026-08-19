@@ -57,7 +57,8 @@ template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQ
           bool SingleSoftmaxWarpGroup = false,
           int KVPageSize = -1,
           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
-              cutlass::fmha::collective::SparseAttnMode::Off>
+              cutlass::fmha::collective::SparseAttnMode::Off,
+          int ScoreReduce = 0>
 struct FwdRunner {
   using Element = DTypeIn;
   using ElementAccumulatorQK = float;
@@ -89,7 +90,8 @@ struct FwdRunner {
 
   using Mainloop = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
       Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeQK, TileShapePV, StrideQ,
-      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode>;
+      StrideK, StrideV, ActiveMask, ThreadShape, IsSplitKV, KVPageSize, kSparseAttnMode,
+      ScoreReduce>;
   using Epilogue = cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
       ElementOut, ElementAccumulatorPV, typename Mainloop::TileShapePV, NumQStages, IsSplitKV, bNeedOutput, kPackFactor>;
   using Operation =
@@ -412,7 +414,8 @@ template <typename DTypeIn, typename DTypeOut, typename IdType, class TileShapeQ
           bool SingleSoftmaxWarpGroup = false,
           int KVPageSize = -1,
           cutlass::fmha::collective::SparseAttnMode kSparseAttnMode =
-              cutlass::fmha::collective::SparseAttnMode::Off>
+              cutlass::fmha::collective::SparseAttnMode::Off,
+          int ScoreReduce = 0>
 cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn* v,
                          IdType* qo_segment_lens, IdType* kv_segment_lens,
                          IdType* qo_segment_offsets, IdType* kv_segment_offsets,
@@ -443,7 +446,8 @@ cudaError_t run_fmha_fwd(void* workspace_buffer, DTypeIn* q, DTypeIn* k, DTypeIn
                          PackGQAUnpackParams pack_gqa = {},
                          int num_ctas = 0) {
   return FwdRunner<DTypeIn, DTypeOut, IdType, TileShapeQK, TileShapePV, ActiveMask,
-                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode>::run(
+                   ThreadShape, IsSplitKV, SingleSoftmaxWarpGroup, KVPageSize, kSparseAttnMode,
+                   ScoreReduce>::run(
       workspace_buffer, q, k, v, qo_segment_lens, kv_segment_lens,
       qo_segment_offsets, kv_segment_offsets, packed_work_range,
       packed_work_info, o, mask_mode_code, sm_scale,

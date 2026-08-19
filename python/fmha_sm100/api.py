@@ -458,7 +458,8 @@ def _make_plan_info(
     qo_segment_offsets, kv_segment_offsets, kv_page_indptr, max_k_tiles,
     qo_segment_lens, kv_segment_lens, qo_offset,
     pack_factor, orig_num_qo_heads,
-    qo_len_uniform, cute_workspace_buffer
+    qo_len_uniform, cute_workspace_buffer,
+    score_reduce="max"
 ):
     # ws = _workspace_cache_per_plan.pop()
     # print("pop")
@@ -486,6 +487,7 @@ def _make_plan_info(
         "orig_num_qo_heads": orig_num_qo_heads,
         "qo_len_uniform": qo_len_uniform,
         "cute_workspace_buffer": cute_workspace_buffer,
+        "score_reduce": score_reduce,
         "MM-SA-Nv":False
     })
 
@@ -529,9 +531,17 @@ def _fmha_sm100_plan(
     causal: bool = True,
     sparse_kernel_mode: str = 'auto',
     use_fp8_kvcache: bool = False,
+    score_reduce: str = "max",
     device = None,
     stream = None
 ):
+    if score_reduce not in ("max", "sum"):
+        raise ValueError(
+            f"score_reduce must be 'max' or 'sum', got {score_reduce!r}")
+    if score_reduce == "sum" and not output_maxscore:
+        # The sum is emitted from the same GMEM write as the max, which only
+        # the OnlyScore/Full score path performs.
+        raise ValueError("score_reduce='sum' requires output_maxscore=True")
     device = torch.cuda.current_device() if device is None else device
     _reset_np_staging()
 
@@ -701,7 +711,8 @@ def _fmha_sm100_plan(
                 kv_segment_offsets=kv_segment_offsets, kv_page_indptr=kv_page_indptr, max_k_tiles=max_k_tiles,
                 qo_segment_lens=qo_segment_lens_gpu, kv_segment_lens=kv_segment_lens, qo_offset=qo_offset,
                 pack_factor=pack_factor, orig_num_qo_heads=orig_num_qo_heads,
-                qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer)
+                qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer,
+                score_reduce=score_reduce)
 
         num_kv_splits = 1
     elif num_kv_splits < 1:
@@ -751,7 +762,8 @@ def _fmha_sm100_plan(
         kv_segment_offsets=kv_segment_offsets, kv_page_indptr=kv_page_indptr, max_k_tiles=max_k_tiles,
         qo_segment_lens=qo_segment_lens_gpu, kv_segment_lens=kv_segment_lens, qo_offset=qo_offset,
         pack_factor=pack_factor, orig_num_qo_heads=orig_num_qo_heads,
-        qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer)
+        qo_len_uniform=qo_len_uniform, cute_workspace_buffer=cute_workspace_buffer,
+        score_reduce=score_reduce)
 
 
 
@@ -896,9 +908,14 @@ def _fmha_sm100(
 
     variant_page_size = (k.shape[2] if is_paged else -1)
 
+    # Fixed at plan time; only OnlyScore variants can be built with a
+    # non-default value (see _FMHA_SM100_IMPOSSIBLE in jit.py).
+    score_reduce_code = 1 if plan_info.get("score_reduce", "max") == "sum" else 0
+
     variant_module = get_fmha_variant(
         dtype_code, qo_tile_size, (max_qo_len <= 64),
-        sparse_mode, variant_page_size, use_split_kv, pack_factor)
+        sparse_mode, variant_page_size, use_split_kv, pack_factor,
+        score_reduce_code)
 
     variant_module.run(
         workspace_buffer,
@@ -1219,6 +1236,7 @@ def sparse_topk_select(
     per_query_valid: Optional[torch.Tensor] = None,
     prescale: float = 1.0,
     group_size: int = 1,
+    group_reduce: str = "max",
 ) -> torch.Tensor:
     r"""Select top-k KV-tile indices per (qo_head, token) row from the FMHA max-score tensor.
 
@@ -1301,6 +1319,11 @@ def sparse_topk_select(
         f"num_qo_heads={num_qo_heads} must be a multiple of group_size={group_size}"
     )
     out_heads = num_qo_heads // group_size
+    if group_reduce not in ("max", "sum"):
+        raise ValueError(
+            f"group_reduce must be 'max' or 'sum', got {group_reduce!r}")
+    # The fold rides inside the transpose either way; only the operator differs.
+    group_sum = 1 if group_reduce == "sum" else 0
 
     # Workspace = transpose_buf only: (out_heads, max_k_tiles, total_qo_len) fp32.
     workspace_size = out_heads * max_k_tiles * total_qo_len  # int32 elements
@@ -1343,6 +1366,7 @@ def sparse_topk_select(
             torch.cuda.current_stream().cuda_stream,
             float(prescale),
             int(group_size),
+            int(group_sum),
         )
     else:
         module.sparse_topk_select(
@@ -1354,6 +1378,7 @@ def sparse_topk_select(
             torch.cuda.current_stream().cuda_stream,
             float(prescale),
             int(group_size),
+            int(group_sum),
         )
 
     return output_indices

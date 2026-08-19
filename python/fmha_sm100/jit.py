@@ -105,8 +105,18 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
     (p.get("tile_q") == "_256" and p.get("single_wg") == "true") or
     (p.get("tile_q") == "_256" and p.get("is_split_kv") == "true") or
     (p.get("page_size") == -1 and p.get("sparse_mode") == "Sparse") or
-    (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256")
+    (p.get("pack_factor", 1) > 1 and p.get("tile_q") == "_256") or
+    # Sum reduction is emitted from the softmax warp's GMEM write, which only
+    # exists in OnlyScore (see the kScoreSum static_assert in
+    # sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp).
+    (p.get("score_reduce", 0) != 0 and p.get("sparse_mode") != "OnlyScore")
 )
+
+# Block-score reduction: 0 = max (upstream), 1 = sum over visible tokens.
+# Deliberately not a dispatch axis -- the default keeps every existing variant
+# key byte-identical, so no compile cache is invalidated; sum gets a "_rsum"
+# suffix of its own.
+_FMHA_SM100_SCORE_REDUCE = (0, 1)
 
 
 def _dlpack_dtype_code(torch_dtype):
@@ -123,9 +133,15 @@ def _dlpack_dtype_code(torch_dtype):
 
 
 def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
-                               sparse_mode, page_size, split_kv, pack_factor):
+                               sparse_mode, page_size, split_kv, pack_factor,
+                               score_reduce=0):
     """Compute a variant key string from runtime parameters."""
     dims = _FMHA_SM100_DISPATCH
+
+    if score_reduce not in _FMHA_SM100_SCORE_REDUCE:
+        raise ValueError(
+            f"score_reduce must be one of {_FMHA_SM100_SCORE_REDUCE}, "
+            f"got {score_reduce}")
 
     def _match_idx(dim_values, runtime_val):
         # Convert Python bool to string to match dispatch table ("true"/"false")
@@ -148,11 +164,14 @@ def _variant_key_from_runtime(dtype_code, qo_tile_size, single_wg,
         _, tparams = dim_values[idx]
         params.update(tparams)
 
+    params["score_reduce"] = score_reduce
+
     if _FMHA_SM100_IMPOSSIBLE(params):
         raise ValueError(f"Impossible FMHA variant combination: {params}")
 
-    func_name = "fmha_sm100_" + "_".join(str(i) for i in indices)
-    variant_name = "_".join(str(i) for i in indices)
+    suffix = "_rsum" if score_reduce != 0 else ""
+    func_name = "fmha_sm100_" + "_".join(str(i) for i in indices) + suffix
+    variant_name = "_".join(str(i) for i in indices) + suffix
     params["func_name"] = func_name
     params["variant_name"] = variant_name
     return variant_name, params
@@ -262,10 +281,11 @@ class FMHAVariantManager:
                 self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
 
     def get_variant(self, dtype_code, qo_tile_size, single_wg,
-                    sparse_mode, page_size, split_kv, pack_factor):
+                    sparse_mode, page_size, split_kv, pack_factor,
+                    score_reduce=0):
         variant_name, params = _variant_key_from_runtime(
             dtype_code, qo_tile_size, single_wg,
-            sparse_mode, page_size, split_kv, pack_factor)
+            sparse_mode, page_size, split_kv, pack_factor, score_reduce)
 
         cached = self._loaded.get(variant_name)
         if cached is not None:
@@ -380,11 +400,12 @@ _variant_manager = FMHAVariantManager()
 
 
 def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
-                     sparse_mode, page_size, split_kv, pack_factor):
+                     sparse_mode, page_size, split_kv, pack_factor,
+                     score_reduce=0):
     """Get a compiled FMHA variant module. Thread-safe, lazy compilation."""
     return _variant_manager.get_variant(
         dtype_code, qo_tile_size, single_wg,
-        sparse_mode, page_size, split_kv, pack_factor)
+        sparse_mode, page_size, split_kv, pack_factor, score_reduce)
 
 
 # ============================================================================

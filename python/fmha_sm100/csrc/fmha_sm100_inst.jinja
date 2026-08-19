@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 // Auto-generated FMHA variant: {{ variant_name }}
-// DTypeIn={{ dtype_in }}, Tile={{ tile_q }}x{{ tile_kv }}, Sparse={{ sparse_mode }}, Page={{ page_size }}, SplitKV={{ is_split_kv }}
+// DTypeIn={{ dtype_in }}, Tile={{ tile_q }}x{{ tile_kv }}, Sparse={{ sparse_mode }}, Page={{ page_size }}, SplitKV={{ is_split_kv }}, ScoreReduce={{ score_reduce | default(0) }}
 #include "fmha_cutlass_sm100.cuh"
 #include "mask.cuh"
 #include "cutlass_utils.cuh"
@@ -33,7 +33,8 @@ cudaError_t {{ func_name }}(const FMHACutlassSM100Params& p) {
                       /*IsSplitKV=*/{{ is_split_kv }},
                       /*SingleSoftmaxWarpGroup=*/{{ single_wg }},
                       {{ page_size }},
-                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }}>(
+                      cutlass::fmha::collective::SparseAttnMode::{{ sparse_mode }},
+                      /*ScoreReduce=*/{{ score_reduce | default(0) }}>(
       p.workspace_buffer_ptr,
       static_cast<cutlass_type_in*>(p.q_ptr),
       static_cast<cutlass_type_in*>(p.k_ptr),

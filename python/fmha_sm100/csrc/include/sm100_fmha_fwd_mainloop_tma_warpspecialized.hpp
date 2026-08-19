@@ -158,10 +158,15 @@ template <class Element_, class ElementQK_, class ElementPV_, class TileShapeQK_
           class ThreadShape = Shape<_2, _1, _1>,
           bool IsSplitKV_ = false,
           int KVPageSize_ = -1,
-          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off>
+          SparseAttnMode kSparseAttnMode = SparseAttnMode::Off,
+          // How a block's per-token QK scores collapse into that block's score.
+          // 0 = max (upstream), 1 = sum over the block's *visible* tokens.
+          int ScoreReduce_ = 0>
 struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   static constexpr bool IsSplitKV = IsSplitKV_;
   static constexpr int KVPageSize = KVPageSize_;
+  static constexpr int kScoreReduce = ScoreReduce_;
+  static constexpr bool kScoreSum = (kScoreReduce == 1);
 
   static constexpr bool kNeedMaxScore = (kSparseAttnMode == SparseAttnMode::OnlyScore || kSparseAttnMode == SparseAttnMode::Full);
   static constexpr bool kNeedOutput = kSparseAttnMode != SparseAttnMode::OnlyScore;
@@ -173,6 +178,12 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   // for safety (no sync elision in v1 — those are TODO for v2).
   static constexpr bool kFuseMaxScoreIntoSoftmax =
       (kSparseAttnMode == SparseAttnMode::OnlyScore);
+  // Sum reduction is emitted from the softmax warp's GMEM write, which only
+  // exists under kFuseMaxScoreIntoSoftmax. The correction-warp path carries the
+  // value through the V-channel TMEM round-trip and would need its own sum
+  // accumulator there, so sum is scoped to OnlyScore.
+  static_assert(!kScoreSum || kSparseAttnMode == SparseAttnMode::OnlyScore,
+                "ScoreReduce=Sum is only supported in OnlyScore mode");
 
   struct SplitKVParams {
     float scale_output_splitkv = 1.0f;
@@ -907,6 +918,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       ElementQK old_row_max = row_max;
       ElementQK tile_max = -INFINITY;
+      // Sum of this tile's VISIBLE token scores, under ScoreReduce=Sum. Masked
+      // lanes hold -INFINITY after apply_mask() and must contribute 0, not
+      // -inf. The reduction below ASSIGNS this, so the initializer only
+      // survives on skip_computation tiles -- which is why it must be
+      // -INFINITY and not 0.f: a skipped tile is unselectable, and 0.f would
+      // outrank every block whose sum is negative.
+      ElementQK tile_sum = -INFINITY;
       {GPU_TRACE_SCOPE(SOFTMAX_GetMax);
       if constexpr (!skip_computation) {
         // Off: start from row_max (fused running max, identical to original code)
@@ -917,20 +935,75 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         } else {
           init_val = -INFINITY;
         }
-        float tile_max_0 = init_val;
-        float tile_max_1 = init_val;
-        float tile_max_2 = init_val;
-        float tile_max_3 = init_val;
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
-          tile_max_0 = ::fmax(tile_max_0, tTMEM_LOADrS(i));
-          tile_max_1 = ::fmax(tile_max_1, tTMEM_LOADrS(i + 1));
-          tile_max_2 = ::fmax(tile_max_2, tTMEM_LOADrS(i + 2));
-          tile_max_3 = ::fmax(tile_max_3, tTMEM_LOADrS(i + 3));
+        if constexpr (kScoreSum) {
+          // Single pass: do NOT also run the max reduction. kScoreSum implies
+          // OnlyScore, where row_max is dead -- final_call stores 0 under
+          // !kNeedOutput and every rescale consumer is kNeedOutput-gated -- and
+          // in OnlyScore the softmax warp has no exp2/P/PV work left, so that
+          // 128-wide reduction IS most of its work and it sits on the kernel's
+          // critical path. Computing max alongside sum measured 2.1x slower
+          // than max alone; dropping it is what makes sum cost the same as max.
+          float tile_sum_0 = 0.f;
+          float tile_sum_1 = 0.f;
+          float tile_sum_2 = 0.f;
+          float tile_sum_3 = 0.f;
+          if constexpr (need_apply_mask) {
+            // Only a masked tile can hold -INFINITY lanes. A masked lane must
+            // contribute 0, and a row that sees NOTHING in this tile must emit
+            // -inf rather than an empty sum of 0.0 (0.0 would outrank every
+            // block with a negative sum), so track visibility as we go.
+            int n_visible = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
+              const float x0 = tTMEM_LOADrS(i);
+              const float x1 = tTMEM_LOADrS(i + 1);
+              const float x2 = tTMEM_LOADrS(i + 2);
+              const float x3 = tTMEM_LOADrS(i + 3);
+              const bool v0 = (x0 != -INFINITY);
+              const bool v1 = (x1 != -INFINITY);
+              const bool v2 = (x2 != -INFINITY);
+              const bool v3 = (x3 != -INFINITY);
+              tile_sum_0 += v0 ? x0 : 0.f;
+              tile_sum_1 += v1 ? x1 : 0.f;
+              tile_sum_2 += v2 ? x2 : 0.f;
+              tile_sum_3 += v3 ? x3 : 0.f;
+              n_visible += int(v0) + int(v1) + int(v2) + int(v3);
+            }
+            tile_sum = (n_visible == 0)
+                ? -INFINITY
+                : ((tile_sum_0 + tile_sum_1) + (tile_sum_2 + tile_sum_3));
+          } else {
+            // Unmasked tile: every lane is a real score, so no compare, no
+            // emptiness test -- this is the tile count that dominates at long
+            // sequence length, and here sum is exactly as cheap as max.
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
+              tile_sum_0 += tTMEM_LOADrS(i);
+              tile_sum_1 += tTMEM_LOADrS(i + 1);
+              tile_sum_2 += tTMEM_LOADrS(i + 2);
+              tile_sum_3 += tTMEM_LOADrS(i + 3);
+            }
+            tile_sum = (tile_sum_0 + tile_sum_1) + (tile_sum_2 + tile_sum_3);
+          }
+          // tile_max stays -INFINITY here; row_max is dead in OnlyScore.
+        } else {
+          // Upstream path, kept verbatim so the default max variants stay
+          // instruction-for-instruction unchanged.
+          float tile_max_0 = init_val;
+          float tile_max_1 = init_val;
+          float tile_max_2 = init_val;
+          float tile_max_3 = init_val;
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tTMEM_LOADrS); i += 4) {
+            tile_max_0 = ::fmax(tile_max_0, tTMEM_LOADrS(i));
+            tile_max_1 = ::fmax(tile_max_1, tTMEM_LOADrS(i + 1));
+            tile_max_2 = ::fmax(tile_max_2, tTMEM_LOADrS(i + 2));
+            tile_max_3 = ::fmax(tile_max_3, tTMEM_LOADrS(i + 3));
+          }
+          tile_max = ::fmax(tile_max_0, tile_max_1);
+          tile_max = ::fmax(tile_max, tile_max_2);
+          tile_max = ::fmax(tile_max, tile_max_3);
         }
-        tile_max = ::fmax(tile_max_0, tile_max_1);
-        tile_max = ::fmax(tile_max, tile_max_2);
-        tile_max = ::fmax(tile_max, tile_max_3);
         if constexpr (kNeedMaxScore) {
           row_max = ::fmax(row_max, tile_max);
         } else {
@@ -949,11 +1022,19 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       // kept for sync safety in v1).
       if constexpr (kFuseMaxScoreIntoSoftmax) {
         if (ms_base != nullptr) {
+          // tile_sum already carries the -inf "row saw nothing in this tile"
+          // sentinel, folded into the reduction above rather than a second pass.
+          ElementQK ms_val;
+          if constexpr (kScoreSum) {
+            ms_val = tile_sum;
+          } else {
+            ms_val = tile_max;
+          }
 #ifdef FMHA_GMEM_BOUNDS_CHECK
-          gmem_stwt_checked(ms_base + k_tile_idx * ms_stride_k, tile_max,
+          gmem_stwt_checked(ms_base + k_tile_idx * ms_stride_k, ms_val,
                             ms_check_base, ms_check_numel, "max_score_stwt");
 #else
-          __stwt(ms_base + k_tile_idx * ms_stride_k, tile_max);
+          __stwt(ms_base + k_tile_idx * ms_stride_k, ms_val);
 #endif
         }
         k_tile_idx += k_tile_idx_step;

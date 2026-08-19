@@ -316,6 +316,10 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
     SparseTopKTransposeKernel(const float* __restrict__ in, float* __restrict__ out, uint32_t K,
                               uint32_t qo, uint32_t force_begin,
                               uint32_t num_valid_pages, float prescale, uint32_t group_size,
+                              // v3.0_group_sum: 0 = max over the index-head
+                              // group (upstream), 1 = sum. Same fold, same
+                              // pass, different operator.
+                              uint32_t group_sum,
                               // v2.9_per_row_force: the force window is the tail
                               // of each query's *own* causal range, not of the
                               // batch-wide page count -- otherwise a short query
@@ -342,8 +346,14 @@ __global__ void __launch_bounds__(kTransposeTile* kTransposeBlockRows)
     if (q_load < qo && k_load < K) {
       const size_t off = static_cast<size_t>(k_load) * qo + q_load;
       float m = in_head[off];
-      for (uint32_t j = 1; j < group_size; ++j) {
-        m = fmaxf(m, in_head[j * head_stride + off]);
+      if (group_sum) {
+        for (uint32_t j = 1; j < group_size; ++j) {
+          m += in_head[j * head_stride + off];
+        }
+      } else {
+        for (uint32_t j = 1; j < group_size; ++j) {
+          m = fmaxf(m, in_head[j * head_stride + off]);
+        }
       }
       tile[ty + dk][tx] = m;
     }
@@ -406,6 +416,8 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
     // over the score tensor; this pass already reads every element, so the max
     // rides along. blockIdx.z indexes the *output* (reduced) head.
     uint32_t group_size,
+    // v3.0_group_sum: 0 = max over the index-head group, 1 = sum.
+    uint32_t group_sum,
     // v2.9_per_row_force: force window measured from each query's own causal
     // bound, so a query pins its own last page rather than the batch's.
     uint32_t force_end, const int32_t* __restrict__ per_row_valid) {
@@ -429,12 +441,19 @@ __global__ void __launch_bounds__(TILE * TILE / 4) SparseTopKTransposeXorF4Kerne
   {
     const size_t off = static_cast<size_t>(kb + tm) * qo + qb + tn * 4;
     float4 v = *reinterpret_cast<const float4*>(in_head + off);
-    for (uint32_t j = 1; j < group_size; ++j) {
-      const float4 g = *reinterpret_cast<const float4*>(in_head + j * head_stride + off);
-      v.x = fmaxf(v.x, g.x);
-      v.y = fmaxf(v.y, g.y);
-      v.z = fmaxf(v.z, g.z);
-      v.w = fmaxf(v.w, g.w);
+    if (group_sum) {
+      for (uint32_t j = 1; j < group_size; ++j) {
+        const float4 g = *reinterpret_cast<const float4*>(in_head + j * head_stride + off);
+        v.x += g.x; v.y += g.y; v.z += g.z; v.w += g.w;
+      }
+    } else {
+      for (uint32_t j = 1; j < group_size; ++j) {
+        const float4 g = *reinterpret_cast<const float4*>(in_head + j * head_stride + off);
+        v.x = fmaxf(v.x, g.x);
+        v.y = fmaxf(v.y, g.y);
+        v.z = fmaxf(v.z, g.z);
+        v.w = fmaxf(v.w, g.w);
+      }
     }
 
     const int base = tm * TILE;
@@ -841,7 +860,8 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
                                           uint32_t num_valid_pages,
                                           uint32_t force_begin, uint32_t force_end,
                                           const int32_t* per_row_valid, float prescale,
-                                          uint32_t group_size, cudaStream_t stream) {
+                                          uint32_t group_size, uint32_t group_sum,
+                                          cudaStream_t stream) {
   // num_qo_heads counts input score rows; the transpose reduces each group of
   // group_size down to one, so everything downstream works on out_heads.
   const uint32_t out_heads = num_qo_heads / group_size;
@@ -863,6 +883,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
       void* tr_args[] = {(void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles,
                          (void*)&total_qo_len, (void*)&force_begin,
                          (void*)&num_valid_pages, (void*)&prescale, (void*)&group_size,
+                         (void*)&group_sum,
                          (void*)&force_end, (void*)&per_row_valid};
       cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeXorF4Kernel<kXorTile>,
                                          grid, block, tr_args, 0, stream);
@@ -874,6 +895,7 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
       void* tr_args[] = {(void*)&in_strided, (void*)&transposed, (void*)&max_k_tiles,
                          (void*)&total_qo_len, (void*)&force_begin,
                          (void*)&num_valid_pages, (void*)&prescale, (void*)&group_size,
+                         (void*)&group_sum,
                          (void*)&force_end, (void*)&per_row_valid};
       cudaError_t err = cudaLaunchKernel((const void*)SparseTopKTransposeKernel, grid, block,
                                          tr_args, 0, stream);
@@ -927,7 +949,8 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
                                     cudaStream_t stream,
                                     const int32_t* per_row_valid = nullptr,
                                     float prescale = 1.0f,
-                                    uint32_t group_size = 1) {
+                                    uint32_t group_size = 1,
+                                    uint32_t group_sum = 0) {
   constexpr uint32_t topk = 16;
   if (group_size == 0 || num_qo_heads % group_size) return cudaErrorInvalidValue;
   const uint32_t out_heads = num_qo_heads / group_size;
@@ -951,7 +974,7 @@ inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* work
   return LaunchTransposeAndIndexerTopK(in, transpose_buf, out, total_qo_len, num_qo_heads,
                                        max_k_tiles, topk, num_valid_pages,
                                        force_begin, force_end, per_row_valid, prescale,
-                                       group_size, stream);
+                                       group_size, group_sum, stream);
 }
 
 }  // namespace sparse_topk
