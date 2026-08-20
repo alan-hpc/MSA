@@ -1251,7 +1251,7 @@ def sparse_topk_select(
         Slots beyond the actual KV tile count must be pre-filled with ``-inf``
         (fmha_sm100 does this automatically via ``torch.full``).
     topk : int
-        Must be exactly 16.
+        Must be 16 or 32.
     num_valid_pages : int, optional
         Actual number of KV pages in the page table, i.e. ``ceil(kv_len / page_size)``.
         ``max_k_tiles`` is round-up-aligned and always >= ``num_valid_pages``.
@@ -1280,7 +1280,7 @@ def sparse_topk_select(
     assert max_score.dtype == torch.float32, f"max_score must be float32, got {max_score.dtype}"
     assert max_score.dim() == 3, f"max_score must be 3D, got {max_score.shape}"
     assert max_score.is_contiguous(), "max_score must be contiguous"
-    assert topk == 16, f"topk must be 16, got {topk}"
+    assert topk in (16, 32), f"topk must be 16 or 32, got {topk}"
 
     num_qo_heads, max_k_tiles, total_qo_len = max_score.shape
 

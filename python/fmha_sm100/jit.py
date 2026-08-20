@@ -408,6 +408,26 @@ def get_fmha_variant(dtype_code, qo_tile_size, single_wg,
         sparse_mode, page_size, split_kv, pack_factor, score_reduce)
 
 
+def precompile_compass_variants() -> None:
+    """Compile the fixed Compass MSA variants before serving requests."""
+    import torch
+
+    fp8 = _dlpack_dtype_code(torch.float8_e4m3fn)
+    bf16 = _dlpack_dtype_code(torch.bfloat16)
+    # The index proxy needs both checkpoint score semantics. Sparse attention
+    # itself always uses the normal output path, whose score reduction is zero.
+    for dtype_code in (bf16, fp8):
+        for score_reduce in _FMHA_SM100_SCORE_REDUCE:
+            get_fmha_variant(
+                dtype_code, 256, False, 2, 128, False, 1, score_reduce
+            )
+    for dtype_code in (bf16, fp8):
+        get_fmha_variant(dtype_code, 256, False, 0, 128, False, 1)
+    get_plan_fn()
+    get_sparse_topk_module()
+    get_reduction_module()
+
+
 # ============================================================================
 # Plan kernel JIT (also needs sm_100a, can't be statically compiled)
 # ============================================================================

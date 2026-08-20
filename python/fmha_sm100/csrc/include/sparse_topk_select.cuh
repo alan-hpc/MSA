@@ -905,7 +905,8 @@ cudaError_t LaunchTransposeAndIndexerTopK(const float* in_strided, float* transp
 
   // ---- (2) IndexerTopK + fused sort + write to qo_outermost layout -------
   {
-    auto kernel = IndexerTopKWithSortKernel<16>;
+    const auto kernel = topk == 16 ? IndexerTopKWithSortKernel<16>
+                                   : IndexerTopKWithSortKernel<32>;
     const size_t dyn_smem_bytes = static_cast<size_t>(topk) * sizeof(int32_t);
     cudaError_t err = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            static_cast<int>(dyn_smem_bytes));
@@ -933,25 +934,26 @@ inline size_t SparseTopKWorkspaceSize(uint32_t total_qo_len, uint32_t num_qo_hea
 // Top-level dispatcher
 // =============================================================================
 //   in        : (num_qo_heads, max_k_tiles, total_qo_len) contiguous fp32
-//   out       : (total_qo_len, num_qo_heads, topk=16) contiguous int32 asc by k_tile index
+//   out       : (total_qo_len, num_qo_heads, topk) contiguous int32 asc by k_tile index
 //   workspace : int32, at least SparseTopKWorkspaceSize(...) elements
 //   num_valid_pages : indices >= num_valid_pages are emitted as -1 (sorted to
 //                     tail).  Pass max_k_tiles (or any value >= max_k_tiles)
 //                     to disable clamping.
 //
-//   * max_k_tiles <= 16      → SparseTopKIdentityFillKernel (trivial)
-//   * 16 < max_k_tiles < 12288 → Transpose + IndexerTopKWithSortKernel<16>
+//   * max_k_tiles <= topk      → SparseTopKIdentityFillKernel (trivial)
+//   * topk < max_k_tiles < 12288 → Transpose + IndexerTopKWithSortKernel<16|32>
 //   * max_k_tiles >= 12288   → cudaErrorNotSupported
 inline cudaError_t SparseTopKSelect(const float* in, int32_t* out, int32_t* workspace,
                                     uint32_t total_qo_len, uint32_t num_qo_heads,
-                                    uint32_t max_k_tiles, uint32_t num_valid_pages,
+                                    uint32_t max_k_tiles, uint32_t topk,
+                                    uint32_t num_valid_pages,
                                     uint32_t force_begin, uint32_t force_end,
                                     cudaStream_t stream,
                                     const int32_t* per_row_valid = nullptr,
                                     float prescale = 1.0f,
                                     uint32_t group_size = 1,
                                     uint32_t group_sum = 0) {
-  constexpr uint32_t topk = 16;
+  if (topk != 16 && topk != 32) return cudaErrorInvalidValue;
   if (group_size == 0 || num_qo_heads % group_size) return cudaErrorInvalidValue;
   const uint32_t out_heads = num_qo_heads / group_size;
   const uint32_t num_rows = total_qo_len * out_heads;

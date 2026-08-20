@@ -44,7 +44,8 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       << group_size << ")";
   TVM_FFI_ICHECK(output_indices.size(1) == num_qo_heads / group_size);
   TVM_FFI_ICHECK(output_indices.size(2) == topk);
-  TVM_FFI_ICHECK(topk == 16) << "this kernel only supports topk == 16, got " << topk;
+  TVM_FFI_ICHECK(topk == 16 || topk == 32)
+      << "this kernel only supports topk in {16, 32}, got " << topk;
   TVM_FFI_ICHECK(num_valid_pages > 0)
       << "num_valid_pages must be > 0, got " << num_valid_pages;
 
@@ -61,7 +62,8 @@ void sparse_topk_select(TensorView max_score, TensorView output_indices,
       static_cast<int32_t*>(output_indices.data_ptr()),
       static_cast<int32_t*>(workspace_buffer.data_ptr()),
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
-      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
+      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(topk),
+      static_cast<uint32_t>(num_valid_pages),
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
       stream, nullptr, static_cast<float>(prescale),
       static_cast<uint32_t>(group_size), static_cast<uint32_t>(group_sum));
@@ -112,7 +114,8 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
   TVM_FFI_ICHECK(output_indices.size(2) == topk);
   TVM_FFI_ICHECK(per_row_valid.size(0) == total_qo_len)
       << "per_row_valid must have one entry per query token";
-  TVM_FFI_ICHECK(topk == 16) << "this kernel only supports topk == 16, got " << topk;
+  TVM_FFI_ICHECK(topk == 16 || topk == 32)
+      << "this kernel only supports topk in {16, 32}, got " << topk;
   TVM_FFI_ICHECK(num_valid_pages > 0)
       << "num_valid_pages must be > 0, got " << num_valid_pages;
 
@@ -129,7 +132,8 @@ void sparse_topk_select_causal(TensorView max_score, TensorView output_indices,
       static_cast<int32_t*>(output_indices.data_ptr()),
       static_cast<int32_t*>(workspace_buffer.data_ptr()),
       static_cast<uint32_t>(total_qo_len), static_cast<uint32_t>(num_qo_heads),
-      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(num_valid_pages),
+      static_cast<uint32_t>(max_k_tiles), static_cast<uint32_t>(topk),
+      static_cast<uint32_t>(num_valid_pages),
       static_cast<uint32_t>(force_begin_blocks), static_cast<uint32_t>(force_end_blocks),
       stream,
       static_cast<const int32_t*>(per_row_valid.data_ptr()),
