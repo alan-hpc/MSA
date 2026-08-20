@@ -87,7 +87,13 @@ class SparseK2qCsrBuilderSm100:
         total_rows: Optional[int] = None,
         qhead_per_kv: int = 1,
         return_schedule: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, SparseAttentionSchedule]:
+        buffers: tuple[
+            torch.Tensor, torch.Tensor, SparseAttentionSchedule
+        ] | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, SparseAttentionSchedule]
+    ):
         # ---- Validation ----------------------------------------------------
         if blk_kv not in _SUPPORTED_BLK_KV:
             raise ValueError(
@@ -162,14 +168,67 @@ class SparseK2qCsrBuilderSm100:
 
         # ---- Output tensors ------------------------------------------------
         device = q2k_indices.device
-        k2q_row_ptr = torch.empty(
-            (head_kv, total_rows + 1), dtype=torch.int32, device=device,
-        )
-        k2q_q_indices = torch.empty(
-            (head_kv, nnz_upper_bound), dtype=torch.int32, device=device,
-        )
         schedule = None
-        if return_schedule:
+        if buffers is not None:
+            if not return_schedule:
+                raise ValueError("CSR buffers require return_schedule=True")
+            k2q_row_ptr, k2q_q_indices, schedule = buffers
+            if k2q_row_ptr.shape != (head_kv, total_rows + 1):
+                raise ValueError(
+                    "CSR row-pointer buffer shape does not match graph plan: "
+                    f"got {tuple(k2q_row_ptr.shape)}, expected "
+                    f"{(head_kv, total_rows + 1)}"
+                )
+            if k2q_q_indices.shape != (head_kv, nnz_upper_bound):
+                raise ValueError(
+                    "CSR query-index buffer shape does not match graph plan: "
+                    f"got {tuple(k2q_q_indices.shape)}, expected "
+                    f"{(head_kv, nnz_upper_bound)}"
+                )
+            if (
+                k2q_row_ptr.device != device
+                or k2q_q_indices.device != device
+                or k2q_row_ptr.dtype != torch.int32
+                or k2q_q_indices.dtype != torch.int32
+            ):
+                raise ValueError(
+                    "CSR graph buffers must be int32 tensors on the input device"
+                )
+            if not k2q_row_ptr.is_contiguous() or not k2q_q_indices.is_contiguous():
+                raise ValueError("CSR graph buffers must be contiguous")
+            if (
+                not schedule.enabled
+                or schedule.scheduler_metadata is None
+                or schedule.work_count is None
+                or schedule.qsplit_indices is None
+                or schedule.split_counts is None
+            ):
+                raise ValueError("CSR graph buffers require a complete schedule")
+            if (
+                schedule.qsplit_indices.shape != k2q_q_indices.shape
+                or schedule.split_counts.shape != (total_q, head_kv)
+            ):
+                raise ValueError("CSR graph schedule shapes do not match the input")
+            schedule_tensors = (
+                schedule.scheduler_metadata,
+                schedule.work_count,
+                schedule.qsplit_indices,
+                schedule.split_counts,
+            )
+            if any(t.device != device or t.dtype != torch.int32 for t in schedule_tensors):
+                raise ValueError(
+                    "CSR graph schedule tensors must be int32 tensors on the input device"
+                )
+            if any(not t.is_contiguous() for t in schedule_tensors):
+                raise ValueError("CSR graph schedule tensors must be contiguous")
+        else:
+            k2q_row_ptr = torch.empty(
+                (head_kv, total_rows + 1), dtype=torch.int32, device=device,
+            )
+            k2q_q_indices = torch.empty(
+                (head_kv, nnz_upper_bound), dtype=torch.int32, device=device,
+            )
+        if return_schedule and buffers is None:
             target_q_per_cta = SPARSE_SCHEDULE_MODEL.balanced_target_q_per_cta(
                 total_q=total_q,
                 topk=topk,

@@ -623,6 +623,7 @@ def sparse_atten_func(
     qk_dtype: Optional[torch.dtype] = None,
     pv_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
+    workspace: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     """Run SM100 CSR block-sparse varlen attention.
 
@@ -774,6 +775,7 @@ def sparse_atten_func(
         qk_dtype,
         pv_dtype,
         out,
+        workspace,
     )
 
 
@@ -1462,6 +1464,7 @@ def _sparse_atten_csr_varlen_forward(
     qk_dtype: torch.dtype,
     pv_dtype: torch.dtype,
     out: Optional[torch.Tensor] = None,
+    workspace: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ):
     total_q, head_q, dim = q.shape
     if head_q % head_kv != 0:
@@ -1480,12 +1483,28 @@ def _sparse_atten_csr_varlen_forward(
         return_temperature_lse and not temperature_lse_fast_path
     )
 
-    O_partial = torch.empty(
-        topK, total_q, head_q, dim, dtype=partial_dtype, device=q.device
-    )
-    LSE_partial = torch.empty(
-        topK, total_q, head_q, dtype=torch.float32, device=q.device
-    )
+    if workspace is None:
+        O_partial = torch.empty(
+            topK, total_q, head_q, dim, dtype=partial_dtype, device=q.device
+        )
+        LSE_partial = torch.empty(
+            topK, total_q, head_q, dtype=torch.float32, device=q.device
+        )
+        LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
+    else:
+        O_partial, LSE_partial, LSE_out = workspace
+        if O_partial.shape != (topK, total_q, head_q, dim):
+            raise ValueError("CSR O_partial workspace shape does not match q")
+        if LSE_partial.shape != (topK, total_q, head_q):
+            raise ValueError("CSR LSE_partial workspace shape does not match q")
+        if LSE_out.shape != (total_q, head_q):
+            raise ValueError("CSR LSE workspace shape does not match q")
+        if (
+            O_partial.dtype != partial_dtype
+            or LSE_partial.dtype != torch.float32
+            or LSE_out.dtype != torch.float32
+        ):
+            raise ValueError("CSR workspace dtypes do not match the attention contract")
     LSE_temperature_partial = (
         torch.empty(topK, total_q, head_q, dtype=torch.float32, device=q.device)
         if kernel_return_temperature_lse
@@ -1505,7 +1524,6 @@ def _sparse_atten_csr_varlen_forward(
         O_out = torch.empty(
             total_q, head_q, dim, dtype=torch.bfloat16, device=q.device
         )
-    LSE_out = torch.empty(total_q, head_q, dtype=torch.float32, device=q.device)
     LSE_temperature_out = (
         torch.empty_like(LSE_out) if kernel_return_temperature_lse else None
     )

@@ -340,6 +340,7 @@ def build_k2q_csr(
     total_rows: Optional[int] = None,
     qhead_per_kv: int = 1,
     return_schedule: bool = False,
+    buffers=None,
 ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, object]:
     """Build the public k2q CSR reverse index on GPU.
 
@@ -408,4 +409,5 @@ def build_k2q_csr(
         total_rows=total_rows,
         qhead_per_kv=qhead_per_kv,
         return_schedule=return_schedule,
+        buffers=buffers,
     )
