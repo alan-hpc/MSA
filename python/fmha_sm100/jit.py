@@ -11,6 +11,7 @@ To recompile after kernel changes: scripts/clear_fmha_cache.sh
 
 import itertools
 import fcntl
+import hashlib
 import logging
 import os
 import shutil
@@ -527,8 +528,21 @@ _sparse_topk_module = None
 _sparse_topk_lock = threading.Lock()
 
 
+def _sparse_topk_cache_dir() -> Path:
+    """Return a source-versioned cache directory for sparse_topk_select."""
+    sources = (
+        _FMHA_VARLEN_DIR / "sparse_topk_select.cu",
+        _FMHA_VARLEN_DIR / "include" / "sparse_topk_select.cuh",
+        _FMHA_VARLEN_DIR / "tvm_ffi_utils.h",
+    )
+    digest = hashlib.sha256()
+    for source in sources:
+        digest.update(source.read_bytes())
+    return CACHE_BASE / f"sparse_topk_{digest.hexdigest()[:16]}"
+
+
 def _do_compile_sparse_topk():
-    cache_dir = CACHE_BASE / "sparse_topk"
+    cache_dir = _sparse_topk_cache_dir()
     so_path = cache_dir / "sparse_topk_select.so"
 
     if so_path.exists():
@@ -594,11 +608,12 @@ def get_sparse_topk_module():
     with _sparse_topk_lock:
         if _sparse_topk_module is not None:
             return _sparse_topk_module
-        lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
+        cache_dir = _sparse_topk_cache_dir()
+        lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
         try:
             _do_compile_sparse_topk()
             import tvm_ffi
-            so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
+            so_path = cache_dir / "sparse_topk_select.so"
             _sparse_topk_module = tvm_ffi.load_module(str(so_path))
         finally:
             _release_file_lock(lock_fd)
