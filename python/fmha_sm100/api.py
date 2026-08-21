@@ -1068,6 +1068,90 @@ def fmha_sm100_plan(
                                     qo_offset=qo_offset, **kwargs)
         return (False, 0, batch_size, plan, None)
 
+
+def fmha_sm100_refresh_plan(
+    plan_info,
+    qo_segment_lens: torch.Tensor,
+    kv_segment_lens: torch.Tensor,
+    *,
+    qo_offset: torch.Tensor,
+) -> None:
+    """Refresh a non-split plan's dynamic metadata on the GPU.
+
+    This is the plan/run half required by CUDA graph users.  The normal planner
+    constructs Python lists and allocates descriptor tensors, neither of which
+    is valid while a graph is being captured.  A graph owner builds one
+    no-split plan before capture, keeps its descriptor tensors alive, then
+    updates their contents and work lists with this function before every
+    replay.
+
+    Args:
+        plan_info: Plan tuple returned by :func:`fmha_sm100_plan` with a single
+            no-split plan.
+        qo_segment_lens: Per-sequence query lengths on CUDA.
+        kv_segment_lens: Per-sequence KV lengths on CUDA.
+        qo_offset: Per-sequence causal offsets on CUDA.
+    """
+    has_mixed_prefill, _, batch_size, plan, prefill = plan_info
+    if has_mixed_prefill or prefill is not None:
+        raise ValueError("CUDA graph plan refresh requires one no-split plan")
+    if plan.get("MM-SA-Nv", False):
+        raise ValueError("CUDA graph plan refresh does not support Nv-prefill")
+    inputs = (qo_segment_lens, kv_segment_lens, qo_offset)
+    if any(t.device != plan["qo_segment_offsets"].device for t in inputs):
+        raise ValueError("plan metadata and refresh tensors must share a device")
+    if any(t.dtype != torch.int32 or t.ndim != 1 for t in inputs):
+        raise TypeError("refresh tensors must be rank-1 CUDA int32 tensors")
+    if any(t.numel() != batch_size for t in inputs):
+        raise ValueError("refresh tensor shape must match the graph plan batch")
+    if plan["num_kv_splits"] != 1:
+        raise ValueError("CUDA graph plan refresh requires num_kv_splits=1")
+
+    qo_offsets = plan["qo_segment_offsets"]
+    kv_offsets = plan["kv_segment_offsets"]
+    qo_offsets[0].zero_()
+    kv_offsets[0].zero_()
+    torch.cumsum(qo_segment_lens, dim=0, out=qo_offsets[1:])
+    torch.cumsum(kv_segment_lens, dim=0, out=kv_offsets[1:])
+    plan["qo_segment_lens"].copy_(qo_segment_lens)
+    plan["kv_segment_lens"].copy_(kv_segment_lens)
+    plan["qo_offset"].copy_(qo_offset)
+    if plan["kv_page_indptr"] is not None:
+        page_counts = torch.div(
+            kv_segment_lens + 127, 128, rounding_mode="floor"
+        )
+        page_indptr = plan["kv_page_indptr"]
+        page_indptr[0].zero_()
+        torch.cumsum(page_counts, dim=0, out=page_indptr[1:])
+
+    pack_factor = plan["pack_factor"]
+    num_qo_heads = plan["orig_num_qo_heads"] // pack_factor
+    qo_tile_size = 128 if plan["max_qo_len"] <= 128 else 256
+    kv_tile_size = 256 if qo_tile_size == 128 else 128
+    _call_plan(
+        qo_offsets,
+        plan["qo_segment_lens"],
+        plan["kv_segment_lens"],
+        plan["packed_work_range"],
+        plan["packed_work_info"],
+        qo_tile_size,
+        kv_tile_size,
+        num_qo_heads,
+        _get_num_cta(qo_offsets.device),
+        True,
+        plan["qo_offset"],
+        1,
+        None,
+        None,
+        None,
+        0,
+        None,
+        None,
+        None,
+        0,
+        pack_factor,
+    )
+
 def fmha_sm100(
     q: torch.Tensor,
     k: torch.Tensor,

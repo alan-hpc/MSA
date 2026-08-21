@@ -548,7 +548,8 @@ class SparseAttentionForwardNvfp4KvSm100:
             #   [5] q_batch_offset
             #   [6] k_batch_offset
             #   [7] causal_q_offset = seqlen_k - seqlen_q
-            sRowMeta: cute.struct.MemRange[Int32, 8]
+            #   [8] seqlen_q, read dynamically from cu_seqlens_q
+            sRowMeta: cute.struct.MemRange[Int32, 9]
             sPagedKvIdx: cute.struct.MemRange[Int32, 1]
             sQLoadMIdx: cute.struct.MemRange[
                 Int32, self.q_stage * self.q_tokens_per_group]
@@ -717,7 +718,7 @@ class SparseAttentionForwardNvfp4KvSm100:
         sQIdx = storage.sQIdx.get_tensor(
             cute.make_layout((self.o_stage * self.q_tokens_per_group,)))
         sDiagQCount = storage.sDiagQCount.get_tensor(cute.make_layout((1,)))
-        sRowMeta = storage.sRowMeta.get_tensor(cute.make_layout((8,)))
+        sRowMeta = storage.sRowMeta.get_tensor(cute.make_layout((9,)))
         sPagedKvIdx = storage.sPagedKvIdx.get_tensor(cute.make_layout((1,)))
         sQLoadMIdx = storage.sQLoadMIdx.get_tensor(
             cute.make_layout((self.q_stage * self.q_tokens_per_group,)))
@@ -850,9 +851,9 @@ class SparseAttentionForwardNvfp4KvSm100:
             sRowMeta[4] = kv_valid_cols
             sRowMeta[5] = q_batch_offset
             sRowMeta[6] = k_batch_offset
+            seqlen_q = mCuSeqlensQ[row_batch_idx + Int32(1)] - q_batch_offset
             causal_q_offset = Int32(0)
             if const_expr(self.causal):
-                seqlen_q = mCuSeqlensQ[row_batch_idx + Int32(1)] - q_batch_offset
                 seqlen_k = self._logical_seqlen_k(
                     row_batch_idx,
                     mPageTable,
@@ -861,6 +862,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                 )
                 causal_q_offset = seqlen_k - seqlen_q
             sRowMeta[7] = causal_q_offset
+            sRowMeta[8] = seqlen_q
             if const_expr(self.paged_kv):
                 sPagedKvIdx[0] = paged_kv_manager.physical_block_index(
                     row_batch_idx, row_kv_block_idx
@@ -1066,6 +1068,7 @@ class SparseAttentionForwardNvfp4KvSm100:
             count_raw_softmax = sRowMeta[3]
             kv_valid_cols_softmax = sRowMeta[4]
             causal_q_offset_softmax = sRowMeta[7]
+            seqlen_q_softmax = sRowMeta[8]
             has_work_softmax = count_raw_softmax > Int32(0)
             num_q_groups_softmax = (
                 count_raw_softmax + Int32(self.q_tokens_per_group - 1)
@@ -1115,7 +1118,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                 causal_q_offset_softmax,
                 sRowMeta[0],
                 head_kv_idx,
-                seq_len_q,
+                seqlen_q_softmax,
                 head_q,
                 num_heads_kv,
                 sRowMeta[5],
@@ -1133,6 +1136,7 @@ class SparseAttentionForwardNvfp4KvSm100:
             count_raw_softmax = sRowMeta[3]
             kv_valid_cols_softmax = sRowMeta[4]
             causal_q_offset_softmax = sRowMeta[7]
+            seqlen_q_softmax = sRowMeta[8]
             has_work_softmax = count_raw_softmax > Int32(0)
             num_q_groups_softmax = (
                 count_raw_softmax + Int32(self.q_tokens_per_group - 1)
@@ -1182,7 +1186,7 @@ class SparseAttentionForwardNvfp4KvSm100:
                 causal_q_offset_softmax,
                 sRowMeta[0],
                 head_kv_idx,
-                seq_len_q,
+                seqlen_q_softmax,
                 head_q,
                 num_heads_kv,
                 sRowMeta[5],

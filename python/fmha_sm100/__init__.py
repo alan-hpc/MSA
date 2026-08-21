@@ -7,7 +7,12 @@ Provides fmha_sm100_plan() and fmha_sm100() interfaces
 with per-variant lazy JIT compilation.
 """
 
-from .api import fmha_sm100, fmha_sm100_plan, sparse_topk_select
+from .api import (
+    fmha_sm100,
+    fmha_sm100_plan,
+    fmha_sm100_refresh_plan,
+    sparse_topk_select,
+)
 
 # Public symbols of the CuTe-DSL sparse stack (implemented in fmha_sm100.sparse).
 # Re-exported lazily so a bare ``import fmha_sm100`` does not pull in the
@@ -26,6 +31,7 @@ _SPARSE_LAZY_EXPORTS = frozenset(
 
 __all__ = [
     "fmha_sm100_plan",
+    "fmha_sm100_refresh_plan",
     "fmha_sm100",
     "sparse_topk_select",
     *sorted(_SPARSE_LAZY_EXPORTS),

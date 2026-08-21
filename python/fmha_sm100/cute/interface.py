@@ -47,6 +47,7 @@ from src.common.tma_utils import (
 )
 
 _compile_cache: dict = {}
+_SPARSE_FWD_ABI_VERSION = 3
 _TEMPERATURE_LSE_FAST_PATH_ABS_TOL = 1e-12
 _SUPPORTED_SPARSE_TOPK = (4, 8, 16, 32)
 _SUPPORTED_FWD_DTYPES = (torch.bfloat16, torch.float8_e4m3fn)
@@ -1757,6 +1758,7 @@ def _call_sparse_forward_sm100_csr_varlen(
 
     key = (
         "sparse_forward_sm100_csr_varlen",
+        _SPARSE_FWD_ABI_VERSION,
         head_dim,
         n_block_size,
         qhead_per_kv,
@@ -1953,6 +1955,7 @@ def _call_sparse_forward_sm100_csr_varlen_nvfp4_kv(
 
     key = (
         "sparse_forward_sm100_csr_varlen_nvfp4_kv",
+        _SPARSE_FWD_ABI_VERSION,
         head_dim,
         n_block_size,
         qhead_per_kv,
