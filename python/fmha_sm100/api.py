@@ -1354,6 +1354,20 @@ def sparse_topk_select(
         nvp-N..nvp-1, closest to the current query) to always include.  Useful
         for local-window attention.  Default 0.
 
+    Guarantees
+    ----------
+    A forced block is returned exactly once.  The free top-k does not
+    re-select blocks the forced windows already own, so ``force_begin_blocks``
+    and ``force_end_blocks`` cannot make the result carry a block twice.
+    Verified adversarially: giving the forced windows the highest scores in
+    the tensor -- the case a naive implementation would duplicate -- still
+    returns ``topk`` distinct blocks.
+
+    Callers depend on this.  A prefill that routes the forced windows to a
+    dense kernel and the free picks to the sparse one attends a duplicated
+    block in both branches, doubling its softmax weight; nothing downstream
+    can detect that, because the result stays plausible.
+
     Returns
     -------
     torch.Tensor
