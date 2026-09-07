@@ -1006,6 +1006,224 @@ def sparse_atten_nvfp4_kv_func(
     return O_out
 
 
+def _store_as_stg128_fake(dst, src):
+    """Write a real-layout result into a partial slot, which is fake layout.
+
+    ``O_partial``'s last axis is in STG.128 fake layout -- the sparse forward
+    writes it that way and ``combine`` un-permutes it on the way out. Anything
+    else placed in a partial slot has to be stored the same way, or combine
+    permutes a result that was never permuted.
+
+    Within one 32-column block the 16-bit map (``stg128_half_fake_col_to_real_col``
+    in src/common/copy_utils.py) is ``fake = lane*8 + group*2 + elem`` against
+    ``real = group*8 + lane*2 + elem`` -- a transpose of ``[4, 4, 2]``, not an
+    arbitrary permutation. The 32-bit map is the same shape on 16 columns. So
+    this is a strided copy, and not the last-axis gather the index form would
+    give, which costs 0.15 ms on an 8192-row output against 0.03 here.
+    """
+    bits = dst.element_size() * 8
+    if bits == 16:
+        blk, a, b = 32, 4, 4
+    elif bits == 32:
+        blk, a, b = 16, 2, 4
+    else:
+        raise ValueError(f"no STG.128 column map for a {bits}-bit partial dtype")
+    dim = src.shape[-1]
+    if dim % blk:
+        raise ValueError(f"head_dim {dim} is not a multiple of {blk}")
+    lead = src.shape[:-1]
+    dst.view(*lead, dim // blk, b, a, 2).copy_(
+        src.view(*lead, dim // blk, a, b, 2).transpose(-3, -2))
+
+
+def sparse_atten_split_func(
+    q,
+    k,
+    v,
+    q2k_indices,
+    *,
+    forced_init_blocks: int,
+    forced_local_blocks: int,
+    forced_page_table,
+    forced_cu_seqlens_q,
+    forced_seqused_k,
+    forced_page_size: int,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_k,
+    page_table,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    total_rows: int,
+    total_k: int,
+    softmax_scale: float,
+    blk_kv: int = 128,
+    qhead_per_kv: int = 1,
+    causal: bool = True,
+    partial_dtype: torch.dtype = torch.bfloat16,
+    out=None,
+    workspace=None,
+    csr_buffers=None,
+):
+    """Sparse prefill with the position-derived windows computed densely.
+
+    ``topk`` is ``forced_init_blocks`` prefix + free picks + ``forced_local_blocks``
+    local, and only the free picks come from the indexer.  The other two follow
+    from the query's position, and their per-tile union equals their per-query
+    count, so a dense pass over them wastes no masked rows -- while needing no
+    inverted index and emitting one partial for all of them instead of one per
+    block.
+
+    The two branches are merged by the same ``combine`` that already merges the
+    sparse partials, not by a separate kernel: the dense result takes partial
+    rank 0 and the sparse forward is handed ``O_partial[1:]``, so it fills ranks
+    1..n without knowing rank 0 exists.  ``split_counts`` is then one larger and
+    combine reads both.
+
+    No block is computed twice.  ``q2k_indices`` is sliced, not classified --
+    the selector returns blocks sorted by index with the forced windows at the
+    extremes, and it guarantees each forced block appears once (see
+    ``sparse_topk_select``) -- so the dense branch's blocks and the sparse
+    branch's are disjoint by construction.
+
+    Args:
+        k, v: the paged cache in ``[num_pages, page_size, Hkv, D]`` -- the
+            layout the dense pass reads.  The sparse pass wants it head-major
+            and gets a permuted view here, so a caller hands in one layout
+            rather than keeping two in step.
+        q2k_indices: the full ``[head_kv, total_q, topK]`` selection.
+        forced_page_table: ``[num_q_pages, init + local]``, each query page's
+            forced KV laid out as ``[prefix | local]``.
+        forced_cu_seqlens_q / forced_seqused_k: the dense branch's varlen
+            descriptors, one request per query page.  ``seqused_k`` must be
+            ``(init + local - 1) * page + q_len`` so the causal cut lands on
+            the query's own position whatever the tail page's length.
+
+    Returns:
+        ``(out, csr_buffers)``. Feed the buffers back on the next call.
+
+    Raises:
+        RuntimeError: if the dense backend is unavailable.  Callers that can
+            fall back should check that before calling.
+    """
+    from flash_attn.cute.interface import flash_attn_varlen_func
+
+    head_kv, total_q, topk = q2k_indices.shape
+    remote_width = topk - forced_init_blocks - forced_local_blocks
+    if remote_width <= 0:
+        raise ValueError(
+            f"forced windows {forced_init_blocks}+{forced_local_blocks} leave "
+            f"no free picks in topk={topk}")
+    head_q = q.shape[1]
+    dim = q.shape[2]
+
+    remote = q2k_indices[
+        :, :, forced_init_blocks:forced_init_blocks + remote_width
+    ].contiguous()
+
+    from sparse_index_utils import build_k2q_csr
+
+    row_ptr, q_indices, schedule = build_k2q_csr(
+        remote,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        blk_kv,
+        total_k=int(total_k),
+        max_seqlen_k=int(max_seqlen_k),
+        max_seqlen_q=int(max_seqlen_q),
+        total_rows=int(total_rows),
+        qhead_per_kv=int(qhead_per_kv),
+        return_schedule=True,
+        buffers=csr_buffers,
+    )
+
+    # rank 0 belongs to the dense branch; the sparse forward gets the rest and
+    # never learns it is offset. The partials are the largest buffers here --
+    # (remote + 1) x total_q x Hq x D -- so a caller that runs this every layer
+    # should hand in a workspace rather than have it allocated per call.
+    if workspace is not None:
+        O_partial, LSE_partial = workspace[0], workspace[1]
+        if O_partial.shape[0] < remote_width + 1:
+            raise ValueError(
+                f"workspace holds {O_partial.shape[0]} partial slots, the "
+                f"split needs {remote_width + 1} (remote + the dense rank)")
+        O_partial = O_partial[:remote_width + 1]
+        LSE_partial = LSE_partial[:remote_width + 1]
+    else:
+        O_partial = torch.empty(
+            remote_width + 1, total_q, head_q, dim,
+            dtype=partial_dtype, device=q.device)
+        LSE_partial = torch.empty(
+            remote_width + 1, total_q, head_q,
+            dtype=torch.float32, device=q.device)
+
+    # The two branches read the cache differently: the dense pass takes it as
+    # stored, the sparse one head-major. Both are views of the same memory.
+    k_hm = k.permute(0, 2, 1, 3)
+    v_hm = v.permute(0, 2, 1, 3)
+
+    dense, dense_lse = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=forced_cu_seqlens_q,
+        max_seqlen_q=forced_page_size,
+        max_seqlen_k=(forced_init_blocks + forced_local_blocks) * forced_page_size,
+        seqused_k=forced_seqused_k,
+        page_table=forced_page_table,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_lse=True,
+    )
+    _store_as_stg128_fake(O_partial[0], dense)
+    LSE_partial[0].copy_(
+        dense_lse.transpose(0, 1) if dense_lse.shape[0] == head_q else dense_lse)
+
+    _call_sparse_forward_sm100_csr_varlen(
+        q.contiguous(),
+        k_hm,
+        v_hm,
+        row_ptr.contiguous(),
+        q_indices.contiguous(),
+        schedule.qsplit_indices.contiguous(),
+        schedule.split_counts,
+        cu_seqlens_q.contiguous(),
+        cu_seqlens_k.contiguous(),
+        page_table.contiguous(),
+        None if seqused_k is None else seqused_k.contiguous(),
+        O_partial[1:],
+        LSE_partial[1:],
+        None,
+        float(softmax_scale),
+        1.0,
+        False,
+        _csr_row_capacity(row_ptr),
+        int(blk_kv),
+        int(head_kv),
+        int(max_seqlen_q),
+        -1,
+        causal=bool(causal),
+        schedule=schedule,
+        qk_dtype=_normalize_forward_mma_dtype(None, q.dtype, "qk_dtype"),
+        pv_dtype=_normalize_forward_mma_dtype(
+            None, torch.bfloat16 if v.dtype == torch.float8_e4m3fn else v.dtype,
+            "pv_dtype"),
+    )
+
+    O_out = out if out is not None else torch.empty(
+        total_q, head_q, dim, dtype=q.dtype, device=q.device)
+    combine(
+        O_partial,
+        LSE_partial,
+        O_out,
+        # nothing here consumes the merged LSE, and combine skips writing it
+        # when it is None rather than filling a buffer to be discarded
+        None,
+        cu_seqlens=cu_seqlens_q,
+        split_counts=schedule.split_counts + 1,
+        use_pdl=True,
+    )
+    return O_out, (row_ptr, q_indices, schedule)
+
+
 def sparse_decode_atten_func(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -18,6 +18,7 @@ can simply do::
         build_k2q_csr,                 # q2k indices -> CSR + schedule
         SparseK2qCsrBuilderSm100,      # SM100 CSR builder (fused schedule)
         sparse_atten_func,             # block-sparse prefill
+        sparse_atten_split_func,       # ... with the forced windows made dense
         sparse_atten_nvfp4_kv_func,    # block-sparse prefill, NVFP4 K/V
         sparse_decode_atten_func,      # block-sparse decode (functional)
         SparseDecodePagedAttentionWrapper,  # paged FP8 decode (plan/run)
@@ -60,6 +61,7 @@ else:  # pragma: no cover - only happens on a broken install
 from interface import (  # noqa: E402
     SparseDecodePagedAttentionWrapper,
     sparse_atten_func,
+    sparse_atten_split_func,
     sparse_atten_nvfp4_kv_func,
     sparse_decode_atten_func,
 )
@@ -89,6 +91,7 @@ from quantize import (  # noqa: E402
 __all__ = [
     # attention
     "sparse_atten_func",
+    "sparse_atten_split_func",
     "sparse_atten_nvfp4_kv_func",
     "sparse_decode_atten_func",
     "SparseDecodePagedAttentionWrapper",
