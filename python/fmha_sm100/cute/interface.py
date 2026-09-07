@@ -1006,6 +1006,22 @@ def sparse_atten_nvfp4_kv_func(
     return O_out
 
 
+def _align16(t):
+    """A view whose data starts on a 16-byte boundary, copying only if needed.
+
+    The forward's tensor arguments carry ``expected data alignment=16 bytes``.
+    A caller's page table or sequence-length tensor is usually a row slice of
+    a larger buffer, and an int32 slice is 16-byte aligned only when its
+    offset is a multiple of four -- which a page count or a request index
+    rarely is. The undivided path never hits this because it stages those
+    tensors into its own graph buffers; a direct call has to check. The copies
+    are a few kilobytes and happen only on a misaligned input.
+    """
+    if t is None or t.data_ptr() % 16 == 0:
+        return t
+    return t.clone()
+
+
 def _store_as_stg128_fake(dst, src):
     """Write a real-layout result into a partial slot, which is fake layout.
 
@@ -1107,6 +1123,14 @@ def sparse_atten_split_func(
             fall back should check that before calling.
     """
     from flash_attn.cute.interface import flash_attn_varlen_func
+
+    page_table = _align16(page_table)
+    seqused_k = _align16(seqused_k)
+    cu_seqlens_q = _align16(cu_seqlens_q)
+    cu_seqlens_k = _align16(cu_seqlens_k)
+    forced_page_table = _align16(forced_page_table)
+    forced_cu_seqlens_q = _align16(forced_cu_seqlens_q)
+    forced_seqused_k = _align16(forced_seqused_k)
 
     head_kv, total_q, topk = q2k_indices.shape
     remote_width = topk - forced_init_blocks - forced_local_blocks
