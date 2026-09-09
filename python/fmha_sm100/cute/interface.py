@@ -1006,6 +1006,12 @@ def sparse_atten_nvfp4_kv_func(
     return O_out
 
 
+_LIVE_ARGS: list = []
+# Optional injected two-branch LSE merge (memory-optimal Triton kernel from
+# the vLLM side). None -> a correct but heavier pure-torch fallback.
+_MERGE_FN = None
+
+
 def _align16(t):
     """A view whose data starts on a 16-byte boundary, copying only if needed.
 
@@ -1022,37 +1028,72 @@ def _align16(t):
     return t.clone()
 
 
-def _store_as_stg128_fake(dst, src):
-    """Write a real-layout result into a partial slot, which is fake layout.
+def _split_via_merge_lse(
+    q, k, v, k_hm, v_hm, row_ptr, q_indices, schedule,
+    O_partial, LSE_partial, remote_width, head_q, head_kv, dim,
+    total_q, cu_seqlens_q, cu_seqlens_k, seqused_k, page_table,
+    forced_cu_seqlens_q, forced_seqused_k, forced_page_table,
+    forced_init_blocks, forced_local_blocks, forced_page_size,
+    max_seqlen_q, max_seqlen_k, blk_kv, qhead_per_kv, causal,
+    softmax_scale, out, flash_attn_varlen_func):
+    """Merge the two branches without the heterogeneous combine.
 
-    ``O_partial``'s last axis is in STG.128 fake layout -- the sparse forward
-    writes it that way and ``combine`` un-permutes it on the way out. Anything
-    else placed in a partial slot has to be stored the same way, or combine
-    permutes a result that was never permuted.
-
-    Within one 32-column block the 16-bit map (``stg128_half_fake_col_to_real_col``
-    in src/common/copy_utils.py) is ``fake = lane*8 + group*2 + elem`` against
-    ``real = group*8 + lane*2 + elem`` -- a transpose of ``[4, 4, 2]``, not an
-    arbitrary permutation. The 32-bit map is the same shape on 16 columns. So
-    this is a strided copy, and not the last-axis gather the index form would
-    give, which costs 0.15 ms on an 8192-row output against 0.03 here.
+    The homogeneous `combine` over the sparse ranks alone is the exact kernel
+    (and configuration) the undivided path uses, which is correct in
+    production. The dense branch is then folded in with a plain LSE merge in
+    torch -- the identity ``O = (e^{Ld}Od + e^{Ls}Os)/(e^{Ld}+e^{Ls})`` -- so
+    the broken rank-0-heterogeneous combine is never invoked. bf16 rounding of
+    each branch before the merge is the only residual.
     """
-    bits = dst.element_size() * 8
-    if bits == 16:
-        blk, a, b = 32, 4, 4
-    elif bits == 32:
-        blk, a, b = 16, 2, 4
+    Op = O_partial[:remote_width]
+    Lp = LSE_partial[:remote_width]
+    Lp.fill_(float("-inf"))            # ranks a query does not fill add nothing
+    keep = [q.contiguous(), row_ptr.contiguous(), q_indices.contiguous(),
+            schedule.qsplit_indices.contiguous(), cu_seqlens_q.contiguous(),
+            cu_seqlens_k.contiguous(), page_table.contiguous(),
+            None if seqused_k is None else seqused_k.contiguous()]
+    _LIVE_ARGS.clear(); _LIVE_ARGS.extend(keep)
+    _call_sparse_forward_sm100_csr_varlen(
+        keep[0], k_hm, v_hm, keep[1], keep[2], keep[3], schedule.split_counts,
+        keep[4], keep[5], keep[6], keep[7], Op, Lp, None,
+        float(softmax_scale), 1.0, False, _csr_row_capacity(row_ptr),
+        int(blk_kv), int(head_kv), int(max_seqlen_q), -1, causal=bool(causal),
+        schedule=schedule,
+        qk_dtype=_normalize_forward_mma_dtype(None, q.dtype, "qk_dtype"),
+        pv_dtype=_normalize_forward_mma_dtype(
+            None, torch.bfloat16 if v.dtype == torch.float8_e4m3fn else v.dtype,
+            "pv_dtype"))
+    sparse_o = torch.empty(total_q, head_q, dim, dtype=q.dtype, device=q.device)
+    sparse_lse = torch.empty(total_q, head_q, dtype=torch.float32,
+                             device=q.device)
+    # homogeneous sparse combine: identical to the undivided path's usage
+    combine(Op, Lp, sparse_o, sparse_lse, cu_seqlens=cu_seqlens_q,
+            split_counts=schedule.split_counts, use_pdl=False)
+    dense, dense_lse = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=forced_cu_seqlens_q, max_seqlen_q=forced_page_size,
+        max_seqlen_k=(forced_init_blocks + forced_local_blocks) * forced_page_size,
+        seqused_k=forced_seqused_k, page_table=forced_page_table,
+        softmax_scale=softmax_scale, causal=True, return_lse=True)
+    dense_lse = (dense_lse.transpose(0, 1) if dense_lse.shape[0] == head_q
+                 else dense_lse).contiguous()
+    O_out = out if out is not None else torch.empty(
+        total_q, head_q, dim, dtype=q.dtype, device=q.device)
+    if _MERGE_FN is not None:
+        # memory-optimal: reads/writes bf16, does the math in fp32 registers
+        _MERGE_FN(dense, dense_lse, sparse_o, sparse_lse, out=O_out)
     else:
-        raise ValueError(f"no STG.128 column map for a {bits}-bit partial dtype")
-    dim = src.shape[-1]
-    if dim % blk:
-        raise ValueError(f"head_dim {dim} is not a multiple of {blk}")
-    lead = src.shape[:-1]
-    dst.view(*lead, dim // blk, b, a, 2).copy_(
-        src.view(*lead, dim // blk, a, b, 2).transpose(-3, -2))
+        # pure-torch fallback: correct but upcasts the O tensors to fp32, which
+        # is ~0.3 ms of extra traffic at an 8k chunk -- use the injected kernel
+        md = dense_lse.float(); ms = sparse_lse.float()
+        m = torch.maximum(md, ms)
+        wa = (md - m).exp_(); wb = (ms - m).exp_()
+        inv = (wa + wb).reciprocal_(); wa.mul_(inv); wb.mul_(inv)
+        O_out.copy_((dense.float() * wa.unsqueeze(-1)
+                     + sparse_o.float() * wb.unsqueeze(-1)).to(q.dtype))
+    return O_out, (row_ptr, q_indices, schedule)
 
 
-def sparse_atten_split_func(
+def _sparse_atten_split_impl(
     q,
     k,
     v,
@@ -1186,66 +1227,19 @@ def sparse_atten_split_func(
     k_hm = k.permute(0, 2, 1, 3)
     v_hm = v.permute(0, 2, 1, 3)
 
-    dense, dense_lse = flash_attn_varlen_func(
-        q, k, v,
-        cu_seqlens_q=forced_cu_seqlens_q,
-        max_seqlen_q=forced_page_size,
-        max_seqlen_k=(forced_init_blocks + forced_local_blocks) * forced_page_size,
-        seqused_k=forced_seqused_k,
-        page_table=forced_page_table,
-        softmax_scale=softmax_scale,
-        causal=True,
-        return_lse=True,
-    )
-    _store_as_stg128_fake(O_partial[0], dense)
-    LSE_partial[0].copy_(
-        dense_lse.transpose(0, 1) if dense_lse.shape[0] == head_q else dense_lse)
+    return _split_via_merge_lse(
+            q, k, v, k_hm, v_hm, row_ptr, q_indices, schedule,
+            O_partial, LSE_partial, remote_width, head_q, head_kv, dim,
+            total_q, cu_seqlens_q, cu_seqlens_k, seqused_k, page_table,
+            forced_cu_seqlens_q, forced_seqused_k, forced_page_table,
+            forced_init_blocks, forced_local_blocks, forced_page_size,
+            max_seqlen_q, max_seqlen_k, blk_kv, qhead_per_kv, causal,
+            softmax_scale, out, flash_attn_varlen_func)
 
-    _call_sparse_forward_sm100_csr_varlen(
-        q.contiguous(),
-        k_hm,
-        v_hm,
-        row_ptr.contiguous(),
-        q_indices.contiguous(),
-        schedule.qsplit_indices.contiguous(),
-        schedule.split_counts,
-        cu_seqlens_q.contiguous(),
-        cu_seqlens_k.contiguous(),
-        page_table.contiguous(),
-        None if seqused_k is None else seqused_k.contiguous(),
-        O_partial[1:],
-        LSE_partial[1:],
-        None,
-        float(softmax_scale),
-        1.0,
-        False,
-        _csr_row_capacity(row_ptr),
-        int(blk_kv),
-        int(head_kv),
-        int(max_seqlen_q),
-        -1,
-        causal=bool(causal),
-        schedule=schedule,
-        qk_dtype=_normalize_forward_mma_dtype(None, q.dtype, "qk_dtype"),
-        pv_dtype=_normalize_forward_mma_dtype(
-            None, torch.bfloat16 if v.dtype == torch.float8_e4m3fn else v.dtype,
-            "pv_dtype"),
-    )
 
-    O_out = out if out is not None else torch.empty(
-        total_q, head_q, dim, dtype=q.dtype, device=q.device)
-    combine(
-        O_partial,
-        LSE_partial,
-        O_out,
-        # nothing here consumes the merged LSE, and combine skips writing it
-        # when it is None rather than filling a buffer to be discarded
-        None,
-        cu_seqlens=cu_seqlens_q,
-        split_counts=schedule.split_counts + 1,
-        use_pdl=True,
-    )
-    return O_out, (row_ptr, q_indices, schedule)
+def sparse_atten_split_func(*args, **kwargs):
+    """Public entry point for the prefill split; see ``_sparse_atten_split_impl``."""
+    return _sparse_atten_split_impl(*args, **kwargs)
 
 
 def sparse_decode_atten_func(
